@@ -482,6 +482,7 @@ class ShmListener final : public Listener {
   ShmNames names_;
   int fd_ = -1;
 };
+}  // namespace duct
 #endif  // !_WIN32
 
 // Linux/Unix implementation functions
