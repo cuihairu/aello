@@ -1,5 +1,7 @@
 # Aello
 
+[![Status](https://img.shields.io/badge/status-in%20development-orange)](https://github.com/cuihairu/aello/releases)
+
 > **English** | [中文](README.zh.md)
 
 <p align="center">
