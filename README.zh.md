@@ -1,6 +1,6 @@
 # Aello
 
-[![Status](https://img.shields.io/badge/status-in%20development-orange)](https://github.com/cuihairu/aello/releases)
+<p align="center">[![Status](https://img.shields.io/badge/status-in%20development-orange)](https://github.com/cuihairu/aello/releases)</p>
 
 > [English](README.md) | **中文**
 
