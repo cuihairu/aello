@@ -1,132 +1,132 @@
-# Aello 逐文件审计（2026-10-16）
+# Aello File-by-File Audit (2026-10-16)
 
-> 输入：外部分析稿 `docs/design/aello-analysis-2026-10-16.md`（性质：外部分析，不是本仓事实）。
-> 方法：全量遍历 `include/` `src/` `tests/` `examples/`（共 39 个文件），逐文件三分类；分析稿提到的概念逐条对代码核验。
-> 口径：本轮零实现代码；本文只落定性结论。改名历史：本仓前身 duct 已改名 aello（GitHub 重定向有效），代码内 namespace/标识符仍是 `duct`，改名属后续实现轮。
-> 审计基线：commit `7646428`，工作区干净。
+> Input: external analysis `docs/design/aello-analysis-2026-10-16.md` (external analysis, not project fact).
+> Method: walk all of `include/`, `src/`, `tests/`, and `examples/` (39 files), classify each file, and verify every concept from the analysis against the code.
+> Scope: no implementation changes in this round. This document records conclusions only. The project was renamed from duct to aello (GitHub redirects work), while namespaces and identifiers still say `duct`; renaming is a later implementation task.
+> Audit baseline: commit `7646428`, clean worktree.
 
-## 0. 总量
+## 0. Totals
 
-| 分类 | 数量 | 文件 |
+| Classification | Count | Files |
 |---|---|---|
-| 保留 | 18 | 见 §3–§6 |
-| 重构 | 10 | 见 §3–§6 |
-| 删除 | 11 | 见 §3–§6 |
+| Keep | 18 | See §3–§6 |
+| Refactor | 10 | See §3–§6 |
+| Delete | 11 | See §3–§6 |
 
-范围：`include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39。构建与配套文件（CMakeLists、cmake 模板、workflows、TODO.md、README.md）在 §7 单独说明，不计入上表。
+Scope: `include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39. Build and support files (CMakeLists, CMake templates, workflows, TODO.md, README.md) are covered separately in §7 and excluded from the totals above.
 
-**构建事实（先说最硬的一条）**：HEAD 在本机 GCC 15.2.0 下编译失败——`include/duct/message.h` 使用 `std::memcpy`/`std::memcmp`（`include/duct/message.h:49`、`include/duct/message.h:57`）与 `std::min`（`include/duct/message.h:47`），但未包含 `<cstring>`/`<algorithm>`（现有 include 列表见 `include/duct/message.h:3-9`）。旧工具链靠传递包含侥幸通过，新 libstdc++ 收紧后报 `'memcpy' is not a member of 'std'`。本轮不修，仅记录。
+**Hard build fact:** HEAD fails to compile with local GCC 15.2.0. `include/duct/message.h` uses `std::memcpy`/`std::memcmp` (`message.h:49`, `message.h:57`) and `std::min` (`message.h:47`) without including `<cstring>` or `<algorithm>` (current includes at `message.h:3-9`). Older toolchains passed through transitive includes; newer libstdc++ reports `'memcpy' is not a member of 'std'`. This round records the issue without fixing it.
 
-## 1. 分析稿概念核验
+## 1. Concept verification
 
-分析稿第三节给出七个"建议先定义"的概念。逐一对代码核验：
+The analysis proposes seven concepts. Their current state in code:
 
-| 概念 | 代码层面 | 证据 |
+| Concept | Code status | Evidence |
 |---|---|---|
-| `Runtime` | **查无** | 无任何同名类型（全仓 grep 无命中） |
-| `Endpoint` | **查无** | 同上 |
-| `MessageView` | **查无同名类型**；最近似物是 `Message::view()`，返回 `std::span` | `include/duct/message.h:37-38` |
-| `MessageBuilder` | **查无**；消息构建由 `Message` 静态工厂承担（`from_bytes`/`from_string`/`with_capacity`） | `include/duct/message.h:18-25` |
-| `SendResult` | **查无同名类型**；该角色由 `Result<void>` + `StatusCode` 扮演。注意：**没有"队列满"专用码**，队列满在阻塞路径表现为 `kTimeout`（`src/queue.cc:33-34`），在 fail-fast 路径借用 `kIoError`（`src/queue.cc:58`） | `include/duct/duct.h:84`；`include/duct/status.h:10-18` |
-| `Dispatcher` | **查无同名类型**；最近似物是 `convenience::serve`/`echo_server`/`consume_loop` 的回调循环 | `include/duct/convenience.h:279-362` |
-| `Transport` | **查无抽象类型**；该角色由 `Pipe`/`Listener` 接口 + scheme 分发承担，各传输是自由函数（`tcp_listen`/`tcp_dial`、`shm_listen`/`shm_dial`、`pipe_listen`/`pipe_dial`，另有已实现未接线的 `uds_listen`/`uds_dial`） | 接口 `include/duct/duct.h:81-99`；分发 `src/duct.cc:23-82` |
+| `Runtime` | **Not found** | No type with this name |
+| `Endpoint` | **Not found** | Same |
+| `MessageView` | **No exact type**; closest is `Message::view()`, returning `std::span` | `include/duct/message.h:37-38` |
+| `MessageBuilder` | **Not found**; `Message` static factories build messages (`from_bytes`/`from_string`/`with_capacity`) | `include/duct/message.h:18-25` |
+| `SendResult` | **No exact type**; played by `Result<void>` + `StatusCode`. There is **no queue-full code**: blocking paths return `kTimeout` (`src/queue.cc:33-34`) and fail-fast paths reuse `kIoError` (`src/queue.cc:58`) | `include/duct/duct.h:84`; `include/duct/status.h:10-18` |
+| `Dispatcher` | **No exact type**; closest are callback loops in `convenience::serve`, `echo_server`, and `consume_loop` | `include/duct/convenience.h:279-362` |
+| `Transport` | **No abstract type**; the role is handled by `Pipe`/`Listener` plus scheme dispatch, with free functions per transport (`tcp_listen`/`tcp_dial`, `shm_listen`/`shm_dial`, `pipe_listen`/`pipe_dial`, and implemented-but-unwired `uds_listen`/`uds_dial`) | Interfaces `include/duct/duct.h:81-99`; dispatch `src/duct.cc:23-82` |
 
-按用户口径注明：以上「查无」只说明**代码里没有**，不构成"全新需求"的定性——用户握有未落文档的设计历史，若这些概念曾在历史设计中出现，以用户口径为准。
+Note: "not found" means **not present in code**. It does not mean the concept is a new requirement; the user may have undocumented design history.
 
-另核验分析稿的几条事实性断言：
+Verification of factual claims in the analysis:
 
-| 分析稿断言 | 核验结果 |
+| Claim | Result |
 |---|---|
-| 「零拷贝」（旧 README 也这么宣传） | **不成立**。shm 发送是 memcpy 进槽（`src/shm_transport.cc:400`），接收是 `Message::from_bytes` 再复制一次（`src/shm_transport.cc:424`、`src/message.cc:7-16`）；wire 路径同样两次复制（`src/wire.cc:171-175`、`src/wire.cc:186-191`）。现状即分析稿说的阶段 1「Copy Send」 |
-| 「有界、预分配的共享内存通道」 | **成立**。每连接两环，每环 64 槽 × 64 KiB 固定（`src/shm_transport.cc:42-43`、`src/shm_transport.cc:146-165`），满则按超时阻塞（有测试 `tests/duct_tests.cc:176-223`） |
-| 「SPSC 起步」 | **现状即 SPSC**：每环单生产者单消费者，head/tail 各一方推进（`src/shm_transport.cc:146-149`） |
-| 批量收发 | **查无真批量**。`convenience::send_batch`/`recv_batch` 只是单发循环（`include/duct/convenience.h:229-263`），不减少原子操作或系统调用 |
+| "Zero-copy" (also claimed by the old README) | **False.** The shm send path copies into a slot (`src/shm_transport.cc:400`), and receive copies again through `Message::from_bytes` (`src/shm_transport.cc:424`, `src/message.cc:7-16`). The wire path also copies twice (`src/wire.cc:171-175`, `186-191`). This is the analysis's stage 1, "Copy Send" |
+| "Bounded, pre-allocated shared-memory channel" | **True.** Each connection has two rings, each with 64 fixed slots × 64 KiB (`src/shm_transport.cc:42-43`, `146-165`), and a full ring blocks according to the timeout (tested at `tests/duct_tests.cc:176-223`) |
+| "Start with SPSC" | **Current state is SPSC**: one producer and one consumer per ring, with head/tail advanced by opposite sides (`src/shm_transport.cc:146-149`) |
+| Batch send/receive | **No true batching.** `convenience::send_batch`/`recv_batch` are loops over single sends (`include/duct/convenience.h:229-263`), reducing neither atomics nor syscalls |
 
-## 2. 横切发现（比单文件结论更重要）
+## 2. Cross-cutting findings
 
-1. **六个源文件不在构建里。** `CMakeLists.txt:7-23` 只编译 `address/duct/message/qos_pipe/shm_transport/tcp_transport/wire`（Windows 加 `win_shm/pipe_transport`）。**未编译**：`src/uds_transport.cc`、`src/reconnect_pipe.cc`、`src/state_callback_pipe.cc`、`src/socket_utils.cc`、`src/logging.cc`、`src/queue.cc`。它们与配套头文件（`logging.h`、`queue.h`、`socket_utils.h`）一起构成"看不见的死代码"——编译器从不检查它们。
-2. **自动重连是广告功能。** `DialOptions::reconnect` 与 `on_state_change` 可以设置（`include/duct/duct.h:101-108`，builder 入口 `include/duct/convenience.h:50-65`），但 `dial()` 全程不读取（`src/duct.cc:43-82` 无一处引用 `opt.reconnect`/`opt.on_state_change`）。实现文件 `reconnect_pipe.cc`、`state_callback_pipe.cc` 写完了却从未被调用（`make_reconnect_pipe`/`make_state_callback_pipe` 全仓零调用方），且不在构建里。`heartbeat_interval` 同样无人消费（仅定义于 `include/duct/duct.h:43`）。
-3. **QoS 名不副实且不对称。** `QosPipe` 只在 dial 侧包裹、只管发送队列（recv 直接透传，`src/qos_pipe.cc:158-160`）；`rcv_hwm_bytes`、`linger`、`Reliability` 枚举全仓无消费者（仅定义于 `include/duct/duct.h:59,66,23-26`）；`ListenOptions::qos` 被各 listen 忽略（如 `src/shm_transport.cc:488-493` 只用 `backlog`）。默认 `DialOptions` 的 `snd_hwm_bytes=4MB` 非零，触发 `src/duct.cc:76` 的包裹条件——**默认每个 dial 都套 QosPipe 并起后台线程**，空闲时靠 1ms 轮询睡眠（`src/qos_pipe.cc:92-98`）。TODO.md M2/M3 标注的 "Implemented: on_state_change / auto-reconnect / linger" 与事实不符。
-4. **uds:// 解析得了、用不了。** `Address::parse` 认识 `uds`（`src/address.cc:37`），但 `listen`/`dial` 的分发没有 uds 分支（`src/duct.cc:29-39`、`src/duct.cc:51-71`），运行时返回 `not_supported`。且 `uds_transport.cc` 依赖的 `socket_utils.cc` 也不在构建里，接上线即断链。
-5. **README 与代码不符（旧 README 的清单）**：宣传"零拷贝/自动重连/连接状态回调"（皆不成立，见上）；文档给出 `-DDUCT_INSTALL=OFF`、install 目标、`find_package(duct)`、pkg-config（`CMakeLists.txt` 无任何 `install()`/导出逻辑，`cmake/*.in` 模板从未被引用生成）；列出 `duct_convenience_example`/`duct_async_example`/`duct_utils_example` 三个二进制（CMake 从不构建它们，`CMakeLists.txt:42-57`）；许可证写"待定"（实际 `LICENSE` 为 MIT，2025 cuihairu）。
-6. **ODR 隐患**：`struct QueuedMessage` 在 `include/duct/queue.h:16-21` 与 `include/duct/qos_pipe.h:18-24` 同名同 namespace（`duct`）重复定义。当前 queue.h 无人包含所以未爆，一旦同 TU 引入即重定义错误。
-7. **测试盲区**：`tests/duct_tests.cc` 覆盖地址解析、shm echo、shm 满环超时、wire 编解码与 macOS SIGPIPE（`tests/duct_tests.cc:44-451`），但 QoS 包装层、重连、uds、并发收发、大消息、多消息顺序均无覆盖；且测试通过把 `snd_hwm_bytes` 置 0 **绕过** QosPipe（`tests/duct_tests.cc:96-98` 等四处）——QoS 路径实际零测试。
-8. **`duct_export.h` 整文件无引用**：无任何文件包含它，`DUCT_API` 零使用；其中 `#define DUCT Experimental [[deprecated(...)]]`（`include/duct/duct_export.h:30`）本身是写坏的宏。
+1. **Six source files are not in the build.** `CMakeLists.txt:7-23` compiles only `address`, `duct`, `message`, `qos_pipe`, `shm_transport`, `tcp_transport`, and `wire` (plus `win_shm`/`pipe_transport` on Windows). **Excluded:** `src/uds_transport.cc`, `reconnect_pipe.cc`, `state_callback_pipe.cc`, `socket_utils.cc`, `logging.cc`, and `queue.cc`. With their headers, they form invisible dead code that the compiler never checks.
+2. **Automatic reconnect is advertised but not implemented.** `DialOptions::reconnect` and `on_state_change` can be configured (`include/duct/duct.h:101-108`; builder entry `include/duct/convenience.h:50-65`), but `dial()` never reads them (`src/duct.cc:43-82`). `reconnect_pipe.cc` and `state_callback_pipe.cc` are never called and are not compiled. `heartbeat_interval` has no consumer either (`include/duct/duct.h:43`).
+3. **QoS is asymmetric and misleading.** `QosPipe` wraps only the dial side and only the send queue; receive is passed through (`src/qos_pipe.cc:158-160`). `rcv_hwm_bytes`, `linger`, and the `Reliability` enum have no consumers (declared at `include/duct/duct.h:59,66,23-26`). Every `listen` ignores `ListenOptions::qos` (for example, `src/shm_transport.cc:488-493` uses only `backlog`). The default non-zero `DialOptions::snd_hwm_bytes=4MB` triggers wrapping at `src/duct.cc:76`, so **every dial gets a QosPipe and a background thread**, idle-polling every 1 ms (`src/qos_pipe.cc:92-98`). TODO.md's M2/M3 "Implemented" markers for `on_state_change`, auto-reconnect, and linger are false.
+4. **`uds://` parses but does not work.** `Address::parse` recognizes `uds` (`src/address.cc:37`), but `listen`/`dial` have no uds branch (`src/duct.cc:29-39`, `51-71`) and return `not_supported`. Its dependency `socket_utils.cc` is also not compiled.
+5. **The old README contradicted the code.** It advertised zero-copy, automatic reconnect, and connection-state callbacks (all false); documented `-DDUCT_INSTALL=OFF`, install targets, `find_package(duct)`, and pkg-config although there is no install/export logic; listed three example binaries CMake never builds; and said the license was undecided although `LICENSE` is MIT (2025, cuihairu).
+6. **ODR hazard:** `struct QueuedMessage` is defined twice in namespace `duct`, in `include/duct/queue.h:16-21` and `include/duct/qos_pipe.h:18-24`. Nothing includes both today, so it has not failed yet.
+7. **Test blind spots:** `tests/duct_tests.cc` covers address parsing, shm echo, shm full-ring timeout, wire encoding/decoding, and macOS SIGPIPE (`tests/duct_tests.cc:44-451`). It does not cover the QoS wrapper, reconnect, uds, concurrent send/receive, large messages, or ordering across multiple messages. Several tests disable QosPipe by setting `snd_hwm_bytes` to 0 (`tests/duct_tests.cc:96-98` and three other places), so the QoS path has zero coverage.
+8. **`duct_export.h` is unreferenced.** No file includes it and `DUCT_API` is never used. `#define DUCT Experimental [[deprecated(...)]]` at `include/duct/duct_export.h:30` is itself malformed.
 
-## 3. include/duct/（14 文件）
+## 3. `include/duct/` (14 files)
 
-| 文件 | 分类 | 结论 |
+| File | Classification | Conclusion |
 |---|---|---|
-| `duct.h` | 保留 | 核心脊柱：`Pipe`/`Listener`（`duct.h:81-99`）+ 全部选项类型，是未来 Endpoint 契约的最近似物。遗留债务记档：`ReconnectPolicy`/`ConnectionCallback` 广告未接线（§2.2），`rcv_hwm_bytes`/`linger`/`Reliability` 无消费者（§2.3），重构轮要么接线要么先删字段 |
-| `message.h` | 保留 | 消息模型核心，`shared_ptr<vector>` 背书 + 裸指针视图（`message.h:64-67`）。修构建即补 `<cstring>`/`<algorithm>`；远期按 Copy→Batch→Claim 路线演化，方向见 adoption 文档 |
-| `status.h` | 保留 | `Status`/`Result`/`StatusCode` 错误模型（`status.h:62-185`），是未来 `SendResult` 语义的载体。重构轮需补"队列满"专用码（现状借用 `kTimeout`/`kIoError`，§1） |
-| `address.h` | 保留 | 地址解析结果类型（`address.h:16-26`），小而正确，被分发依赖 |
-| `protocol.h` | 保留 | 帧常量与 scheme 枚举（`protocol.h:11-20`）。改名注记：magic 仍是 `'DUCT'`（0x44554354），属后续实现轮 |
-| `wire.h` | 保留 | 字节流帧协议：16 字节头、64 KiB 上限、跨平台句柄（`wire.h:11-23`），tcp/uds/pipe 共用 |
-| `raii.h` | 保留 | `ScopedPipe`/`ScopedListener` 纯头文件 RAII 薄封装（`raii.h:17-132`），无害且实用 |
-| `socket_utils.h` | 保留 | 平台 socket 辅助（poll/select/FIONBIO，`socket_utils.h:20-34`），uds 接线时必需；注记：其 .cc 当前不在构建（§2.1） |
-| `convenience.h` | 重构 | builder 思路可留，内容要瘦身：`auto_reconnect()` 链式设置后静默无效（§2.2）必须在重构轮消除（接线或移除）；`request()` 是裸 send+recv 无请求关联（`convenience.h:202-212`）；`send_batch` 是伪批量（§1）；`serve`/`echo_server` 可作为 Dispatcher 雏形收编进核心 |
-| `qos_pipe.h` | 重构 | "QoS"名不副实（§2.3）：仅发送侧、仅字节界、后台线程轮询。改法方向：与 `queue.h` 二存一，语义改为明确的"有界发送缓冲 + 背压策略"，`QueuedMessage` 撞名（§2.6）必须处理 |
-| `async.h` | 删除 | 与定位正面冲突：`Channel` 无界增长（`async.h:242-249` push 无任何上限）、回调风格每次操作 detach 一个线程（`async.h:104-119`）、`EventLoop` 是 100ms 轮询（`async.h:154-183`，注释自认应换 epoll）。分析稿明确"第一版不要通用事件循环/异步框架" |
-| `queue.h` | 删除 | `MessageQueue` 未编译、零引用（§2.1），`hwm_bytes=0` 即无限（`queue.cc:221-223`）违背有界原则，且与 qos_pipe.h 撞名（§2.6）。进程内有界队列如需，按 SPSC 环重设计，不复用这份 deque+mutex 实现 |
-| `logging.h` | 删除 | 自带日志框架 + 指标体系（Counter/Gauge/Histogram/Registry 单例，`logging.h:239-412`）超出消息运行时定位；`Histogram::observe` 把所有观测值压进无界 vector（`logging.h:354-356`）直接违反有界内存原则；配套 .cc 未编译。性能数字归 aello-bench，运行时日志后续按最小 hook 重议 |
-| `utils.h` | 删除 | 通用工具杂物箱：`Port`/`TcpAddr`/字符串拼接器/`StrongType`/字面量（`utils.h:21-100`、`248-310`、`347-376`），与消息运行时无关，零测试，纯 API 面膨胀。YAGNI |
-| `duct_export.h` | 删除 | 零引用整文件（§2.8），`DUCT_API` 从未标注任何符号，宏本体写坏；导出宏等真做库打包时重来 |
+| `duct.h` | Keep | Core spine: `Pipe`/`Listener` (`duct.h:81-99`) and all option types, the closest thing to a future Endpoint contract. Debt: reconnect/callback options are unwired; receive watermark, linger, and reliability have no consumers. Either wire them or delete the fields during refactoring |
+| `message.h` | Keep | Core message model: `shared_ptr<vector>` backing with a raw-pointer view (`message.h:64-67`). Add the missing standard headers to fix the build; evolve toward Copy → Batch → Claim as described in the adoption document |
+| `status.h` | Keep | `Status`/`Result`/`StatusCode` error model (`status.h:62-185`) and the future carrier for `SendResult` semantics. Add a queue-full code rather than borrowing `kTimeout`/`kIoError` |
+| `address.h` | Keep | Small, correct address-parse result type (`address.h:16-26`) used by dispatch |
+| `protocol.h` | Keep | Frame constants and scheme enum (`protocol.h:11-20`). The magic value is still `'DUCT'` (0x44554354); rename later |
+| `wire.h` | Keep | Byte-stream framing: 16-byte header, 64 KiB limit, cross-platform handle (`wire.h:11-23`); shared by TCP, UDS, and pipe |
+| `raii.h` | Keep | Header-only RAII wrappers `ScopedPipe`/`ScopedListener` (`raii.h:17-132`); harmless and useful |
+| `socket_utils.h` | Keep | Platform socket helpers (`socket_utils.h:20-34`), required when UDS is wired; its `.cc` is not currently compiled |
+| `convenience.h` | Refactor | Keep the builder idea but slim it down. `auto_reconnect()` silently does nothing and must be wired or removed. `request()` is bare send+receive with no request correlation (`convenience.h:202-212`). `send_batch` is fake batching. `serve`/`echo_server` can become Dispatcher prototypes in the core |
+| `qos_pipe.h` | Refactor | The "QoS" name overpromises: send-side only, byte-bound only, background polling. Keep one of this and `queue.h`, and define the semantics as an explicit bounded send buffer plus backpressure policy. Resolve the duplicate `QueuedMessage` name |
+| `async.h` | Delete | Conflicts with the project direction: unbounded `Channel` (`async.h:242-249`), one detached thread per callback operation (`async.h:104-119`), and a 100 ms polling `EventLoop` (`async.h:154-183`) that its own comment says should use epoll. The analysis explicitly excludes a general event loop/async framework from v1 |
+| `queue.h` | Delete | `MessageQueue` is uncompiled and unreferenced, `hwm_bytes=0` means unlimited (`queue.cc:221-223`) and violates the bounded-memory principle, and the name collides with `qos_pipe.h`. If an in-process bounded queue is needed later, redesign it around the SPSC ring rather than this deque+mutex implementation |
+| `logging.h` | Delete | The bundled logging and metrics framework (Counter/Gauge/Histogram/Registry, `logging.h:239-412`) is outside a messaging runtime. `Histogram::observe` stores every observation in an unbounded vector (`logging.h:354-356`), directly violating bounded memory. Its `.cc` is uncompiled. Performance data belongs to aello-bench; revisit runtime logging later as a minimal hook |
+| `utils.h` | Delete | General-purpose grab bag (`Port`/`TcpAddr`/string joiner/`StrongType`/literals at `utils.h:21-100`, `248-310`, `347-376`) unrelated to messaging, untested, and pure API-surface expansion. YAGNI |
+| `duct_export.h` | Delete | Entire file is unreferenced, `DUCT_API` marks nothing, and the macro is malformed. Revisit export macros when library packaging is real |
 
-## 4. src/（16 文件）
+## 4. `src/` (16 files)
 
-| 文件 | 分类 | 结论 |
+| File | Classification | Conclusion |
 |---|---|---|
-| `duct.cc` | 保留 | scheme 分发中枢（`duct.cc:23-82`）。重构注记：接线 uds 分支；`duct.cc:76` 的 QoS 包裹条件（`hwm!=0 || policy!=kBlock`）语义晦涩，重构轮改为显式 opt-in |
-| `address.cc` | 保留 | 解析实现与测试对齐（`tests/duct_tests.cc:44-76`） |
-| `message.cc` | 保留 | 随 `message.h` 补头文件即修复 |
-| `shm_transport.cc` | 保留 | **主性能路径，定位核心**：POSIX 侧固定槽双环 + 命名信号量 + UDS 引导（`shm_transport.cc:146-165`、`305-373`、`488-527`）。已知边界记档：槽参数硬编码（`shm_transport.cc:42-43`）、崩溃残留靠 owner close 时 unlink（`shm_transport.cc:430-440`）无进程异常退出恢复、信号量等待 macOS 走 1ms 轮询回退（`shm_transport.cc:119-134`）。这些是 aello-shm P0 的演进项，不是删除项 |
-| `win_shm.cc` | 保留 | Windows 侧同构实现：`CreateFileMapping`/`MapViewOfFile`/命名信号量（`win_shm.cc:212-249`），与 POSIX 侧同环同参数，保持双平台对齐 |
-| `tcp_transport.cc` | 保留 | 网络后端（分析稿 P2 但已存在且可用）：帧收发 + NODELAY + 端口 0 支持（`tcp_transport.cc:115-160`、`218-236`）。保留作参照与本地网联调用 |
-| `pipe_transport.cc` | 保留 | Windows 命名管道后端（`pipe_transport.cc:250-303`），对应 aello-local 定位的本地兼容路径 |
-| `socket_utils.cc` | 保留 | 见 `socket_utils.h`；重构轮随 uds 接线一并入构建 |
-| `qos_pipe.cc` | 重构 | 随 `qos_pipe.h`（§2.3 全部条目）；另 `send_worker` 对 `kDropNew`/`kDropOld` 的处理与 `send()` 内分支重复且不一致（`qos_pipe.cc:88-99` vs `qos_pipe.cc:117-145`），重构时统一 |
-| `uds_transport.cc` | 重构 | 实现完整（超时连接、路径清理，`uds_transport.cc:104-235`）但未分发未编译（§2.4）。改法方向：接线进 `duct.cc` 分发 + `socket_utils.cc` 入构建 + 补测试；接线前 README 不宣传 uds |
-| `reconnect_pipe.cc` | 重构 | 实现质量尚可（指数退避+抖动、状态机、stale error 防护，`reconnect_pipe.cc:132-198`），但未编译未接线。改法方向：接线进 `dial()` 的 `opt.reconnect.enabled` 路径并删掉字段广告落差；shm 场景无意义，仅 tcp/pipe 生效 |
-| `reconnect_pipe.h` | 重构 | 同上 |
-| `logging.cc` | 删除 | 实现死头文件 `logging.h` 的 `ConsoleLogger`，本身不在构建（§2.1） |
-| `queue.cc` | 删除 | 死代码（§2.1、§2.6） |
-| `state_callback_pipe.cc` | 删除 | 从未调用未编译（§2.2）；职责与 `ReconnectPipe` 的状态回调重叠，接线重连时由后者统一承担 |
-| `state_callback_pipe.h` | 删除 | 同上 |
+| `duct.cc` | Keep | Scheme dispatch hub (`duct.cc:23-82`). Refactor notes: wire the UDS branch; make the obscure QoS-wrap condition at `duct.cc:76` (`hwm!=0 || policy!=kBlock`) explicit opt-in |
+| `address.cc` | Keep | Parsing implementation aligns with tests (`tests/duct_tests.cc:44-76`) |
+| `message.cc` | Keep | Fixed together with the missing includes in `message.h` |
+| `shm_transport.cc` | Keep | **Primary performance path and core of the project**: POSIX fixed-slot double ring + named semaphores + UDS bootstrap (`shm_transport.cc:146-165`, `305-373`, `488-527`). Known limits: hard-coded slot parameters (`42-43`), crash cleanup only through owner-close unlink (`430-440`) with no abnormal-exit recovery, and a 1 ms polling fallback for semaphore waits on macOS (`119-134`). These are evolution items for aello-shm, not reasons to delete |
+| `win_shm.cc` | Keep | Isomorphic Windows implementation: `CreateFileMapping`/`MapViewOfFile`/named semaphores (`win_shm.cc:212-249`), aligned with the POSIX ring parameters |
+| `tcp_transport.cc` | Keep | Network backend (P2 in the analysis, but already present and usable): framing + NODELAY + port 0 (`tcp_transport.cc:115-160`, `218-236`). Keep as a reference and local-network path |
+| `pipe_transport.cc` | Keep | Windows named-pipe backend (`pipe_transport.cc:250-303`), the local compatibility path for aello-local |
+| `socket_utils.cc` | Keep | See `socket_utils.h`; add it to the build when wiring UDS |
+| `qos_pipe.cc` | Refactor | Follows `qos_pipe.h`; additionally, `send_worker` handles `kDropNew`/`kDropOld` differently from the branches in `send()` (`qos_pipe.cc:88-99` vs `117-145`). Unify during refactoring |
+| `uds_transport.cc` | Refactor | Complete implementation (connect timeout, path cleanup, `uds_transport.cc:104-235`) but not dispatched or compiled. Wire it into `duct.cc`, compile `socket_utils.cc`, add tests, and do not advertise UDS until then |
+| `reconnect_pipe.cc` | Refactor | Reasonable implementation (exponential backoff with jitter, state machine, stale-error guard, `reconnect_pipe.cc:132-198`) but uncompiled and unwired. Wire it into `dial()` when `opt.reconnect.enabled` and remove the documentation gap. It is meaningless for shm and applies only to TCP/pipe |
+| `reconnect_pipe.h` | Refactor | Same |
+| `logging.cc` | Delete | Implements the dead `logging.h` `ConsoleLogger`; not compiled |
+| `queue.cc` | Delete | Dead code |
+| `state_callback_pipe.cc` | Delete | Never called or compiled; its state-callback role overlaps `ReconnectPipe` and can be subsumed when reconnect is wired |
+| `state_callback_pipe.h` | Delete | Same |
 
-## 5. tests/（1 文件）
+## 5. `tests/` (1 file)
 
-| 文件 | 分类 | 结论 |
+| File | Classification | Conclusion |
 |---|---|---|
-| `duct_tests.cc` | 重构 | 现有 7 个用例有价值（尤其 shm 满环超时与 wire 边界，`tests/duct_tests.cc:176-223`、`298-451`），但：手搓 EXPECT 宏无框架（`duct_tests.cc:30-42`）；QoS 靠置 0 绕过而非直测（§2.7）；无多进程/压力/崩溃用例（分析稿 aello-test 的核心内容全缺）；uds 无法测（未接线）。改法方向：按 aello-test P0 扩展——先补 QoS 直测与并发收发，再多进程与 kill -9 重启矩阵 |
+| `duct_tests.cc` | Refactor | Seven useful cases remain, especially shm full-ring timeout and wire boundaries (`tests/duct_tests.cc:176-223`, `298-451`). Problems: hand-rolled EXPECT macros (`30-42`); QoS bypassed rather than tested; no multi-process, stress, or crash cases; UDS untestable because it is unwired. Expand per aello-test P0: direct QoS tests and concurrent send/receive first, then multi-process and `kill -9` restart matrices |
 
-## 6. examples/（8 文件）
+## 6. `examples/` (8 files)
 
-| 文件 | 分类 | 结论 |
+| File | Classification | Conclusion |
 |---|---|---|
-| `duct_echo_server.cc` | 保留 | 最小服务端样例，在构建内（`CMakeLists.txt:43-44`），nightly 打包引用它 |
-| `duct_echo_client.cc` | 保留 | 同上 |
-| `pipe_test.cc` | 保留 | Windows 命名管道手动联调用，在构建内 |
-| `shm_test.cc` | 重构 | 手动联调有价值，在构建内；但输出文案写死 "Windows shared memory server"（`examples/shm_test.cc:28`）而它对 POSIX 同样工作，误导；随重构轮改文案并参数化 |
-| `qos_test.cc` | 重构 | 手动双终端工具，在构建内；其演示的背压行为恰是 CI 零覆盖区（§2.7），重构轮应转成自动化用例而非留在 examples |
-| `convenience_example.cc` | 重构 | **不在构建内**（§2.5）；演示 `auto_reconnect()` 等实际无效的功能等于教用户踩坑。改法方向：随 convenience.h 瘦身重写，只演示真实生效的 API，并入 CMake |
-| `async_example.cc` | 删除 | 依赖判死的 `async.h`，且不在构建内 |
-| `utils_example.cc` | 删除 | 依赖判死的 `utils.h`，且不在构建内 |
+| `duct_echo_server.cc` | Keep | Minimal server example, in the build (`CMakeLists.txt:43-44`), referenced by nightly packaging |
+| `duct_echo_client.cc` | Keep | Same |
+| `pipe_test.cc` | Keep | Manual Windows named-pipe tool, in the build |
+| `shm_test.cc` | Refactor | Useful for manual testing and in the build, but its output says "Windows shared memory server" (`examples/shm_test.cc:28`) although it also works on POSIX. Fix the text and parameterize it |
+| `qos_test.cc` | Refactor | Manual two-terminal tool in the build. Its backpressure demo is exactly the untested area of CI; turn it into automated coverage instead of leaving it in examples |
+| `convenience_example.cc` | Refactor | **Not in the build**. It demonstrates `auto_reconnect()` and other features that do not work, teaching users bad practice. Rewrite it alongside the convenience.h cleanup to show only effective APIs, and add it to CMake |
+| `async_example.cc` | Delete | Depends on doomed `async.h` and is not built |
+| `utils_example.cc` | Delete | Depends on doomed `utils.h` and is not built |
 
-## 7. 构建与配套（不计入三分类总量）
+## 7. Build and support files
 
-- `CMakeLists.txt`：**重构对象**。六个源文件缺席（§2.1）；三个 example 缺席（§2.5）；无 install/export；project 名仍是 `duct`（`CMakeLists.txt:2`）。重构轮先补齐构建再谈改名。
-- `cmake/ductConfig.cmake.in`、`cmake/duct.pc.in`、`cmake/duct_version.h.in`：**重构对象**。三份模板零引用——`ductTargets.cmake` 从不生成，版本头从不配置。要么接线 install 真做打包，要么删除；现状是"仓库里躺着的虚构交付面"。
-- `.github/workflows/cmake-multi-platform.yml`：保留。GCC/Clang/MSVC 矩阵 + ctest，符合多平台验收需要（`cmake-multi-platform.yml:25-45`）。注记：它目前没拦住 message.h 的构建破损（ubuntu-latest 的 GCC 版本较旧），等 runner 升级即暴露。
-- `.github/workflows/nightly.yml`：保留。schedule + dispatch、滚动 nightly tag、prerelease 标记（`nightly.yml:122-140`），符合"nightly 允许、正式版本只由用户手动触发"的红线。
-- `TODO.md`：**重构对象**。M2/M3 的 "Implemented" 标注与代码不符（§2.3）；整体按旧定位写就。由 adoption 文档接管路线图后降级为历史参考或重写。
-- `README.md`：本轮已按新定位重写（英文主文档 + `README.zh.md`），旧版失实清单见 §2.5。
+- `CMakeLists.txt`: **refactor.** Six source files and three examples are missing, there is no install/export, and the project name is still `duct` (`CMakeLists.txt:2`). Fix the build before renaming.
+- `cmake/ductConfig.cmake.in`, `cmake/duct.pc.in`, `cmake/duct_version.h.in`: **refactor or delete.** All three are unreferenced; no targets file is generated and the version header is never configured. Either implement packaging or remove the fictional delivery surface.
+- `.github/workflows/cmake-multi-platform.yml`: **keep.** GCC/Clang/MSVC matrix plus CTest (`cmake-multi-platform.yml:25-45`). It did not catch the `message.h` break because `ubuntu-latest` still has an older GCC; the failure will surface when the runner updates.
+- `.github/workflows/nightly.yml`: **keep.** Schedule/dispatch, rolling nightly tag, and prerelease marker (`nightly.yml:122-140`) fit the rule that nightly builds are automatic but releases remain manual.
+- `TODO.md`: **refactor.** M2/M3 "Implemented" markers are false and the document follows the old positioning. Demote it to historical reference or rewrite it once the adoption document owns the roadmap.
+- `README.md`: rewritten to the new positioning this round (English primary + `README.zh.md`).
 
-## 8. 建议的处理顺序（供下一实现轮，本轮不动代码）
+## 8. Recommended order for the next implementation round
 
-1. 修构建：`message.h` 补 `<cstring>`/`<algorithm>`——一行改动解锁一切。
-2. 删除名单落地：§3/§4/§6 的 11 个删除项 + `cmake/` 三模板（或接线打包，二选一）。
-3. 构建补齐：`uds_transport.cc`/`socket_utils.cc` 入构建并接线 uds 分支，或明确 park（删分发外的部分）。
-4. 消除广告落差：`ReconnectPolicy`/`on_state_change` 接线或删字段；`rcv_hwm_bytes`/`linger`/`Reliability` 同理。
-5. 测试补盲：QoS 直测、并发收发、进程异常退出矩阵。
-6. 之后才谈 namespace/品牌改名与模块目标拆分（aello-core/shm/bench/test 的 CMake 化）。
+1. Fix the build: add `<cstring>`/`<algorithm>` to `message.h`.
+2. Apply the delete list: 11 files plus the three CMake templates (or implement packaging).
+3. Complete the build: wire `uds_transport.cc`/`socket_utils.cc` and the UDS branch, or explicitly park them.
+4. Remove documentation gaps: wire or delete `ReconnectPolicy`/`on_state_change` and `rcv_hwm_bytes`/`linger`/`Reliability`.
+5. Add missing tests: direct QoS, concurrent send/receive, abnormal process exit.
+6. Only then rename namespaces/branding and split CMake targets (`aello-core`/`shm`/`bench`/`test`).

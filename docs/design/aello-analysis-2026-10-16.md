@@ -1,552 +1,221 @@
-# Aello 分析报告（外部，整理稿）
+# Aello Analysis Report (External Draft)
 
-> 来源：https://chatgpt.com/s/t_6ad1057e6b4081918ad731e17983e85f
-> 整理日期：2026-10-16
-> **性质：外部分析，不是本仓事实。** 动手前必须对代码逐条核验；
-> 文中「已有实现 / 此前设计」一律按 **未落文档** 处理，先核验再定性。
-> 本仓前身 **duct 已改名为 aello**（GitHub 重定向仍有效）。
+> Source: <https://chatgpt.com/s/t_6ad1057e6b4081918ad731e17983e85f>
+> Compiled: 2026-10-16
+> **Status: external analysis, not established project fact.** Verify every claim against the code before acting. References to "existing implementation" or "earlier design" should be treated as **undocumented** until checked.
+> The project formerly known as **duct has been renamed to aello** (GitHub redirects still work).
 
 ---
 
-## 一、先确定 Aello 到底要做什么
+## 1. Establish what Aello is for
 
-我建议把 Aello 定位为：
+I recommend positioning Aello as:
 
 > **Aello — A high-performance messaging runtime for game servers.**
 >
-> 面向游戏服务器的高性能消息运行时，重点解决进程之间如何以低延迟、可预测、可观测的方式传递消息。
+> A low-latency, predictable, observable runtime for passing messages between server processes.
 
-它不是要重新实现一个 BigWorld，也不是简单把共享内存、Aeron 和 ZeroMQ 包在同一个 API 后面。
+It is not a reimplementation of BigWorld, nor a thin wrapper that hides shared memory, Aeron, and ZeroMQ behind one API.
 
-Aello 应该吸收它们各自最有价值的设计思想：
+Aello should absorb the most valuable design ideas from each system:
 
-- 从 **BigWorld Mercury** 学习游戏服务器场景中的消息组织、通道、可靠性和通信生命周期。
-- 从 **Aeron** 学习低延迟传输、共享内存 IPC、缓冲区管理、流量控制和性能测试思路。
-- 从 **ZeroMQ** 学习统一消息抽象、传输后端隔离、队列策略和消息通信模式。
-- 从 **Folly ProducerConsumerQueue** 学习固定容量 SPSC 队列的低同步开销设计。
-- 从 **Boost.Interprocess** 学习共享内存、进程共享同步原语、内存布局和跨进程对象生命周期管理。
+- **BigWorld Mercury**: message organization, channels, reliability, and communication lifecycles in game servers.
+- **Aeron**: low-latency transport, shared-memory IPC, buffer management, flow control, and performance testing.
+- **ZeroMQ**: a unified messaging abstraction, transport isolation, queue policies, and communication patterns.
+- **Folly ProducerConsumerQueue**: low-synchronization design for fixed-capacity SPSC queues.
+- **Boost.Interprocess**: shared memory, process-shared synchronization, memory layout, and cross-process object lifetimes.
 
-这里的关键不是把这些项目的功能全部叠加，而是为游戏后端的实际工作负载选择合适的机制。
+The goal is not to accumulate every feature from these projects. It is to select the mechanisms that fit real game-backend workloads.
 
-## 二、研究成熟项目后，Aello 应该吸收什么
+## 2. What Aello should learn from mature projects
 
-这里需要先区分一个容易混淆的地方：高性能不只是把消息放进共享内存，还涉及缓存命中、线程竞争、内存分配、消费者唤醒、背压以及慢消费者对其他消息流的影响。
+High performance is not just putting messages in shared memory. It also involves cache locality, thread contention, allocation, consumer wake-up, backpressure, and the effect of slow consumers on unrelated message flows.
 
-[images: Aeron messaging transport architecture logo minimal abstract]
+**Aeron — the main transport reference.** Aeron provides high-performance IPC and UDP transport, with Media Driver, Publication, and Subscription concepts. Its flow control bounds how far a producer may run ahead of a consumer. Aello should study these mechanisms rather than copy the API.
 
-**Aeron — 传输层的主要研究对象**
+**LMAX Disruptor — queue and scheduling model.** Worth studying for pre-allocated ring buffers, sequence numbers, consumer dependency graphs, and the trade-off between busy polling and blocking waits. Disruptor's event-processing model is not a complete cross-process protocol.
 
-IPC、UDP、流、缓冲区、背压
+**ZeroMQ — messaging abstraction and patterns.** Its unified message API and backend isolation are useful references. Automatic reconnect, brokers, pub/sub, and every routing pattern do not all belong in the first release.
 
-Aeron 已经支持进程内外的高性能消息传输，并使用 Media Driver、Publication、Subscription 等概念组织传输。它的流量控制也能限制生产者领先于消费者的程度。Aello 应研究这些机制，而不是简单复制 API。
+**Folly / Moodycamel — concurrent queues.** Folly's SPSC queue uses fixed capacity and separate producer and consumer endpoints. Moodycamel splits queues per producer. Aello should begin with the simple SPSC path and introduce multi-producer structures only when real workloads justify them.
 
----
+**Boost.Interprocess — shared-memory infrastructure.** Study creation and destruction, process-shared synchronization primitives, permissions, relative-offset pointers, and resource lifetimes. Shared memory cannot safely contain ordinary process-local pointers or unverified object layouts.
 
-[images: LMAX Disruptor ring buffer concurrency architecture abstract diagram]
+### Key conclusion
 
-**LMAX Disruptor — 队列与调度模型**
+Do not start by building a complete Aeron replacement. **Own the game-specific message runtime and IPC core, keep network transport pluggable, and integrate mature network libraries such as Aeron when necessary.** This avoids becoming another broad communication framework that is shallow in every area.
 
-预分配内存、序列号、等待策略
+## 3. Overall architecture
 
-值得研究预分配环形缓冲区、消费者依赖关系，以及忙轮询与阻塞等待的取舍。特别要注意，Disruptor 的事件处理模型不等于一个完整的跨进程通信协议。
+Split Aello into three clear boundaries: **message runtime, transport backends, and optional game-communication extensions**.
 
----
+### Game communication extensions (optional)
 
-[images: ZeroMQ messaging patterns request reply publish subscribe pipeline abstract network diagram]
+RPC · request/response · service addressing · sessions
 
-**ZeroMQ — 消息抽象与通信模式**
-
-消息边界、传输抽象、队列策略
-
-可以借鉴统一消息 API 和后端隔离，但不必把自动重连、代理、发布订阅和所有路由模式都放入第一版。
-
----
-
-[images: Folly ProducerConsumerQueue C++ source code ring buffer]
-
-**Folly / Moodycamel — 并发队列**
-
-SPSC、MPSC、MPMC、批量操作
-
-Folly 的 SPSC 队列使用固定容量，并让生产者和消费者各自操作对应端点；Moodycamel 的队列采用按生产者拆分子队列等设计。Aello 应从简单的单生产者单消费者路径开始，再依据真实工作负载决定是否引入多生产者机制。
-
----
-
-[images: Boost Interprocess shared memory memory mapped file synchronization diagram]
-
-**Boost.Interprocess — 共享内存基础设施**
-
-映射、同步、进程共享对象
-
-重点研究共享内存的创建与销毁、进程共享同步原语、权限、相对偏移指针和资源生命周期。共享内存不能直接依赖普通进程内指针或未经验证的对象布局。
-
-### 从这些项目得出的关键结论
-
-我不建议 Aello 一开始就自研一套完整的 Aeron 替代品。
-
-更合理的路线是：**自己掌握游戏场景下的消息运行时与 IPC 核心，同时把网络传输作为可插拔后端，必要时直接集成成熟的 Aeron 或其他网络库。**
-
-这样才能避免项目再次变成一套功能很多、每个模块都不够深入的通用通信框架。
-
-## 三、Aello 的整体架构
-
-我建议把 Aello 分成三个边界清晰的部分：**消息运行时、传输后端、游戏通信扩展**。
-
-### 游戏通信扩展（可选模块）
-
-RPC · Request/Response · Service Addressing · Session
-
-游戏进程调用、请求关联、服务定位；不强制进入核心库
+Game-process calls, request correlation, and service discovery. None of these are forced into the core library.
 
 ### Aello Runtime
 
-**Endpoint**
+**Endpoint** — a process communication endpoint
 
-进程通信端点
+**Message** — message boundaries and metadata
 
-**Message**
+**Dispatcher** — receive and dispatch
 
-消息边界与元数据
+**Flow Control** — queue capacity and backpressure
 
-**Dispatcher**
+### Transport backends
 
-接收与分发
+Shared memory (primary performance path), local sockets (compatibility path), and network transport (later extension).
 
-**Flow Control**
+The diagram describes a target architecture. It does not claim that the current repository already implements these modules.
 
-队列容量与背压
+### 3.1 Runtime Core
 
-### Transport Backends
+Begin with a minimal, stable public vocabulary:
 
-Shared Memory
+| Concept | Responsibility |
+|---|---|
+| `Runtime` | Initialization, resource management, startup, and shutdown |
+| `Endpoint` | An endpoint that can send or receive messages |
+| `MessageView` | Read-only message view that does not own the underlying memory by default |
+| `MessageBuilder` | Build a message for sending |
+| `SendResult` | Distinguish sent, queue full, endpoint closed, and related outcomes |
+| `Dispatcher` | Route received messages to the appropriate handler |
+| `Transport` | Hide differences between transport mechanisms |
 
-主性能路径
+The first version does not need `Future`, a complex async framework, a general event loop, or timers. First design synchronous send, batch send/receive, and receiver polling. Decide later whether an async wrapper is warranted.
 
-Local Socket
+### 3.2 Shared memory as the primary performance path
 
-本地兼容后端
+Start with a **bounded, pre-allocated shared-memory message channel**, not a universal queue.
 
-Network
+- Fixed-capacity ring buffers, so the normal path does not allocate and free memory repeatedly.
+- Fixed headers plus bounded payloads, or descriptors backed by shared-memory buffers.
+- Fixed layouts, explicit alignment, and relative offsets across processes. Never store ordinary pointers in shared memory.
+- Explicit atomic synchronization and memory ordering, so consumers never observe a partially published message.
+- Isolate frequently written producer and consumer state to reduce false sharing.
+- Define queue-full behavior explicitly: immediate return, bounded wait, or blocking wait. Never allow implicit unbounded growth.
+- Make the wait strategy configurable: busy polling, brief CPU yield, or OS wait primitives.
 
-后续扩展
+**Do not assume that using `std::atomic` makes shared memory, crash recovery, or cross-platform behavior automatically safe.** Verify the implementation conditions for each target OS and compiler, and add abnormal-process-exit tests.
 
-注意：图中是建议的目标架构，不代表现有 Duct 仓库已经实现了这些模块。
+### 3.3 Message ownership and memory management
 
-### 1. Runtime Core：核心消息运行时
+Treat zero-copy as an optional capability, not a first-version slogan. Separate three stages:
 
-建议先定义最小而稳定的公共概念：
+1. **Copy Send**: the caller supplies a payload and the library copies it into the queue.
+2. **Batch Send**: submit multiple messages at once to reduce atomic operations and call overhead.
+3. **Claim / Commit**: the caller claims a shared buffer, writes to it, explicitly commits, and the receiver releases it after processing.
 
-| 概念 | 职责 |
-|--------|--------|
-| `Runtime` | 初始化、资源管理、启动和关闭 |
-| `Endpoint` | 表示可发送或接收消息的端点 |
-| `MessageView` | 只读消息视图，不默认拥有底层内存 |
-| `MessageBuilder` | 构建待发送消息 |
-| `SendResult` | 明确发送成功、队列满、端点关闭等结果 |
-| `Dispatcher` | 将接收到的消息交给相应处理逻辑 |
-| `Transport` | 屏蔽底层传输机制的差异 |
+The third stage reduces copies, but introduces buffer lifetimes, failed commits, leaked uncommitted buffers, and abnormal process termination. It requires an explicit ownership protocol before implementation.
 
-第一版不需要把 `Future`、复杂异步框架、通用事件循环和定时器全部塞进来。先把同步发送接口、批量收发接口和接收端轮询机制设计好，之后再决定是否增加异步封装。
+## 4. Message semantics for game servers
 
-### 2. Shared Memory：主性能路径
+Game servers differ from ordinary business messaging middleware: messages are not merely data delivery. They can affect entity state, frame logic, request/response timing, and cross-process call ordering.
 
-我建议先实现一个**有界、预分配的共享内存消息通道**，而不是一上来就做万能队列。
+For example, a game backend may exchange messages between **BaseApp** (player sessions, entities, business requests) and **CellApp** (spatial entities, scene logic, simulation updates), as well as DB or other service processes. This is an illustrative relationship, not a universal deployment topology.
 
-核心设计：
+Aello should deliberately layer its message semantics:
 
-- 固定容量环形队列，避免正常收发路径反复申请和释放内存。
-- 消息槽使用固定头部和有界载荷，或者使用描述符加共享内存缓冲区。
-- 跨进程数据结构使用固定布局、明确对齐和相对偏移，避免把普通指针直接写进共享内存。
-- 使用明确的原子同步与内存序，保证消费者不会读到尚未发布完成的消息。
-- 分离生产者与消费者频繁更新的状态，减少伪共享。
-- 明确队列满时的行为：立即返回、限时等待或阻塞等待；不能无限制地隐式增长。
-- 提供可配置的等待策略：忙轮询、短暂让出 CPU、操作系统等待机制。
+| Message category | Example | First-stage policy |
+|---|---|---|
+| One-way messages | State updates, notifications, events | Supported |
+| Request / response | Query an entity, load data | Optional upper-layer module |
+| Batch messages | A group of entity updates or events | Core batch send/receive support |
+| Sequenced messages | Frame number, state version, event sequence | Metadata extension; do not decide game semantics |
+| Broadcast / multiple subscribers | Regional state, public events | Later |
+| Scheduled / delayed messages | Delayed execution, timeout jobs | Not in the first core |
 
-这里需要特别注意：**共享内存中的原子变量、进程崩溃恢复和跨平台行为，不能仅凭“使用了 `std::atomic`”就假设全部安全。** 应根据目标操作系统和编译器验证实现条件，并设计进程异常退出测试。
+### Do not conflate reliability, ordering, and transport
 
-### 3. 消息所有权与内存管理
+A message transported over shared memory is not automatically reliable after the receiving process crashes. Likewise, FIFO ordering does not guarantee that messages from multiple producers match the global order required by game logic.
 
-我更倾向于把零拷贝作为可选能力，而不是第一版的宣传口号。
+Define separate stages:
 
-建议区分三个阶段：
+- **Transport success**: the message entered the transport backend.
+- **Receive success**: the receiver obtained the message.
+- **Processing complete**: application logic handled it.
+- **Persistence complete**: durable state was written when the application requires it.
 
-1. **Copy Send**：调用方提供载荷，库负责将数据复制到队列。
-2. **Batch Send**：一次提交多条消息，减少原子操作和函数调用开销。
-3. **Claim / Commit**：调用方申请共享缓冲区，写入后显式提交，接收方处理后释放。
+The first version should promise only transport behavior with a precise contract. Do not claim end-to-end exactly-once. Reliable retry belongs with request IDs, idempotency, and application-level acknowledgements.
 
-第三种方式可以减少复制，但会引入缓冲区生命周期、提交失败、未提交缓冲区泄漏和进程异常终止等复杂问题。必须先有明确的所有权协议，才能实现。
+## 5. How to set performance goals
 
-## 四、针对游戏行业，消息模型应该怎么设计？
+Do not start with a marketing number such as "ten million messages per second" and design backwards. Build repeatable benchmarks first.
 
-游戏服务器与普通业务消息中间件有一个重要区别：消息不只是“把数据送到对方”，还可能影响实体状态、帧逻辑、请求响应和跨进程调用的时序。
+Cover four dimensions:
 
-例如，你熟悉的游戏服务器可能存在这样的通信：
+**Latency** — p50, p95, p99, and p99.9 one-way latency, plus round-trip latency. Tail latency and jitter matter more than the mean.
 
-**BaseApp**
+**Throughput** — messages per second and payload bytes per second for each message-size bucket. Do not report only one metric.
 
-玩家会话、实体与业务请求
+**Resource cost** — CPU utilization, CPU cycles per message, memory footprint, context switches, and the cost of different wait strategies.
 
-实体调用 / 状态更新 / RPC
+**Stress and failure** — slow consumers, full queues, producer bursts, forced process termination, restart, and resource cleanup. Performance results are valid only alongside correctness tests.
 
-**CellApp**
+Use the same machine and comparable workloads to test at least:
 
-空间实体、场景逻辑、模拟更新
-
----
-
-**DB / Other Service Processes**
-
-持久化请求、结果通知、服务间事件
-
-示意通信关系，并非所有游戏引擎的实际部署拓扑。
-
-因此，Aello 的消息语义需要有意识地分层。
-
-| 消息类别 | 示例 | 第一阶段策略 |
-|--------|--------|--------|
-| 单向消息 | 状态更新、通知、事件 | 支持 |
-| 请求 / 响应 | 查询实体、加载数据 | 作为上层可选模块 |
-| 批量消息 | 一批实体更新、多个事件 | 核心支持批量收发 |
-| 带序号消息 | 帧号、状态版本、事件序号 | 提供元数据扩展，不替游戏决定语义 |
-| 广播 / 多订阅者 | 区域状态、公共事件 | 后续增加 |
-| 定时与延迟消息 | 延迟执行、超时任务 | 不放入第一版核心 |
-
-### 特别重要：不要把可靠性、顺序和传输方式混成一个选项
-
-例如，消息可以通过共享内存传输，但这并不自动意味着它在接收进程崩溃后仍然可靠。类似地，FIFO 队列的顺序也不代表多个生产者提交的消息一定符合游戏逻辑所需的全局顺序。
-
-建议为 Aello 明确区分：
-
-- **传输成功**：消息已进入传输后端。
-- **接收成功**：接收方已经取得消息。
-- **处理完成**：接收方业务逻辑已经处理。
-- **持久化完成**：如果业务要求持久化，相关状态已经持久化。
-
-第一版可以只保证有明确契约的传输行为，不要声称提供端到端 exactly-once。对于需要可靠重试的业务，应结合请求 ID、幂等处理和业务确认设计。
-
-## 五、性能目标应该如何确定？
-
-不要先写一个“每秒千万条消息”的宣传数字，再反过来设计架构。应先建立可重复的基准测试。
-
-建议 Aello 的性能测试覆盖以下维度：
-
-**延迟**
-
-测量单向消息延迟的 p50、p95、p99、p99.9，以及请求往返延迟。除平均值外，重点关注尾延迟和抖动。
-
-**吞吐量**
-
-按消息大小分别测试消息数/秒和有效载荷字节数/秒，避免只报告一种指标。
-
-**资源成本**
-
-记录 CPU 使用率、每条消息的 CPU 周期、内存占用、上下文切换，以及不同等待策略的资源成本。
-
-**压力与故障**
-
-测试慢消费者、队列满、生产者突发、进程被强制终止、重启和资源清理。性能数据必须与正确性测试同时成立。
-
-建议使用同一台机器、同一组负载，至少对比：
-
-1. Aello Shared Memory。
-2. Aello 的本地 Socket 后端。
-3. Aeron IPC。
-4. 一个简单的 SPSC 队列基线。
-5. 如果研究跨机器传输，再比较 Aeron UDP 或其他网络方案。
-
-Aeron 的官方项目和文档已经提供性能测试、IPC 和 UDP 相关设计资料，可作为重要对照。
-
-## 六、我建议的模块与实施顺序
-
-| 模块 | 职责 | 优先级 |
-|--------|--------|--------|
-| `aello-core` | 消息模型、错误类型、端点契约 | P0 |
-| `aello-shm` | 共享内存、环形队列、同步机制 | P0 |
-| `aello-bench` | 吞吐、延迟、资源与竞争基准 | P0 |
-| `aello-test` | 多进程、压力、崩溃和重启测试 | P0 |
-| `aello-local` | UDS / Windows 本地通信适配 | P1 |
-| `aello-rpc` | 请求关联、响应、超时与取消 | P1 |
-| `aello-network` | 可插拔网络后端或成熟库适配 | P2 |
-| `aello-pubsub` | 多订阅者、广播和分发策略 | P2 |
-
-这里的 P0/P1/P2 是建议的开发顺序，不代表已经有这些代码模块。
-
-### 推荐的实施阶段
-
-1. **阶段 1：基准与契约**
- 
- 确定操作系统、消息大小分布、生产者和消费者数量、顺序要求、满队列行为与性能测试方法。先建立可复现的对照基线。
-2. **阶段 2：最小共享内存引擎**
- 
- 实现有界 SPSC 队列、消息发布与消费、进程间唤醒、关闭和资源清理。验证内存序、进程终止与重启行为。
-3. **阶段 3：游戏服务器集成**
- 
- 使用模拟的 BaseApp / CellApp 负载测试单向消息、批量状态更新和请求响应，验证真实消息大小与突发模式。
-4. **阶段 4：扩展并发模型**
- 
- 根据基准结果决定是否增加 MPSC、MPMC、多通道、批量提交、零拷贝与更复杂的等待策略。不要为了功能表好看而提前实现。
-5. **阶段 5：网络和上层语义**
- 
- 再评估 UDS、TCP、Aeron 适配、RPC、服务寻址和广播。让传输层与游戏业务协议保持分离。
-
-## 七、最终定位与名称
-
-我建议正式采用：
+1. Aello shared memory.
+2. Aello's local socket backend.
+3. Aeron IPC.
+4. A simple SPSC queue baseline.
+5. Aeron UDP or another network option when investigating cross-machine transport.
+
+Aeron's own benchmarks and documentation are important reference material.
+
+## 6. Modules and implementation order
+
+| Module | Responsibility | Priority |
+|---|---|---|
+| `aello-core` | Message model, error types, endpoint contracts | P0 |
+| `aello-shm` | Shared memory, ring queues, synchronization | P0 |
+| `aello-bench` | Throughput, latency, resource, and contention benchmarks | P0 |
+| `aello-test` | Multi-process, stress, crash, and restart tests | P0 |
+| `aello-local` | UDS / Windows local-transport adapter | P1 |
+| `aello-rpc` | Request correlation, response, timeout, cancellation | P1 |
+| `aello-network` | Pluggable network backend or mature-library adapter | P2 |
+| `aello-pubsub` | Multiple subscribers, broadcast, dispatch policy | P2 |
+
+P0/P1/P2 describe recommended order, not modules that already exist.
+
+### Recommended stages
+
+1. **Benchmarks and contracts** — define operating systems, message-size distribution, producer/consumer counts, ordering requirements, queue-full behavior, and measurement method. Establish a reproducible baseline.
+2. **Minimal shared-memory engine** — implement a bounded SPSC queue, publish/consume, inter-process wake-up, shutdown, and cleanup. Verify memory ordering, process termination, and restart.
+3. **Game-server integration** — use simulated BaseApp/CellApp workloads to test one-way messages, batch state updates, and request/response with realistic sizes and bursts.
+4. **Concurrency model** — use benchmark evidence to decide whether MPSC, MPMC, multiple channels, batch commit, zero-copy, or more complex wait strategies are justified.
+5. **Network and upper-layer semantics** — then evaluate UDS, TCP, Aeron, RPC, service addressing, and broadcast. Keep transport separate from the game protocol.
+
+## 7. Final positioning and name
+
+Adopt:
 
 # Aello
 
 High-Performance Messaging Runtime for Game Servers
 
----
+**Core positioning**
 
-**核心定位**
+A high-performance process-communication and messaging runtime for game servers: bounded, low-latency, observable local message channels first, with clear extension boundaries for network transport and game communication semantics.
 
-一个面向游戏服务器的高性能进程通信与消息运行时，优先提供有界、低延迟、可观测的本机消息通道，并为后续网络传输和游戏通信语义提供清晰扩展边界。
+**Core principles**
 
-**核心原则**
+- Low latency without sacrificing correctness.
+- Bounded memory; queues never grow without limit.
+- Separate transport from message semantics.
+- Validate one performance path before expanding the concurrency model.
+- Every performance claim must be supported by a reproducible benchmark.
 
-- 低延迟，但不牺牲正确性。
-- 有界内存，不让队列无限增长。
-- 传输与消息语义分离。
-- 优先验证单一性能路径，再扩展并发模型。
-- 所有性能结论必须由可复现基准支持。
+My conclusion is that Aello should not become a project that merely aggregates fast communication libraries. It should be infrastructure **with shared-memory IPC as its first performance target, the game-server message runtime as its core abstraction, and mature network adapters as extensions**.
 
-我的最终判断是：Aello 不应该成为一个“把所有高速通信库功能拼起来”的项目，而应该成为一个**以共享内存 IPC 为首个性能目标、以游戏服务器消息运行时为核心抽象、以成熟网络传输适配为扩展能力**的基础设施。
-
-下一步最值得做的不是立即实现所有模块，而是针对现有 `cuihairu/duct` 逐文件审计：区分哪些实现可以保留、哪些 API 需要重构、哪些功能应当删除，并据此生成一份可以直接交给 Code Agent 执行的 Aello 技术设计与迁移计划。
+The next step is not to implement every module. It is to audit the existing `cuihairu/duct` code file by file: identify what to keep, what API to refactor, and what to delete, then turn that into an Aello technical design and migration plan that a coding agent can execute.
 
 ---
 
-If you want, I can:
-
-- 继续详细设计 Aello 的消息传输与同步机制
-- 提出具体的基准测试方案和测试用例设计
-- 规划 Aello 基于不同场景的模块开发路线图
-
----
-
->后续扩展</text>
- </box>
- </grid-item>
- </grid>
- </box>
-</box>
-
-注意：图中是建议的目标架构，不代表现有 Duct 仓库已经实现了这些模块。
-
-### 1. Runtime Core：核心消息运行时
-
-建议先定义最小而稳定的公共概念：
-
-| 概念 | 职责 |
-|---|---|
-| `Runtime` | 初始化、资源管理、启动和关闭 |
-| `Endpoint` | 表示可发送或接收消息的端点 |
-| `MessageView` | 只读消息视图，不默认拥有底层内存 |
-| `MessageBuilder` | 构建待发送消息 |
-| `SendResult` | 明确发送成功、队列满、端点关闭等结果 |
-| `Dispatcher` | 将接收到的消息交给相应处理逻辑 |
-| `Transport` | 屏蔽底层传输机制的差异 |
-
-第一版不需要把 `Future`、复杂异步框架、通用事件循环和定时器全部塞进来。先把同步发送接口、批量收发接口和接收端轮询机制设计好，之后再决定是否增加异步封装。
-
-### 2. Shared Memory：主性能路径
-
-我建议先实现一个**有界、预分配的共享内存消息通道**，而不是一上来就做万能队列。
-
-核心设计：
-
-- 固定容量环形队列，避免正常收发路径反复申请和释放内存。
-- 消息槽使用固定头部和有界载荷，或者使用描述符加共享内存缓冲区。
-- 跨进程数据结构使用固定布局、明确对齐和相对偏移，避免把普通指针直接写进共享内存。
-- 使用明确的原子同步与内存序，保证消费者不会读到尚未发布完成的消息。
-- 分离生产者与消费者频繁更新的状态，减少伪共享。
-- 明确队列满时的行为：立即返回、限时等待或阻塞等待；不能无限制地隐式增长。
-- 提供可配置的等待策略：忙轮询、短暂让出 CPU、操作系统等待机制。
-
-这里需要特别注意：**共享内存中的原子变量、进程崩溃恢复和跨平台行为，不能仅凭“使用了 `std::atomic`”就假设全部安全。** 应根据目标操作系统和编译器验证实现条件，并设计进程异常退出测试。
-
-### 3. 消息所有权与内存管理
-
-我更倾向于把零拷贝作为可选能力，而不是第一版的宣传口号。
-
-建议区分三个阶段：
-
-1. **Copy Send**：调用方提供载荷，库负责将数据复制到队列。
-2. **Batch Send**：一次提交多条消息，减少原子操作和函数调用开销。
-3. **Claim / Commit**：调用方申请共享缓冲区，写入后显式提交，接收方处理后释放。
-
-第三种方式可以减少复制，但会引入缓冲区生命周期、提交失败、未提交缓冲区泄漏和进程异常终止等复杂问题。必须先有明确的所有权协议，才能实现。
-
-## 四、针对游戏行业，消息模型应该怎么设计？
-
-游戏服务器与普通业务消息中间件有一个重要区别：消息不只是“把数据送到对方”，还可能影响实体状态、帧逻辑、请求响应和跨进程调用的时序。
-
-例如，你熟悉的游戏服务器可能存在这样的通信：
-
-<box border radius=
-
----
-
->示意通信关系，并非所有游戏引擎的实际部署拓扑。</text>
-</box>
-
-因此，Aello 的消息语义需要有意识地分层。
-
-| 消息类别 | 示例 | 第一阶段策略 |
-|---|---|---|
-| 单向消息 | 状态更新、通知、事件 | 支持 |
-| 请求 / 响应 | 查询实体、加载数据 | 作为上层可选模块 |
-| 批量消息 | 一批实体更新、多个事件 | 核心支持批量收发 |
-| 带序号消息 | 帧号、状态版本、事件序号 | 提供元数据扩展，不替游戏决定语义 |
-| 广播 / 多订阅者 | 区域状态、公共事件 | 后续增加 |
-| 定时与延迟消息 | 延迟执行、超时任务 | 不放入第一版核心 |
-
-### 特别重要：不要把可靠性、顺序和传输方式混成一个选项
-
-例如，消息可以通过共享内存传输，但这并不自动意味着它在接收进程崩溃后仍然可靠。类似地，FIFO 队列的顺序也不代表多个生产者提交的消息一定符合游戏逻辑所需的全局顺序。
-
-建议为 Aello 明确区分：
-
-- **传输成功**：消息已进入传输后端。
-- **接收成功**：接收方已经取得消息。
-- **处理完成**：接收方业务逻辑已经处理。
-- **持久化完成**：如果业务要求持久化，相关状态已经持久化。
-
-第一版可以只保证有明确契约的传输行为，不要声称提供端到端 exactly-once。对于需要可靠重试的业务，应结合请求 ID、幂等处理和业务确认设计。
-
-## 五、性能目标应该如何确定？
-
-不要先写一个“每秒千万条消息”的宣传数字，再反过来设计架构。应先建立可重复的基准测试。
-
-建议 Aello 的性能测试覆盖以下维度：
-
-<box border radius=
-
----
-
- gap={2}>
- <list-item>
- **阶段 1：基准与契约**
-
- 确定操作系统、消息大小分布、生产者和消费者数量、顺序要求、满队列行为与性能测试方法。先建立可复现的对照基线。
- </list-item>
- <list-item>
- **阶段 2：最小共享内存引擎**
-
- 实现有界 SPSC 队列、消息发布与消费、进程间唤醒、关闭和资源清理。验证内存序、进程终止与重启行为。
- </list-item>
- <list-item>
- **阶段 3：游戏服务器集成**
-
- 使用模拟的 BaseApp / CellApp 负载测试单向消息、批量状态更新和请求响应，验证真实消息大小与突发模式。
- </list-item>
- <list-item>
- **阶段 4：扩展并发模型**
-
- 根据基准结果决定是否增加 MPSC、MPMC、多通道、批量提交、零拷贝与更复杂的等待策略。不要为了功能表好看而提前实现。
- </list-item>
- <list-item>
- **阶段 5：网络和上层语义**
-
- 再评估 UDS、TCP、Aeron 适配、RPC、服务寻址和广播。让传输层与游戏业务协议保持分离。
- </list-item>
-</list>
-
-## 七、最终定位与名称
-
-我建议正式采用：
-
-<box border radius=
-
----
-
- />
- **核心定位**
-
- 一个面向游戏服务器的高性能进程通信与消息运行时，优先提供有界、低延迟、可观测的本机消息通道，并为后续网络传输和游戏通信语义提供清晰扩展边界。
-
- **核心原则**
-
- - 低延迟，但不牺牲正确性。
- - 有界内存，不让队列无限增长。
- - 传输与消息语义分离。
- - 优先验证单一性能路径，再扩展并发模型。
- - 所有性能结论必须由可复现基准支持。
-</box>
-
-我的最终判断是：Aello 不应该成为一个“把所有高速通信库功能拼起来”的项目，而应该成为一个**以共享内存 IPC 为首个性能目标、以游戏服务器消息运行时为核心抽象、以成熟网络传输适配为扩展能力**的基础设施。
-
-下一步最值得做的不是立即实现所有模块，而是针对现有 `cuihairu/duct` 逐文件审计：区分哪些实现可以保留、哪些 API 需要重构、哪些功能应当删除，并据此生成一份可以直接交给 Code Agent 执行的 Aello 技术设计与迁移计划。
-
----
-
-If you want, I can:
-
-- 继续详细设计 Aello 的消息传输与同步机制
-- 提出具体的基准测试方案和测试用例设计
-- 规划 Aello 基于不同场景的模块开发路线图
-
----
-
-]}/>
-
-## 六、我建议的模块与实施顺序
-
-| 模块 | 职责 | 优先级 |
-|---|---|---|
-| `aello-core` | 消息模型、错误类型、端点契约 | P0 |
-| `aello-shm` | 共享内存、环形队列、同步机制 | P0 |
-| `aello-bench` | 吞吐、延迟、资源与竞争基准 | P0 |
-| `aello-test` | 多进程、压力、崩溃和重启测试 | P0 |
-| `aello-local` | UDS / Windows 本地通信适配 | P1 |
-| `aello-rpc` | 请求关联、响应、超时与取消 | P1 |
-| `aello-network` | 可插拔网络后端或成熟库适配 | P2 |
-| `aello-pubsub` | 多订阅者、广播和分发策略 | P2 |
-
-这里的 P0/P1/P2 是建议的开发顺序，不代表已经有这些代码模块。
-
-### 推荐的实施阶段
-
-<list marker=
-
----
-
- gap={1}>
- **压力与故障**
-
- 测试慢消费者、队列满、生产者突发、进程被强制终止、重启和资源清理。性能数据必须与正确性测试同时成立。
- </box>
- </row>
-</box>
-
-建议使用同一台机器、同一组负载，至少对比：
-
-1. Aello Shared Memory。
-2. Aello 的本地 Socket 后端。
-3. Aeron IPC。
-4. 一个简单的 SPSC 队列基线。
-5. 如果研究跨机器传输，再比较 Aeron UDP 或其他网络方案。
-
-Aeron 的官方项目和文档已经提供性能测试、IPC 和 UDP 相关设计资料，可作为重要对照。<Cite refs={[
-
----
-
-]}/>
- </box>
- </row>
-</box>
-
-### 从这些项目得出的关键结论
-
-我不建议 Aello 一开始就自研一套完整的 Aeron 替代品。
-
-更合理的路线是：**自己掌握游戏场景下的消息运行时与 IPC 核心，同时把网络传输作为可插拔后端，必要时直接集成成熟的 Aeron 或其他网络库。**
-
-这样才能避免项目再次变成一套功能很多、每个模块都不够深入的通用通信框架。
-
-## 三、Aello 的整体架构
-
-我建议把 Aello 分成三个边界清晰的部分：**消息运行时、传输后端、游戏通信扩展**。
-
-<box border radius=
+Possible follow-ups:
+
+- Detailed design of Aello's message transport and synchronization mechanisms.
+- A concrete benchmark plan and test-case design.
+- A scenario-based module roadmap.

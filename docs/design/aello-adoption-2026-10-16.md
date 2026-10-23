@@ -1,88 +1,80 @@
-# Aello 分析稿吸收结论（2026-10-16）
+# Aello Analysis Adoption Decisions (2026-10-16)
 
-> 输入：外部分析稿 `docs/design/aello-analysis-2026-10-16.md` + 逐文件审计 `docs/design/aello-audit-2026-10-16.md`。
-> 用户口径：「审核并吸收一部分」。本文只落**采纳/延后结论与理由**，本轮零实现代码。
-> 事实口径：代码现状以审计文档的 file:line 为准，分析稿原文不作为事实来源。
+> Inputs: external analysis `docs/design/aello-analysis-2026-10-16.md` and file audit `docs/design/aello-audit-2026-10-16.md`.
+> User direction: "review and adopt part of it." This document records **adopt/defer decisions and rationale** only. No implementation code is included.
+> Source of truth: current code behavior is defined by file:line evidence in the audit, not by the external analysis.
 
-## 1. 定位：采纳
+## 1. Positioning: adopted
 
-**「High-Performance Messaging Runtime for Game Servers」** 已按此重写 README（英文主文档 + `README.zh.md`）。
+**"High-Performance Messaging Runtime for Game Servers"** is adopted and reflected in the README (English primary + `README.zh.md`).
 
-两条"不是"一并落档：
+Two non-goals are also recorded:
 
-- 不是重写 BigWorld——吸收的是 Mercury 对游戏消息组织（通道、可靠性、生命周期）的思考方式，不做引擎级复刻。
-- 不是把共享内存 / Aeron / ZeroMQ 包在一个 API 后面——传输后端可插拔，必要时直接集成成熟网络库，不自研全功能替代品。
+- It is not a BigWorld rewrite. It borrows Mercury's thinking about game-message organization (channels, reliability, lifecycle), not engine-level replication.
+- It is not shared memory / Aeron / ZeroMQ hidden behind one API. Transport backends remain pluggable, and mature network libraries may be integrated directly instead of building a full replacement.
 
-## 2. 模块划分与优先级
+## 2. Modules and priorities
 
-分析稿的模块表按现状核对后逐项定性。**优先级排序采纳为路线图**；模块 CMake 目标拆分延后到实现轮（当前是单 target `duct`，`CMakeLists.txt:7-15`）。
+The analysis's module table was checked against current code. **The priority ordering is adopted as the roadmap**; splitting CMake targets is deferred to an implementation round (the repository currently has one `duct` target, `CMakeLists.txt:7-15`).
 
-| 分析稿模块 | 优先级 | 结论 | 现状与理由 |
+| Analysis module | Priority | Decision | Current state and rationale |
 |---|---|---|---|
-| `aello-core` 消息模型/错误类型/端点契约 | P0 | **采纳** | 种子已在：`Message`/`Status`/`Result`/`Pipe`/`Listener`/wire 帧。第一步是审计文档 §8 的删减（去 utils/logging/async/export），不是新增概念；`Runtime`/`Endpoint` 等类型是否引入待实现轮按契约设计定 |
-| `aello-shm` 共享内存/环形队列/同步 | P0 | **采纳** | 主性能路径已存在且形态正确（固定槽双环+信号量，`shm_transport.cc:42-43`）。演进项（描述符+内存池、eventfd/futex 唤醒、崩溃恢复）挂在基准证据之后，见 §3.1 |
-| `aello-bench` 吞吐/延迟/资源基准 | P0 | **采纳，当前最大空白** | 全仓没有任何基准；examples 里全是手动联调工具。分析稿"先基准后优化"的阶段 1 正是从零开始的第一项工作 |
-| `aello-test` 多进程/压力/崩溃测试 | P0 | **采纳** | 现有 `duct_tests.cc` 单文件单进程，崩溃重启矩阵全缺（审计 §5）。扩展路径已列 |
-| `aello-local` UDS/Windows 本地适配 | P1 | **采纳方向，实现延后** | 审计发现 `uds_transport.cc` 已实现但未接线未编译（审计 §2.4）；接线+补测是 P1 第一件事，不是新写 |
-| `aello-rpc` 请求关联/超时/取消 | P1 | **延后** | 现有 `convenience::request` 是裸 send+recv，无请求 ID 关联（`convenience.h:202-212`）；需要核心契约先稳，不提前造 |
-| `aello-network` 可插拔网络后端/Aeron 适配 | P2 | **延后** | `tcp_transport.cc` 保持现状够用；是否集成 Aeron 等到有跨机需求再决策 |
-| `aello-pubsub` 多订阅者/广播 | P2 | **延后** | 现状每连接 SPSC 双环，广播是另一个分发层问题，不混进核心 |
+| `aello-core` message model / errors / endpoint contracts | P0 | **Adopt** | Seeds already exist: `Message`/`Status`/`Result`/`Pipe`/`Listener`/wire framing. The first step is the audit §8 cleanup (remove utils/logging/async/export), not adding concepts. Whether to introduce `Runtime`/`Endpoint` is left to the implementation round |
+| `aello-shm` shared memory / ring queues / synchronization | P0 | **Adopt** | The primary path already exists in the right shape (fixed-slot double ring + semaphores, `shm_transport.cc:42-43`). Evolution items (descriptors + memory pool, eventfd/futex wake-up, crash recovery) wait for benchmark evidence; see §3.1 |
+| `aello-bench` throughput / latency / resource benchmarks | P0 | **Adopt — currently the largest gap** | The repository has no benchmarks; examples are manual test tools. The analysis's stage 1, "benchmark before optimizing," is the first task from a zero baseline |
+| `aello-test` multi-process / stress / crash tests | P0 | **Adopt** | `duct_tests.cc` is one single-process file and lacks the crash/restart matrix (audit §5). The expansion path is defined |
+| `aello-local` UDS/Windows local adapter | P1 | **Adopt direction, defer implementation** | The audit found `uds_transport.cc` implemented but unwired and uncompiled. Wiring and tests are the first P1 task, not a rewrite |
+| `aello-rpc` request correlation / timeout / cancellation | P1 | **Defer** | `convenience::request` is bare send+receive with no request-ID correlation (`convenience.h:202-212`). Stabilize core contracts first |
+| `aello-network` pluggable network backend / Aeron adapter | P2 | **Defer** | `tcp_transport.cc` is sufficient for now. Decide on Aeron when a cross-machine requirement appears |
+| `aello-pubsub` multiple subscribers / broadcast | P2 | **Defer** | Current connections use a dual SPSC ring; broadcast is a separate dispatch-layer problem and should not be mixed into the core |
 
-## 3. 四条专项裁决
+## 3. Four specific rulings
 
-### 3.1 零拷贝作为可选能力（Copy → Batch → Claim/Commit 三阶段）
+### 3.1 Zero-copy as an optional capability (Copy → Batch → Claim/Commit)
 
-**裁决：路线图采纳，实现按阶段推进；当下处于阶段 1，Batch 与 Claim/Commit 明确延后。**
+**Ruling: adopt as a roadmap; implement in stages. The project is at stage 1; Batch and Claim/Commit are explicitly deferred.**
 
-理由与现状：
+- The current implementation is stage 1 (Copy Send): shm send copies into a slot (`shm_transport.cc:400`) and receive copies again (`shm_transport.cc:424`). This is not a regression; it is the correct starting point recommended by the analysis.
+- **Batch deferred:** true batching (multiple messages per submission, amortizing atomics and semaphore posts) requires a ring-queue API. Existing `convenience::send_batch` is a fake batch that loops over single sends (`convenience.h:229-240`) and must not be described as batch capability.
+- **Claim/Commit deferred:** a cross-process buffer-ownership protocol needs ownership documentation and crash tests before it can handle failed commits, uncommitted leaks, and abnormal process termination. Until aello-bench proves copying is a bottleneck, the complexity is not justified. The README no longer advertises zero-copy.
 
-- 现状就是阶段 1（Copy Send）：shm 发送 memcpy 进槽（`shm_transport.cc:400`），接收再复制（`shm_transport.cc:424`）。这不是退步，是分析稿建议的正确起点。
-- **Batch 延后**：真批量（一次提交多条、摊薄原子操作与信号量 post）需要环形队列 API 配合；现有 `convenience::send_batch` 是单发循环的假批量（`convenience.h:229-240`），不吸收为"已具备批量能力"。
-- **Claim/Commit 延后**：引入跨进程缓冲区所有权协议（提交失败、未提交泄漏、进程异常终止回收）之前必须有所有权文档与崩溃测试；在 aello-bench 证明复制是瓶颈之前，不值得付这个复杂度。README 已停止宣传"零拷贝"。
+### 3.2 Four success states (transport / receive / processing / persistence)
 
-### 3.2 四种成功状态区分（传输/接收/处理/持久化）
+**Ruling: adopt the vocabulary in design documents; defer API changes. The v1 contract promises only "transport success."**
 
-**裁决：语义分层采纳进文档；API 层延后；第一版契约只承诺到"传输成功"。**
+- The current error model exposes transport-level results only (`Result<void>` + `StatusCode`, `status.h:10-18`), and has no queue-full code. Blocking paths borrow `kTimeout`; fail-fast paths borrow `kIoError` (`queue.cc:33-58`).
+- Receive acknowledgement, business completion, and durable persistence are upper-layer semantics and the core library must not pretend to provide them. The analysis's rule that v1 guarantees only explicitly contracted transport behavior, without claiming end-to-end exactly-once, is adopted for the README.
+- Implementation action: add a queue-full code to `StatusCode`; keep the four-state distinction as design vocabulary rather than a v1 API.
 
-理由与现状：
+### 3.3 Bounded memory; no implicit queue growth
 
-- 现有错误模型只有传输级结果（`Result<void>` + `StatusCode`，`status.h:10-18`），且无"队列满"专用码（阻塞超时借用 `kTimeout`，fail-fast 借用 `kIoError`，`queue.cc:33-58`）。
-- 接收确认、业务处理完成、持久化完成属于上层语义，核心库不假装提供。分析稿"第一版只保证有明确契约的传输行为，不声称端到端 exactly-once"直接采纳为 README 契约口径。
-- 实现轮动作：给 `StatusCode` 补队列满专用码，使传输级契约自洽；四态区分作为词汇表落在设计文档，不进 v1 API。
+**Ruling: adopt now, promote to a core principle, and state it in the README.**
 
-### 3.3 有界内存、禁止队列隐式增长
+- The main path already complies: the shm ring is fixed at 64 slots × 64 KiB (`shm_transport.cc:42-43`), and QosPipe applies a byte high-water mark (`qos_pipe.cc:117`). The principle confirms existing behavior rather than imposing a new one.
+- Violations (all already on the audit delete/refactor list): unbounded `async::Channel` (`async.h:242-249`), unbounded `Histogram` observations (`logging.h:354-356`), and `MessageQueue` treating `hwm=0` as unlimited (`queue.cc:221-223`).
+- Refactor note: QosPipe limits bytes but not item count, so tiny messages can accumulate excessive entries (`qos_pipe.cc:117` compares only bytes). Add an item cap or charge by slot.
 
-**裁决：当下采纳，升格为核心原则并写入 README。**
+### 3.4 Start with SPSC; decide MPSC/MPMC from real load
 
-理由与现状：
+**Ruling: adopt now (it describes the current implementation); defer MPSC/MPMC until benchmark evidence exists.**
 
-- 代码主路径已符合：shm 环固定 64 槽 × 64 KiB（`shm_transport.cc:42-43`），QosPipe 按字节高水位限流（`qos_pipe.cc:117`）。原则是对既有事实的确认，不是新要求。
-- 违例清单（全部在审计的删除/重构名单内，删除即消解）：`async::Channel` 无界（`async.h:242-249`）、`Histogram` 观测值无界（`logging.h:354-356`）、`MessageQueue` hwm=0 即无限（`queue.cc:221-223`）。
-- 重构注记：QosPipe 只限字节不限条数，极小消息可堆积大量条目（`qos_pipe.cc:117` 只比 bytes）；重构时补条数上限或改槽计费。
+- Each connection has two rings, one producer, one consumer, with head/tail exclusively advanced by opposite sides (`shm_transport.cc:146-149`). This is SPSC today and needs no change.
+- Multi-producer support requires redesigning enqueue arbitration and full-ring semantics. That is pure risk before aello-bench produces single-path data. The analysis's "do not implement early for a feature checklist" is adopted as discipline.
 
-### 3.4 SPSC 起步，按真实负载再决定 MPSC/MPMC
+## 4. Explicitly not adopted for now
 
-**裁决：当下采纳（它描述的就是现状），MPSC/MPMC 延后至基准证据出现。**
-
-理由与现状：
-
-- 每连接两环、单生产者单消费者、head/tail 各一方独占推进（`shm_transport.cc:146-149`）——现状即 SPSC，无需改动。
-- 多生产者需要重做环的入队仲裁与满环语义，在 aello-bench 给出单路径数据之前是纯风险。分析稿"不要为了功能表好看而提前实现"采纳为纪律。
-
-## 4. 明确不吸收（本轮及可见将来）
-
-| 项 | 理由 |
+| Item | Reason |
 |---|---|
-| 通用事件循环/定时器/Future 框架进核心 | 分析稿明确第一版不要；现 `async.h` 按审计删除 |
-| 运行时指标框架（Counter/Gauge/Registry） | 性能数字归 aello-bench；运行时只留最小可观测钩子，后续按需重议 |
-| 自动重连作为"开箱能力"宣传 | 代码未接线（审计 §2.2）；接线前任何文档不得宣称 |
-| 端到端 exactly-once 承诺 | 与 3.2 一致，永不进入核心宣传 |
-| 性能宣传数字（"每秒千万条"式） | 全部等 aello-bench 可复现数据；在那之前 README 只写结构性事实 |
+| General event loop / timers / Future framework in the core | v1 explicitly excludes them; `async.h` is slated for deletion in the audit |
+| Runtime metrics framework (Counter/Gauge/Registry) | Performance numbers belong to aello-bench; keep only minimal runtime hooks and revisit later |
+| Advertising automatic reconnect as an out-of-the-box feature | The code is unwired (audit §2.2); no document may claim it until wired |
+| End-to-end exactly-once promise | Consistent with §3.2; never claim it |
+| Promotional performance numbers ("ten million per second") | Wait for reproducible aello-bench data; until then the README states structural facts only |
 
-## 5. 下一步工作序（供实现轮，本文档不含实现）
+## 5. Next work order (implementation round only)
 
-1. 修 `message.h` 构建（一行）。
-2. 落地审计删除名单（11 文件 + cmake 三模板处理）。
-3. 建 `bench/`：先一个 shm 往返延迟 + 单向吞吐的最小可复现基准，对照 UDS/TCP（分析稿阶段 1）。
-4. uds 接线 + 重连接线（或删广告字段），消除文档-代码落差。
-5. 测试补盲（QoS 直测、并发、进程 kill -9 重启矩阵）。
+1. Fix the `message.h` build (one line).
+2. Apply the audit delete list (11 files plus the three CMake templates decision).
+3. Create `bench/`: first a minimal reproducible shm round-trip-latency and one-way-throughput benchmark, compared with UDS/TCP (analysis stage 1).
+4. Wire UDS and reconnect (or remove the advertised fields) to eliminate the documentation gap.
+5. Fill test blind spots: direct QoS tests, concurrency, and process `kill -9`/restart matrices.
