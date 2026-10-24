@@ -12,6 +12,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
+#include <csignal>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -112,11 +114,24 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
   (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
   while (n != 0) {
+#if defined(__APPLE__)
+    // Belt-and-suspenders: also mask SIGPIPE for the duration of the send so a
+    // write to a closed peer cannot raise the signal even if SO_NOSIGPIPE is
+    // unavailable or ineffective. The mask is thread-local, so other threads
+    // are unaffected.
+    sigset_t block, old_mask;
+    sigemptyset(&block);
+    sigaddset(&block, SIGPIPE);
+    (void)::pthread_sigmask(SIG_BLOCK, &block, &old_mask);
+#endif
 #if defined(_WIN32)
     SOCKET sock = static_cast<SOCKET>(fd);
     int w = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0);
 #else
     ssize_t w = ::send(fd, p, n, 0);
+#endif
+#if defined(__APPLE__)
+    (void)::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
 #endif
     if (w < 0) {
       int error = get_last_error();
