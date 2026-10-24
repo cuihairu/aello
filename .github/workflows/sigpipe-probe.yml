@@ -1,0 +1,58 @@
+name: sigpipe-probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build and run probe
+        shell: bash
+        run: |
+          cat > probe.c <<'CPPEOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <errno.h>
+          #include <signal.h>
+          #include <sys/socket.h>
+          #include <unistd.h>
+          #include <pthread.h>
+
+          static volatile sig_atomic_t g_sigpipe = 0;
+          static void handler(int sig) { (void)sig; g_sigpipe++; }
+
+          int main(void) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = handler;
+            sigaction(SIGPIPE, &sa, NULL);
+
+            int fds[2];
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+              printf("socketpair failed: %s\n", strerror(errno));
+              return 2;
+            }
+            close(fds[1]);
+
+            int one = 1;
+            int rc = setsockopt(fds[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+            printf("setsockopt SO_NOSIGPIPE rc=%d errno=%s\n", rc, rc==0?"0":strerror(errno));
+
+            g_sigpipe = 0;
+            ssize_t w = send(fds[0], "x", 1, 0);
+            printf("send rc=%zd errno=%s sigpipe_count=%d\n", w, w<0?strerror(errno):"0", (int)g_sigpipe);
+
+            // second: with mask
+            sigset_t block, old;
+            sigemptyset(&block); sigaddset(&block, SIGPIPE);
+            int mrc = pthread_sigmask(SIG_BLOCK, &block, &old);
+            g_sigpipe = 0;
+            ssize_t w2 = send(fds[0], "x", 1, 0);
+            pthread_sigmask(SIG_SETMASK, &old, NULL);
+            printf("masked send rc=%zd errno=%s sigpipe_after_restore=%d mask_rc=%d\n", w2, w2<0?strerror(errno):"0", (int)g_sigpipe, mrc);
+
+            close(fds[0]);
+            return 0;
+          }
+          CPPEOF
+          clang -o probe probe.c -lpthread
+          ./probe
