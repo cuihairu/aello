@@ -238,14 +238,32 @@ static void test_wire_write_no_sigpipe_on_macos() {
 
   ::close(fds[1]);
 
-  auto old = std::signal(SIGPIPE, handler);
+  // Use sigaction for reliable SIGPIPE capture on macOS; std::signal may not
+  // install the handler deterministically on arm64 runners.
+  struct sigaction sa {};
+  sa.sa_handler = handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  struct sigaction prev {};
+  int sigrc = ::sigaction(SIGPIPE, &sa, &prev);
+  EXPECT_TRUE(sigrc == 0);
   sigpipe_count.store(0, std::memory_order_relaxed);
 
   auto st = duct::wire::write_frame(fds[0], duct::Message::from_string("x"));
   EXPECT_TRUE(!st.ok());
-  EXPECT_EQ(sigpipe_count.load(std::memory_order_relaxed), 0);
 
-  (void)std::signal(SIGPIPE, old);
+  const int seen = sigpipe_count.load(std::memory_order_relaxed);
+  if (seen != 0) {
+    std::cerr << "[sigpipe] handler fired " << seen
+              << " time(s): SO_NOSIGPIPE did not suppress SIGPIPE on this platform\n";
+  }
+  EXPECT_EQ(seen, 0);
+
+  if (sigrc == 0) {
+    (void)::sigaction(SIGPIPE, &prev, nullptr);
+  } else {
+    (void)std::signal(SIGPIPE, SIG_DFL);
+  }
   ::close(fds[0]);
 #endif
 }
