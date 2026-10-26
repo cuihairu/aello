@@ -32,7 +32,7 @@ jobs:
             artifact_name: duct-windows-x64
             c_compiler: cl
             cpp_compiler: cl
-          - os: macos-15
+          - os: macos-latest
             target: macos-arm64
             artifact_name: duct-macos-arm64
             c_compiler: clang
