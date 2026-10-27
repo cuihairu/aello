@@ -3,6 +3,9 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#if defined(__APPLE__)
+#include <mutex>
+#endif
 
 #include "duct/protocol.h"
 
@@ -109,39 +112,60 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
   if (!wsa.ok()) return wsa;
 #endif
 #if defined(__APPLE__)
-  // Avoid SIGPIPE on macOS when writing to a closed socket.
+  // Avoid SIGPIPE when writing to a closed socket. macOS offers SO_NOSIGPIPE
+  // per socket, but newer XNU (macos-latest runners) rejects it with EINVAL,
+  // and merely blocking SIGPIPE does not help: XNU queues the blocked signal
+  // and delivers it once the mask is restored (both confirmed by the
+  // sigpipe-probe workflow). Where SO_NOSIGPIPE is unavailable, temporarily
+  // set SIGPIPE to SIG_IGN for the duration of the send loop; a mutex
+  // serializes concurrent writers so the previous handler is restored once.
+  static std::mutex sigpipe_ignore_mu;
   int one = 1;
-  (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  const bool nosigpipe_ok =
+      ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0;
+  std::unique_lock<std::mutex> ignore_lock;
+  struct sigaction ign {};
+  struct sigaction prev_handler {};
+  if (!nosigpipe_ok) {
+    ignore_lock = std::unique_lock<std::mutex>(sigpipe_ignore_mu);
+    sigemptyset(&ign.sa_mask);
+    ign.sa_handler = SIG_IGN;
+    (void)::sigaction(SIGPIPE, &ign, &prev_handler);
+  }
 #endif
   while (n != 0) {
-#if defined(__APPLE__)
-    // Belt-and-suspenders: also mask SIGPIPE for the duration of the send so a
-    // write to a closed peer cannot raise the signal even if SO_NOSIGPIPE is
-    // unavailable or ineffective. The mask is thread-local, so other threads
-    // are unaffected.
-    sigset_t block, old_mask;
-    sigemptyset(&block);
-    sigaddset(&block, SIGPIPE);
-    (void)::pthread_sigmask(SIG_BLOCK, &block, &old_mask);
-#endif
 #if defined(_WIN32)
     SOCKET sock = static_cast<SOCKET>(fd);
     int w = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0);
 #else
     ssize_t w = ::send(fd, p, n, 0);
 #endif
-#if defined(__APPLE__)
-    (void)::pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
-#endif
     if (w < 0) {
       int error = get_last_error();
       if (interrupted(error)) continue;
+#if defined(__APPLE__)
+      if (!nosigpipe_ok) {
+        (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
+      }
+#endif
       return Status::io_error("send() failed");
     }
-    if (w == 0) return Status::closed("peer closed");
+    if (w == 0) {
+#if defined(__APPLE__)
+      if (!nosigpipe_ok) {
+        (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
+      }
+#endif
+      return Status::closed("peer closed");
+    }
     p += static_cast<std::size_t>(w);
     n -= static_cast<std::size_t>(w);
   }
+#if defined(__APPLE__)
+  if (!nosigpipe_ok) {
+    (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
+  }
+#endif
   return {};
 }
 
