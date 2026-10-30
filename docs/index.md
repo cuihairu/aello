@@ -24,6 +24,8 @@ features:
     details: TCP, shared memory, and Windows named pipes share one Pipe/Listener model, with UDS wiring in progress.
 ---
 
+![Aello messaging runtime architecture](/images/architecture-en.svg)
+
 ## Current status
 
 Aello is an experimental, pre-release messaging runtime. It currently provides a message model, `Result`/`Status` error handling, a `Pipe`/`Listener` API over `tcp://`, `shm://`, and `pipe://`, bounded fixed-slot shared-memory rings, a 16-byte wire header, and cross-platform CI.

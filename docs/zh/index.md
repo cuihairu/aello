@@ -24,6 +24,8 @@ features:
     details: TCP、共享内存与 Windows 命名管道共用一套 Pipe/Listener 模型，UDS 接线正在进行。
 ---
 
+![Aello 消息运行时架构](/images/architecture-zh.svg)
+
 ## 当前状态
 
 Aello 处于实验阶段、尚未正式发布。当前提供消息模型、`Result`/`Status` 错误处理、覆盖 `tcp://`、`shm://`、`pipe://` 的 `Pipe`/`Listener` API、有界固定槽共享内存环、16 字节帧头以及跨平台 CI。

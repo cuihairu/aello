@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1000" viewBox="0 0 1200 1000" role="img" aria-labelledby="title desc" xml:lang="zh-CN">
+<title id="title">Aello · 消息运行时架构</title>
+<desc id="desc">分层架构。应用进程经 duct::listen / duct::dial 使用 Pipe/Listener 接口；Message 以拷贝优先共享缓冲传递；Result/Status 提供免异常错误处理；Address 解析 tcp/shm/pipe/uds 四种 scheme。dial 在配置 QoS 时用 QosPipe 包装：有界发送队列、背压策略与 TTL。传输后端 shm:// 为有界固定槽环快路径，tcp:// 与 pipe:// 共享同一 Pipe/Listener 模型，uds:// 仅解析未接线。字节流传输以 16 字节帧头分帧，单消息上限 64KiB，投递语义为至多一次。虚线表示可选包装路径，实线为数据流。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="context-stroke"/></marker></defs>
+<style>text{font-family:Arial,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d}.title{font-size:30px;font-weight:700}.name{font-size:22px;font-weight:700}.body{font-size:17px;fill:#435570}.small{font-size:15px;fill:#52647b}.label{font-size:15px;fill:#435570;paint-order:stroke;stroke:#f8fafc;stroke-width:5px;stroke-linejoin:round}.edge{fill:none;stroke-linejoin:round}.control{stroke-dasharray:7 5}</style>
+<rect width="1200" height="1000" rx="20" fill="#f8fafc"/>
+<text x="40" y="48" class="title" text-anchor="start">Aello · 消息运行时架构</text>
+<text x="40" y="80" class="body" text-anchor="start">进程消息通信 · 有界内存 · 低延迟 · 可插拔传输 · 实验阶段</text>
+
+<path d="M320 210 V250" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="server-api" data-from="server-proc" data-to="public-api" d="M320 210 V250" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)"/>
+<path d="M880 210 V250" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="client-api" data-from="client-proc" data-to="public-api" d="M880 210 V250" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)"/>
+<path d="M600 400 V450" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="api-qos" data-from="public-api" data-to="qos-pipe" d="M600 400 V450" class="edge control" style="stroke:#64748b;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M600 550 V590" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="qos-transport" data-from="qos-pipe" data-to="transport-layer" d="M600 550 V590" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M600 740 V780" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="transport-wire" data-from="transport-layer" data-to="wire-layer" d="M600 740 V780" class="edge" style="stroke:#7c3aed;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+<g id="server-proc" data-node="server-proc"><rect x="60" y="110" width="520" height="100" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="80" y="144" class="name" text-anchor="start">服务端进程</text>
+<text x="80" y="175" class="body" text-anchor="start">duct::listen() → accept() → recv() / send()</text>
+</g>
+<g id="client-proc" data-node="client-proc"><rect x="620" y="110" width="520" height="100" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="640" y="144" class="name" text-anchor="start">客户端进程</text>
+<text x="640" y="175" class="body" text-anchor="start">duct::dial() → send() / recv()</text>
+</g>
+
+<g id="public-api" data-node="public-api"><rect x="60" y="250" width="1080" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="80" y="284" class="name" text-anchor="start">公共 API 层（include/duct/）</text>
+<text x="80" y="315" class="body" text-anchor="start">Pipe / Listener 接口 · listen() / dial() 入口</text>
+<text x="80" y="342" class="body" text-anchor="start">Message（拷贝优先共享缓冲）· Result&lt;T&gt; / Status（免异常错误处理）</text>
+<text x="80" y="369" class="body" text-anchor="start">Address 解析（tcp / shm / pipe / uds）· 选项：Qos / Send / Recv / Dial / Listen</text>
+</g>
+
+<g id="qos-pipe" data-node="qos-pipe"><rect x="60" y="450" width="1080" height="100" rx="14" fill="#eef2ff" stroke="#a5b4fc" stroke-width="1.5"/>
+<text x="80" y="484" class="name" text-anchor="start">QosPipe（dial 配置 QoS 时可选包装）</text>
+<text x="80" y="515" class="body" text-anchor="start">有界发送队列 · 背压策略（阻塞 / 丢弃 / 快速失败）· TTL · 后台发送线程</text>
+</g>
+
+<g id="transport-layer" data-node="transport-layer">
+<rect x="60" y="590" width="255" height="150" rx="14" fill="#eef8f5" stroke="#86c9b3" stroke-width="1.5"/>
+<text x="80" y="624" class="name" text-anchor="start">shm://</text>
+<text x="80" y="655" class="body" text-anchor="start">快路径</text>
+<text x="80" y="682" class="body" text-anchor="start">有界固定槽环 64×64KiB</text>
+<text x="80" y="709" class="body" text-anchor="start">信号量同步 · SPSC</text>
+<rect x="330" y="590" width="255" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="350" y="624" class="name" text-anchor="start">tcp://</text>
+<text x="350" y="655" class="body" text-anchor="start">字节流</text>
+<text x="350" y="682" class="body" text-anchor="start">16 字节帧头分帧</text>
+<text x="350" y="709" class="body" text-anchor="start">全平台</text>
+<rect x="600" y="590" width="255" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="620" y="624" class="name" text-anchor="start">pipe://</text>
+<text x="620" y="655" class="body" text-anchor="start">Windows 命名管道</text>
+<text x="620" y="682" class="body" text-anchor="start">同一 Pipe/Listener 模型</text>
+<rect x="870" y="590" width="270" height="150" rx="14" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="890" y="624" class="name" text-anchor="start">uds://</text>
+<text x="890" y="655" class="body" text-anchor="start">已解析 · 未接线</text>
+<text x="890" y="682" class="body" text-anchor="start">延后（延后项）</text>
+</g>
+
+<g id="wire-layer" data-node="wire-layer"><rect x="60" y="780" width="1080" height="90" rx="14" fill="#edf5ff" stroke="#93b9e3" stroke-width="1.5"/>
+<text x="80" y="814" class="name" text-anchor="start">线协议 / 帧层（wire.cc · protocol.h）</text>
+<text x="80" y="845" class="body" text-anchor="start">16 字节帧头：magic / version / header_len / payload_len / flags · 单消息上限 64KiB · 拷贝发送 · 至多一次投递</text>
+</g>
+
+<text x="340" y="238" class="label" text-anchor="middle">listen / dial 入口</text>
+<text x="620" y="432" class="label" text-anchor="middle">QoS 配置时包装</text>
+<text x="620" y="575" class="label" text-anchor="middle">send / recv 委托</text>
+<text x="620" y="772" class="label" text-anchor="middle">字节流按帧收发</text>
+<text x="40" y="925" class="small" text-anchor="start">虚线：可选包装路径（QosPipe）· 实线：数据流 · 投递语义为至多一次，持久化属应用层职责</text>
+<text x="40" y="950" class="small" text-anchor="start">零拷贝 claim/commit 为延后能力；reconnect 选项当前被忽略（reconnect_pipe 未接入 dial）。</text>
+<text x="40" y="975" class="small" text-anchor="start">图示为目标契约，不代表已全部实现。</text>
+</svg>

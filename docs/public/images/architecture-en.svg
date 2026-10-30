@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1000" viewBox="0 0 1200 1000" role="img" aria-labelledby="title desc" xml:lang="en">
+<title id="title">Aello · Messaging Runtime Architecture</title>
+<desc id="desc">Layered architecture. Application processes use the Pipe/Listener interfaces via duct::listen / duct::dial; Message is a copy-first shared buffer; Result/Status provide exception-free error handling; Address parses tcp/shm/pipe/uds schemes. dial wraps the pipe in QosPipe when QoS options are configured: bounded send queue, backpressure policy and TTL. Transports: shm:// is the bounded fixed-slot ring fast path, tcp:// and pipe:// share one Pipe/Listener model, uds:// is parsed but not wired. Byte-stream transports frame messages with a 16-byte header; single messages are capped at 64KiB; delivery is at-most-once. Dashed line is the optional wrapper path, solid lines are data flow.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="context-stroke"/></marker></defs>
+<style>text{font-family:Arial,'Noto Sans CJK SC','Microsoft YaHei',sans-serif;fill:#172b4d}.title{font-size:30px;font-weight:700}.name{font-size:22px;font-weight:700}.body{font-size:17px;fill:#435570}.small{font-size:15px;fill:#52647b}.label{font-size:15px;fill:#435570;paint-order:stroke;stroke:#f8fafc;stroke-width:5px;stroke-linejoin:round}.edge{fill:none;stroke-linejoin:round}.control{stroke-dasharray:7 5}</style>
+<rect width="1200" height="1000" rx="20" fill="#f8fafc"/>
+<text x="40" y="48" class="title" text-anchor="start">Aello · Messaging Runtime Architecture</text>
+<text x="40" y="80" class="body" text-anchor="start">Inter-process messaging · bounded memory · low latency · pluggable transports · experimental</text>
+
+<path d="M320 210 V250" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="server-api" data-from="server-proc" data-to="public-api" d="M320 210 V250" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)"/>
+<path d="M880 210 V250" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="client-api" data-from="client-proc" data-to="public-api" d="M880 210 V250" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)"/>
+<path d="M600 400 V450" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="api-qos" data-from="public-api" data-to="qos-pipe" d="M600 400 V450" class="edge control" style="stroke:#64748b;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M600 550 V590" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="qos-transport" data-from="qos-pipe" data-to="transport-layer" d="M600 550 V590" class="edge" style="stroke:#475569;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+<path d="M600 740 V780" fill="none" stroke="#f8fafc" stroke-width="9"/>
+<path id="transport-wire" data-from="transport-layer" data-to="wire-layer" d="M600 740 V780" class="edge" style="stroke:#7c3aed;stroke-width:2" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+<g id="server-proc" data-node="server-proc"><rect x="60" y="110" width="520" height="100" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="80" y="144" class="name" text-anchor="start">Server process</text>
+<text x="80" y="175" class="body" text-anchor="start">duct::listen() → accept() → recv() / send()</text>
+</g>
+<g id="client-proc" data-node="client-proc"><rect x="620" y="110" width="520" height="100" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5"/>
+<text x="640" y="144" class="name" text-anchor="start">Client process</text>
+<text x="640" y="175" class="body" text-anchor="start">duct::dial() → send() / recv()</text>
+</g>
+
+<g id="public-api" data-node="public-api"><rect x="60" y="250" width="1080" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="80" y="284" class="name" text-anchor="start">Public API layer (include/duct/)</text>
+<text x="80" y="315" class="body" text-anchor="start">Pipe / Listener interfaces · listen() / dial() entry points</text>
+<text x="80" y="342" class="body" text-anchor="start">Message (copy-first shared buffer) · Result&lt;T&gt; / Status (exception-free errors)</text>
+<text x="80" y="369" class="body" text-anchor="start">Address parsing (tcp / shm / pipe / uds) · options: Qos / Send / Recv / Dial / Listen</text>
+</g>
+
+<g id="qos-pipe" data-node="qos-pipe"><rect x="60" y="450" width="1080" height="100" rx="14" fill="#eef2ff" stroke="#a5b4fc" stroke-width="1.5"/>
+<text x="80" y="484" class="name" text-anchor="start">QosPipe (optional wrapper when dial configures QoS)</text>
+<text x="80" y="515" class="body" text-anchor="start">Bounded send queue · backpressure (block / drop / fail-fast) · TTL · background send thread</text>
+</g>
+
+<g id="transport-layer" data-node="transport-layer">
+<rect x="60" y="590" width="255" height="150" rx="14" fill="#eef8f5" stroke="#86c9b3" stroke-width="1.5"/>
+<text x="80" y="624" class="name" text-anchor="start">shm://</text>
+<text x="80" y="655" class="body" text-anchor="start">fast path</text>
+<text x="80" y="682" class="body" text-anchor="start">bounded fixed-slot ring 64×64KiB</text>
+<text x="80" y="709" class="body" text-anchor="start">semaphore sync · SPSC</text>
+<rect x="330" y="590" width="255" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="350" y="624" class="name" text-anchor="start">tcp://</text>
+<text x="350" y="655" class="body" text-anchor="start">byte stream</text>
+<text x="350" y="682" class="body" text-anchor="start">16-byte header framing</text>
+<text x="350" y="709" class="body" text-anchor="start">all platforms</text>
+<rect x="600" y="590" width="255" height="150" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text x="620" y="624" class="name" text-anchor="start">pipe://</text>
+<text x="620" y="655" class="body" text-anchor="start">Windows named pipes</text>
+<text x="620" y="682" class="body" text-anchor="start">same Pipe/Listener model</text>
+<rect x="870" y="590" width="270" height="150" rx="14" fill="#f5f3ff" stroke="#c4b5fd" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="890" y="624" class="name" text-anchor="start">uds://</text>
+<text x="890" y="655" class="body" text-anchor="start">parsed · not wired</text>
+<text x="890" y="682" class="body" text-anchor="start">deferred</text>
+</g>
+
+<g id="wire-layer" data-node="wire-layer"><rect x="60" y="780" width="1080" height="90" rx="14" fill="#edf5ff" stroke="#93b9e3" stroke-width="1.5"/>
+<text x="80" y="814" class="name" text-anchor="start">Wire / framing layer (wire.cc · protocol.h)</text>
+<text x="80" y="845" class="body" text-anchor="start">16-byte header: magic / version / header_len / payload_len / flags · 64KiB message cap · copy-send · at-most-once</text>
+</g>
+
+<text x="340" y="238" class="label" text-anchor="middle">listen / dial entry</text>
+<text x="620" y="432" class="label" text-anchor="middle">wrapped when QoS configured</text>
+<text x="620" y="575" class="label" text-anchor="middle">send / recv delegated</text>
+<text x="620" y="772" class="label" text-anchor="middle">byte-stream framing</text>
+<text x="40" y="925" class="small" text-anchor="start">Dashed: optional wrapper path (QosPipe) · Solid: data flow · Delivery is at-most-once; durability is an application concern</text>
+<text x="40" y="950" class="small" text-anchor="start">Zero-copy claim/commit is a deferred capability; reconnect options are currently ignored (reconnect_pipe not wired into dial).</text>
+<text x="40" y="975" class="small" text-anchor="start">Diagram is the intended contract, not a claim that all of it is implemented.</text>
+</svg>
