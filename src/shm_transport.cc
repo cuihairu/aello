@@ -321,7 +321,11 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
     return Status::io_error("mmap(shm) failed" + errno_suffix());
   }
   h.mem = static_cast<ShmLayout*>(p);
-  std::memset(h.mem, 0, kShmSize);
+  // Value-initialize instead of memset: ShmLayout contains std::atomic members,
+  // which are not trivially copy-assignable, so memset on them is undefined behavior
+  // (-Wclass-memaccess). The fresh shm segment is already zeroed by the OS, and
+  // value-initialization makes the atomics/slots explicitly zero.
+  ::new (static_cast<void*>(h.mem)) ShmLayout{};
 
   // Semaphores:
   // - items start at 0
