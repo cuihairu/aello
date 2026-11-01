@@ -1,6 +1,6 @@
 # Aello
 
-<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange"></a> <a href="https://cuihairu.github.io/aello/"><img src="https://img.shields.io/badge/docs-docs-blue" alt="docs"></a></p>
+<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange"></a> <a href="https://cuihairu.github.io/aello//"><img src="https://img.shields.io/badge/docs-docs-blue" alt="docs"></a> <a href="https://cuihairu.github.io/aello/"><img src="https://img.shields.io/badge/docs-docs-blue" alt="docs"></a></p>
 
 > **English** | [中文](README.zh.md)
 
