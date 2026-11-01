@@ -35,7 +35,6 @@ class QosPipe : public Pipe {
  private:
   // Background thread for processing send queue
   void send_worker();
-  bool can_send_message(const QueuedMessage& queued_msg) const;
 
   std::unique_ptr<Pipe> underlying_;
   QosOptions qos_;

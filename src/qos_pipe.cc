@@ -17,85 +17,71 @@ QosPipe::~QosPipe() {
   }
 }
 
-bool QosPipe::can_send_message(const QueuedMessage& queued_msg) const {
-  // Check TTL
-  if (qos_.ttl.count() > 0) {
-    auto now = std::chrono::steady_clock::now();
-    auto age = now - queued_msg.timestamp;
-    if (age > qos_.ttl) {
-      return false;  // Message expired
-    }
-  }
-
-  // Check queue limits
-  if (send_bytes_.load() >= qos_.snd_hwm_bytes) {
-    return false;
-  }
-
-  return true;
-}
-
 void QosPipe::send_worker() {
   while (running_) {
-    std::unique_lock<std::mutex> lock(send_mutex_);
+    QueuedMessage msg_to_send{Message{}};
+    {
+      std::unique_lock<std::mutex> lock(send_mutex_);
 
-    // Wait for messages or shutdown
-    send_cv_.wait(lock, [this] { return !send_queue_.empty() || !running_; });
+      // Wait for messages or shutdown
+      send_cv_.wait(lock, [this] { return !send_queue_.empty() || !running_; });
 
-    if (!running_) break;
+      if (!running_) break;
 
-    // Process expired messages (TTL)
-    if (qos_.ttl.count() > 0) {
-      auto now = std::chrono::steady_clock::now();
+      // Process expired messages (TTL)
+      if (qos_.ttl.count() > 0) {
+        auto now = std::chrono::steady_clock::now();
 
-      send_queue_.erase(
-        std::remove_if(send_queue_.begin(), send_queue_.end(),
-          [&](const QueuedMessage& queued_msg) {
-            auto age = now - queued_msg.timestamp;
-            if (age > qos_.ttl) {
-              send_bytes_ -= queued_msg.message.size();
-              send_count_ -= 1;
-              return true;  // Remove expired message
-            }
-            return false;
-          }),
-        send_queue_.end());
+        send_queue_.erase(
+          std::remove_if(send_queue_.begin(), send_queue_.end(),
+            [&](const QueuedMessage& queued_msg) {
+              auto age = now - queued_msg.timestamp;
+              if (age > qos_.ttl) {
+                send_bytes_ -= queued_msg.message.size();
+                send_count_ -= 1;
+                return true;  // Remove expired message
+              }
+              return false;
+            }),
+          send_queue_.end());
+      }
+
+      if (send_queue_.empty()) continue;
+
+      // Drain unconditionally. The HWM water mark gates the *enqueue* side (send()),
+      // not the drain side: gating the worker here would stall the queue permanently
+      // once it reaches snd_hwm_bytes (the worker is the only path that frees bytes).
+      // Pop the head before sending so a concurrent send() (kDropOld) or close()
+      // cannot race with an in-flight transport send.
+      msg_to_send = std::move(send_queue_.front());
+      send_queue_.pop_front();
+      send_bytes_ -= msg_to_send.message.size();
+      send_count_ -= 1;
+      // Wake a blocked kBlock sender: queue space was just freed.
+      send_cv_.notify_all();
     }
 
-    // Try to send the front message
-    if (!send_queue_.empty()) {
-      auto& queued_msg = send_queue_.front();
+    // Send outside the lock, with a bounded timeout: a blocked transport send
+    // (e.g. a full shm ring) must not wedge close(), which joins this worker, and
+    // must not block concurrent send() calls behind it.
+    SendOptions opt;
+    opt.timeout = std::chrono::milliseconds(100);
+    auto result = underlying_->send(msg_to_send.message, opt);
 
-      // Check if we can send (respecting HWM limits)
-      if (can_send_message(queued_msg)) {
-        SendOptions opt;
-        auto result = underlying_->send(queued_msg.message, opt);
-
-        if (result.ok()) {
-          // Message sent successfully
-          send_bytes_ -= queued_msg.message.size();
-          send_count_ -= 1;
-          send_queue_.pop_front();
-        } else {
-          // Send failed - if it's a temporary issue, keep the message
-          // If it's a permanent failure, we should close the pipe
-          if (result.status().code() == StatusCode::kClosed ||
-              result.status().code() == StatusCode::kIoError) {
-            running_ = false;
-            break;
-          }
-        }
-      } else {
-        // Hit HWM limits - check backpressure policy
-        if (qos_.backpressure == BackpressurePolicy::kFailFast) {
-          // Don't block, just let the next send() fail
-          lock.unlock();
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        } else {
-          // For kBlock, kDropNew, kDropOld, we handle them in send()
-          lock.unlock();
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+    if (!result.ok()) {
+      std::lock_guard<std::mutex> lock(send_mutex_);
+      if (result.status().code() == StatusCode::kClosed ||
+          result.status().code() == StatusCode::kIoError) {
+        running_ = false;
+        break;
+      }
+      // Transient failure (e.g. kTimeout from the bounded send): keep the message,
+      // re-inserted at the front to preserve ordering. If close() ran meanwhile,
+      // drop it.
+      if (running_) {
+        send_queue_.push_front(std::move(msg_to_send));
+        send_bytes_ += msg_to_send.message.size();
+        send_count_ += 1;
       }
     }
   }
@@ -137,6 +123,9 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
         send_cv_.wait_for(lock, opt.timeout, [this] {
           return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
         });
+        if (!running_) {
+          return Status::closed("pipe closed");
+        }
         if (send_bytes_.load() >= qos_.snd_hwm_bytes) {
           return Status::timeout("send queue full (timeout)");
         }
@@ -165,6 +154,12 @@ void QosPipe::close() {
     running_ = false;
   }
   send_cv_.notify_all();
+  // Join the worker before closing the underlying transport. The worker's send is
+  // bounded (see send_worker), so this cannot hang; joining first avoids closing the
+  // transport while a send is still in flight.
+  if (send_thread_.joinable()) {
+    send_thread_.join();
+  }
   underlying_->close();
 }
 

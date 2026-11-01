@@ -468,6 +468,134 @@ static void test_wire_socketpair_frames() {
 #endif
 }
 
+static void test_qos_delivery_under_hwm() {
+  // QoS-enabled dial (default snd_hwm_bytes wraps in QosPipe). A small HWM forces the
+  // in-memory queue to reach its watermark quickly. The send worker must keep draining
+  // even at the watermark (the HWM gates enqueue, not drain); previously it stalled and
+  // the echo never returned.
+  auto lis_r = duct::listen("shm://duct_testqos_hwm");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  const int kCount = 16;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < kCount; ++i) {
+      auto msg = p.value()->recv({});
+      if (!msg.ok()) return msg.status();
+      auto st = p.value()->send(msg.value(), {});
+      if (!st.ok()) return st;
+    }
+    return {};
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 4 * 1024;  // ~4 x 1KiB messages, forces HWM quickly.
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testqos_hwm", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  std::string payload(1024, 'x');
+  for (int i = 0; i < kCount; ++i) {
+    duct::SendOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    auto st = c.value()->send(duct::Message::from_string(payload), opt);
+    EXPECT_TRUE(st.ok());
+    if (!st.ok()) break;
+  }
+
+  int received = 0;
+  for (int i = 0; i < kCount; ++i) {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    auto echo = c.value()->recv(opt);
+    if (!echo.ok()) break;
+    ++received;
+  }
+  EXPECT_EQ(received, kCount);
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
+static void test_qos_close_under_full_ring() {
+  // Fill the shm ring (server never reads) so the QoS send worker blocks on the
+  // transport send. close() must still return promptly: previously it deadlocked on
+  // the worker's mutex.
+  auto lis_r = duct::listen("shm://duct_testqos_close");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto fut = accepted.get_future();
+  std::thread t([&] { accepted.set_value(lis_r.value()->accept()); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 4 * 1024 * 1024;  // default-ish; wrap in QosPipe
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testqos_close", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    t.join();
+    return;
+  }
+
+  auto sr = fut.get();
+  EXPECT_TRUE(sr.ok());
+  if (!sr.ok()) {
+    t.join();
+    return;
+  }
+  // Server side never reads: keep the pipe alive but do not recv.
+  auto server_pipe = std::move(sr.value());
+
+  std::string payload(1024, 'y');
+  for (int i = 0; i < 100; ++i) {
+    duct::SendOptions opt;
+    opt.timeout = std::chrono::milliseconds(200);
+    auto st = c.value()->send(duct::Message::from_string(payload), opt);
+    if (!st.ok()) break;  // queue full at HWM is fine; the ring is what we want full.
+  }
+
+  // Give the worker time to block on the full ring.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // close() must complete; run it on a side thread and bound the wait.
+  auto closed = std::promise<void>();
+  auto closed_fut = closed.get_future();
+  std::thread closer([&] {
+    c.value()->close();
+    closed.set_value();
+  });
+
+  auto cf = closed_fut.wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(cf == std::future_status::ready);
+  if (cf != std::future_status::ready) {
+    // Avoid leaking a thread that may still be blocked in close().
+    closer.detach();
+  } else {
+    closer.join();
+  }
+
+  server_pipe.reset();
+  lis_r.value()->close();
+  t.join();
+}
+
 }  // namespace
 
 int main() {
@@ -479,6 +607,8 @@ int main() {
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
   test_wire_write_no_sigpipe_on_macos();
+  test_qos_delivery_under_hwm();
+  test_qos_close_under_full_ring();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
