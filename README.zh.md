@@ -1,17 +1,11 @@
 # Aello
 
-<p align="center">
-  <a href="https://github.com/cuihairu/aello/releases"></a> <a href="https://cuihairu.github.io/aello/zh//"></a>
-  <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange"> <img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-blue" alt="docs">
-</p>
+<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img src="https://img.shields.io/badge/status-in%20development-orange" alt="status"/></a> <a href="https://cuihairu.github.io/aello/zh/"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-blue" alt="docs"/></a></p>
 
 > [English](README.md) | **中文**
 
 <p align="center">
-  <a href="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml"><img src="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a>
-  <a href="https://isocpp.org/"><img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" alt="C++20"></a>
-  <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
+<a href="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml"><img src="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a> <a href="https://isocpp.org/"><img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" alt="C++20"></a> <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
 </p>
 
 **Aello** 是面向游戏服务器的消息运行时：解决服务器进程之间如何以低延迟、
@@ -38,8 +32,8 @@
 
 - 没有自动重连（选项字段目前被忽略）。
 - `uds://` 地址能解析，但尚未接入 dial/listen。
-- 没有接收侧水位、消息 TTL 强制、分片。
-- 没有基准测试、RPC、发布订阅、异步层。
+- 没有接收侧水位与分片。（消息 TTL 在设置 `QosOptions::ttl` 后于 QoS 发送路径生效，默认关闭。）
+- 没有基准测试、RPC、发布订阅，也没有异步/事件循环 API（`async.h` 未编入库）。注意：启用 QoS 时发送侧确有内部排空工作线程。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
 
@@ -112,7 +106,8 @@ auto reply = pipe.value()->recv({});
   延后能力，不是现状。
 - **单条消息最大 64 KiB。** 更大的载荷在被拒绝，直到分片能力落地。
 - **`shm://` 队列满行为：** send 阻塞至有空间或超时（`SendOptions::timeout`），
-  超时返回 `kTimeout`。
+  超时返回 `kTimeout`。这是传输层（关闭 QoS 时）的行为；启用 QoS 时先由
+  内存发送队列的 `snd_hwm_bytes` 高水位约束。
 - **可靠性为 at-most-once。** 对端死亡时在途消息丢失；可靠投递是应用层课题。
 
 ## 构建
@@ -136,6 +131,10 @@ tests/            跨平台测试套件
 examples/         echo 对 + 手动传输工具
 docs/design/      分析、审计与吸收结论
 ```
+
+`include/duct/` 下的部分头文件（`async.h`、`utils.h`、`logging.h`、`queue.h`、
+`convenience.h`、`raii.h`、`socket_utils.h`、`duct_export.h`）尚未编入库，
+在设计审计的删除/重构清单上。
 
 ## 许可证
 

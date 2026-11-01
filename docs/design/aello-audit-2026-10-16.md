@@ -13,9 +13,9 @@
 | Refactor | 10 | See §3–§6 |
 | Delete | 11 | See §3–§6 |
 
-Scope: `include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39. Build and support files (CMakeLists, CMake templates, workflows, TODO.md, README.md) are covered separately in §7 and excluded from the totals above.
+Scope: `include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39. Build and support files (CMakeLists, CMake templates, workflows, todo.md, README.md) are covered separately in §7 and excluded from the totals above.
 
-**Hard build fact:** HEAD fails to compile with local GCC 15.2.0. `include/duct/message.h` uses `std::memcpy`/`std::memcmp` (`message.h:49`, `message.h:57`) and `std::min` (`message.h:47`) without including `<cstring>` or `<algorithm>` (current includes at `message.h:3-9`). Older toolchains passed through transitive includes; newer libstdc++ reports `'memcpy' is not a member of 'std'`. This round records the issue without fixing it.
+**Hard build fact:** HEAD compiles and tests pass with local GCC 15.2.0 (ctest 1/1). At audit baseline `7646428`, HEAD failed: `message.h` used `std::memcpy`/`std::memcmp` (`message.h:49`, `message.h:57`) and `std::min` (`message.h:47`) without including `<cstring>` or `<algorithm>`. `<cstring>` was added after the audit; `<algorithm>` was added on 2026-11-02 (audit batch). Older toolchains passed through transitive includes; newer libstdc++ reports `'memcpy' is not a member of 'std'`.
 
 ## 1. Concept verification
 
@@ -46,7 +46,7 @@ Verification of factual claims in the analysis:
 
 1. **Six source files are not in the build.** `CMakeLists.txt:7-23` compiles only `address`, `duct`, `message`, `qos_pipe`, `shm_transport`, `tcp_transport`, and `wire` (plus `win_shm`/`pipe_transport` on Windows). **Excluded:** `src/uds_transport.cc`, `reconnect_pipe.cc`, `state_callback_pipe.cc`, `socket_utils.cc`, `logging.cc`, and `queue.cc`. With their headers, they form invisible dead code that the compiler never checks.
 2. **Automatic reconnect is advertised but not implemented.** `DialOptions::reconnect` and `on_state_change` can be configured (`include/duct/duct.h:101-108`; builder entry `include/duct/convenience.h:50-65`), but `dial()` never reads them (`src/duct.cc:43-82`). `reconnect_pipe.cc` and `state_callback_pipe.cc` are never called and are not compiled. `heartbeat_interval` has no consumer either (`include/duct/duct.h:43`).
-3. **QoS is asymmetric and misleading.** `QosPipe` wraps only the dial side and only the send queue; receive is passed through (`src/qos_pipe.cc:158-160`). `rcv_hwm_bytes`, `linger`, and the `Reliability` enum have no consumers (declared at `include/duct/duct.h:59,66,23-26`). Every `listen` ignores `ListenOptions::qos` (for example, `src/shm_transport.cc:488-493` uses only `backlog`). The default non-zero `DialOptions::snd_hwm_bytes=4MB` triggers wrapping at `src/duct.cc:76`, so **every dial gets a QosPipe and a background thread**, idle-polling every 1 ms (`src/qos_pipe.cc:92-98`). TODO.md's M2/M3 "Implemented" markers for `on_state_change`, auto-reconnect, and linger are false.
+3. **QoS is asymmetric and misleading.** `QosPipe` wraps only the dial side and only the send queue; receive is passed through (`src/qos_pipe.cc:158-160`). `rcv_hwm_bytes`, `linger`, and the `Reliability` enum have no consumers (declared at `include/duct/duct.h:59,66,23-26`). Every `listen` ignores `ListenOptions::qos` (for example, `src/shm_transport.cc:488-493` uses only `backlog`). The default non-zero `DialOptions::snd_hwm_bytes=4MB` triggers wrapping at `src/duct.cc:76`, so **every dial gets a QosPipe and a background thread**, idle-polling every 1 ms (`src/qos_pipe.cc:92-98`). todo.md's M2/M3 "Implemented" markers for `on_state_change`, auto-reconnect, and linger are false.
 4. **`uds://` parses but does not work.** `Address::parse` recognizes `uds` (`src/address.cc:37`), but `listen`/`dial` have no uds branch (`src/duct.cc:29-39`, `51-71`) and return `not_supported`. Its dependency `socket_utils.cc` is also not compiled.
 5. **The old README contradicted the code.** It advertised zero-copy, automatic reconnect, and connection-state callbacks (all false); documented `-DDUCT_INSTALL=OFF`, install targets, `find_package(duct)`, and pkg-config although there is no install/export logic; listed three example binaries CMake never builds; and said the license was undecided although `LICENSE` is MIT (2025, cuihairu).
 6. **ODR hazard:** `struct QueuedMessage` is defined twice in namespace `duct`, in `include/duct/queue.h:16-21` and `include/duct/qos_pipe.h:18-24`. Nothing includes both today, so it has not failed yet.
@@ -119,12 +119,12 @@ Verification of factual claims in the analysis:
 - `cmake/ductConfig.cmake.in`, `cmake/duct.pc.in`, `cmake/duct_version.h.in`: **refactor or delete.** All three are unreferenced; no targets file is generated and the version header is never configured. Either implement packaging or remove the fictional delivery surface.
 - `.github/workflows/cmake-multi-platform.yml`: **keep.** GCC/Clang/MSVC matrix plus CTest (`cmake-multi-platform.yml:25-45`). It did not catch the `message.h` break because `ubuntu-latest` still has an older GCC; the failure will surface when the runner updates.
 - `.github/workflows/nightly.yml`: **keep.** Schedule/dispatch, rolling nightly tag, and prerelease marker (`nightly.yml:122-140`) fit the rule that nightly builds are automatic but releases remain manual.
-- `TODO.md`: **refactor.** M2/M3 "Implemented" markers are false and the document follows the old positioning. Demote it to historical reference or rewrite it once the adoption document owns the roadmap.
+- `todo.md`: **refactor.** M2/M3 "Implemented" markers are false and the document follows the old positioning. Demote it to historical reference or rewrite it once the adoption document owns the roadmap.
 - `README.md`: rewritten to the new positioning this round (English primary + `README.zh.md`).
 
 ## 8. Recommended order for the next implementation round
 
-1. Fix the build: add `<cstring>`/`<algorithm>` to `message.h`.
+1. Fix the build: add `<cstring>`/`<algorithm>` to `message.h`. **Done** — `<cstring>` added after the audit; `<algorithm>` added 2026-11-02 (audit batch).
 2. Apply the delete list: 11 files plus the three CMake templates (or implement packaging).
 3. Complete the build: wire `uds_transport.cc`/`socket_utils.cc` and the UDS branch, or explicitly park them.
 4. Remove documentation gaps: wire or delete `ReconnectPolicy`/`on_state_change` and `rcv_hwm_bytes`/`linger`/`Reliability`.

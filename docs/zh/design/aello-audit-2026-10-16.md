@@ -13,7 +13,7 @@
 | 重构 | 10 | 见 §3–§6 |
 | 删除 | 11 | 见 §3–§6 |
 
-范围：`include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39。构建与配套文件（CMakeLists、cmake 模板、workflows、TODO.md、README.md）在 §7 单独说明，不计入上表。
+范围：`include/` 14 + `src/` 16 + `tests/` 1 + `examples/` 8 = 39。构建与配套文件（CMakeLists、cmake 模板、workflows、todo.md、README.md）在 §7 单独说明，不计入上表。
 
 **构建事实（先说最硬的一条）**：HEAD 在本机 GCC 15.2.0 下编译失败——`include/duct/message.h` 使用 `std::memcpy`/`std::memcmp`（`include/duct/message.h:49`、`include/duct/message.h:57`）与 `std::min`（`include/duct/message.h:47`），但未包含 `<cstring>`/`<algorithm>`（现有 include 列表见 `include/duct/message.h:3-9`）。旧工具链靠传递包含侥幸通过，新 libstdc++ 收紧后报 `'memcpy' is not a member of 'std'`。本轮不修，仅记录。
 
@@ -46,7 +46,7 @@
 
 1. **六个源文件不在构建里。** `CMakeLists.txt:7-23` 只编译 `address/duct/message/qos_pipe/shm_transport/tcp_transport/wire`（Windows 加 `win_shm/pipe_transport`）。**未编译**：`src/uds_transport.cc`、`src/reconnect_pipe.cc`、`src/state_callback_pipe.cc`、`src/socket_utils.cc`、`src/logging.cc`、`src/queue.cc`。它们与配套头文件（`logging.h`、`queue.h`、`socket_utils.h`）一起构成"看不见的死代码"——编译器从不检查它们。
 2. **自动重连是广告功能。** `DialOptions::reconnect` 与 `on_state_change` 可以设置（`include/duct/duct.h:101-108`，builder 入口 `include/duct/convenience.h:50-65`），但 `dial()` 全程不读取（`src/duct.cc:43-82` 无一处引用 `opt.reconnect`/`opt.on_state_change`）。实现文件 `reconnect_pipe.cc`、`state_callback_pipe.cc` 写完了却从未被调用（`make_reconnect_pipe`/`make_state_callback_pipe` 全仓零调用方），且不在构建里。`heartbeat_interval` 同样无人消费（仅定义于 `include/duct/duct.h:43`）。
-3. **QoS 名不副实且不对称。** `QosPipe` 只在 dial 侧包裹、只管发送队列（recv 直接透传，`src/qos_pipe.cc:158-160`）；`rcv_hwm_bytes`、`linger`、`Reliability` 枚举全仓无消费者（仅定义于 `include/duct/duct.h:59,66,23-26`）；`ListenOptions::qos` 被各 listen 忽略（如 `src/shm_transport.cc:488-493` 只用 `backlog`）。默认 `DialOptions` 的 `snd_hwm_bytes=4MB` 非零，触发 `src/duct.cc:76` 的包裹条件——**默认每个 dial 都套 QosPipe 并起后台线程**，空闲时靠 1ms 轮询睡眠（`src/qos_pipe.cc:92-98`）。TODO.md M2/M3 标注的 "Implemented: on_state_change / auto-reconnect / linger" 与事实不符。
+3. **QoS 名不副实且不对称。** `QosPipe` 只在 dial 侧包裹、只管发送队列（recv 直接透传，`src/qos_pipe.cc:158-160`）；`rcv_hwm_bytes`、`linger`、`Reliability` 枚举全仓无消费者（仅定义于 `include/duct/duct.h:59,66,23-26`）；`ListenOptions::qos` 被各 listen 忽略（如 `src/shm_transport.cc:488-493` 只用 `backlog`）。默认 `DialOptions` 的 `snd_hwm_bytes=4MB` 非零，触发 `src/duct.cc:76` 的包裹条件——**默认每个 dial 都套 QosPipe 并起后台线程**，空闲时靠 1ms 轮询睡眠（`src/qos_pipe.cc:92-98`）。todo.md M2/M3 标注的 "Implemented: on_state_change / auto-reconnect / linger" 与事实不符。
 4. **uds:// 解析得了、用不了。** `Address::parse` 认识 `uds`（`src/address.cc:37`），但 `listen`/`dial` 的分发没有 uds 分支（`src/duct.cc:29-39`、`src/duct.cc:51-71`），运行时返回 `not_supported`。且 `uds_transport.cc` 依赖的 `socket_utils.cc` 也不在构建里，接上线即断链。
 5. **README 与代码不符（旧 README 的清单）**：宣传"零拷贝/自动重连/连接状态回调"（皆不成立，见上）；文档给出 `-DDUCT_INSTALL=OFF`、install 目标、`find_package(duct)`、pkg-config（`CMakeLists.txt` 无任何 `install()`/导出逻辑，`cmake/*.in` 模板从未被引用生成）；列出 `duct_convenience_example`/`duct_async_example`/`duct_utils_example` 三个二进制（CMake 从不构建它们，`CMakeLists.txt:42-57`）；许可证写"待定"（实际 `LICENSE` 为 MIT，2025 cuihairu）。
 6. **ODR 隐患**：`struct QueuedMessage` 在 `include/duct/queue.h:16-21` 与 `include/duct/qos_pipe.h:18-24` 同名同 namespace（`duct`）重复定义。当前 queue.h 无人包含所以未爆，一旦同 TU 引入即重定义错误。
@@ -119,7 +119,7 @@
 - `cmake/ductConfig.cmake.in`、`cmake/duct.pc.in`、`cmake/duct_version.h.in`：**重构对象**。三份模板零引用——`ductTargets.cmake` 从不生成，版本头从不配置。要么接线 install 真做打包，要么删除；现状是"仓库里躺着的虚构交付面"。
 - `.github/workflows/cmake-multi-platform.yml`：保留。GCC/Clang/MSVC 矩阵 + ctest，符合多平台验收需要（`cmake-multi-platform.yml:25-45`）。注记：它目前没拦住 message.h 的构建破损（ubuntu-latest 的 GCC 版本较旧），等 runner 升级即暴露。
 - `.github/workflows/nightly.yml`：保留。schedule + dispatch、滚动 nightly tag、prerelease 标记（`nightly.yml:122-140`），符合"nightly 允许、正式版本只由用户手动触发"的红线。
-- `TODO.md`：**重构对象**。M2/M3 的 "Implemented" 标注与代码不符（§2.3）；整体按旧定位写就。由 adoption 文档接管路线图后降级为历史参考或重写。
+- `todo.md`：**重构对象**。M2/M3 的 "Implemented" 标注与代码不符（§2.3）；整体按旧定位写就。由 adoption 文档接管路线图后降级为历史参考或重写。
 - `README.md`：本轮已按新定位重写（英文主文档 + `README.zh.md`），旧版失实清单见 §2.5。
 
 ## 8. 建议的处理顺序（供下一实现轮，本轮不动代码）

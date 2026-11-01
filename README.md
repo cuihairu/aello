@@ -1,9 +1,6 @@
 # Aello
 
-<p align="center">
-  <a href="https://github.com/cuihairu/aello/releases"></a> <a href="https://cuihairu.github.io/aello//"></a>
-  <img alt="Status" src="https://img.shields.io/badge/status-in%20development-orange"> <img src="https://img.shields.io/badge/docs-blue" alt="docs">
-</p>
+<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img src="https://img.shields.io/badge/status-in%20development-orange" alt="status"/></a> <a href="https://cuihairu.github.io/aello/"><img src="https://img.shields.io/badge/docs-blue" alt="docs"/></a></p>
 
 > **English** | [中文](README.zh.md)
 
@@ -36,8 +33,8 @@ What does **not** exist yet — stated plainly so nobody has to discover it:
 
 - No automatic reconnect (the option fields are currently ignored).
 - `uds://` addresses parse but are not wired into dial/listen.
-- No receive-side watermarks, no message TTL enforcement, no fragmentation.
-- No benchmarks, no RPC, no pub/sub, no async layer.
+- No receive-side watermarks and no fragmentation. (Message TTL is enforced on the QoS send path when `QosOptions::ttl` is set; it defaults to off.)
+- No benchmarks, no RPC, no pub/sub, and no async/event-loop API (`async.h` is not part of the library). Note the send side does run an internal queue-drain worker when QoS is enabled.
 
 Design audit and roadmap live in [`docs/design/`](docs/design/):
 
@@ -110,7 +107,9 @@ Every call returns a `Result<T>`; check `.ok()` and read `.status()` — no exce
 - **Single messages up to 64 KiB.** Larger payloads are rejected until
   fragmentation exists.
 - **Full queue behavior on `shm://`:** send blocks until space or timeout
-  (`SendOptions::timeout`), then returns `kTimeout`.
+  (`SendOptions::timeout`), then returns `kTimeout`. This is the transport-level
+  behavior (with QoS disabled); with QoS enabled the in-memory send queue's
+  `snd_hwm_bytes` water mark applies first.
 - **Reliability is at-most-once.** Messages in flight are lost if a peer dies;
   durable delivery is an application-level concern.
 
@@ -136,6 +135,10 @@ tests/            cross-platform test suite
 examples/         echo pair + manual transport tools
 docs/design/      analysis, audit, and adoption decisions
 ```
+
+A few headers under `include/duct/` (`async.h`, `utils.h`, `logging.h`, `queue.h`,
+`convenience.h`, `raii.h`, `socket_utils.h`, `duct_export.h`) are not part of the
+built library yet; they are on the design audit's delete/refactor list.
 
 ## License
 
