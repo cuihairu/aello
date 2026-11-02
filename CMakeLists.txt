@@ -7,6 +7,7 @@ option(DUCT_BUILD_TESTS "Build duct tests" ON)
 add_library(duct
   src/address.cc
   src/duct.cc
+  src/logging.cc
   src/message.cc
   src/qos_pipe.cc
   src/socket_utils.cc
@@ -65,4 +66,10 @@ if (DUCT_BUILD_TESTS)
   )
   target_link_libraries(duct_tests PRIVATE duct)
   add_test(NAME duct_tests COMMAND duct_tests)
+
+  add_executable(async_tests
+    tests/async_tests.cc
+  )
+  target_link_libraries(async_tests PRIVATE duct)
+  add_test(NAME async_tests COMMAND async_tests)
 endif()

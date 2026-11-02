@@ -5,6 +5,7 @@
 #include "duct/wire.h"
 
 #include <cstring>
+#include <cerrno>
 #include <memory>
 #include <string>
 
@@ -12,9 +13,11 @@
 // UDS is not available on Windows; use named pipes instead.
 #else
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 
 namespace duct {
@@ -102,6 +105,9 @@ class UdsListener final : public Listener {
 };
 
 static Result<int> connect_uds(const std::string& path, std::chrono::milliseconds timeout) {
+  if (timeout.count() < 0) {
+    return Status::invalid_argument("dial timeout must not be negative");
+  }
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
     return Status::io_error("socket(AF_UNIX) failed");
@@ -132,39 +138,58 @@ static Result<int> connect_uds(const std::string& path, std::chrono::millisecond
     int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     if (rc == 0) {
       // Connected immediately.
-      (void)socket_utils::set_nonblocking(fd, false);
+      auto rb = socket_utils::set_nonblocking(fd, false);
+      if (!rb.ok()) {
+        ::close(fd);
+        return rb.status();
+      }
       return fd;
     }
 
-    if (errno != EINPROGRESS) {
+    if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) {
+      int err = errno;
       ::close(fd);
-      return Status::io_error("connect() failed for uds path: " + path);
+      return Status::io_error("connect() failed for uds path: " + path +
+                              ": " + std::strerror(err));
     }
 
     // Wait for connection to complete.
     st = socket_utils::wait_writable(fd, timeout);
     if (!st.ok()) {
+      int err = errno;
       ::close(fd);
-      return st.status();
+      if (st.status().code() == StatusCode::kTimeout) {
+        return Status::timeout("connect() timed out for uds path: " + path);
+      }
+      return Status::io_error(st.status().message() + ": " + std::strerror(err));
     }
 
     // Check if connection succeeded.
     int err = 0;
     socklen_t errlen = sizeof(err);
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
+      int saved = err;
       ::close(fd);
-      return Status::io_error("connect() failed for uds path: " + path);
+      return Status::io_error("connect() failed for uds path: " + path +
+                              ": SO_ERROR=" + std::to_string(saved) + " " +
+                              std::strerror(saved));
     }
 
     // Restore blocking mode.
-    (void)socket_utils::set_nonblocking(fd, false);
+    auto rb = socket_utils::set_nonblocking(fd, false);
+    if (!rb.ok()) {
+      ::close(fd);
+      return rb.status();
+    }
     return fd;
   }
 
   // Blocking connect.
   if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    int err = errno;
     ::close(fd);
-    return Status::io_error("connect() failed for uds path: " + path);
+    return Status::io_error("connect() failed for uds path: " + path +
+                            ": " + std::strerror(err));
   }
 
   return fd;
@@ -180,9 +205,6 @@ static Result<int> listen_uds(const std::string& path, int backlog) {
   (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
 
-  // Remove existing socket file if present (common UDS pattern).
-  ::unlink(path.c_str());
-
   struct sockaddr_un addr {};
   addr.sun_family = AF_UNIX;
 
@@ -191,6 +213,43 @@ static Result<int> listen_uds(const std::string& path, int backlog) {
     return Status::invalid_argument("uds path too long");
   }
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+
+  // Remove an existing socket file only after the path has been validated.
+  // Before unlinking, verify it is actually a socket owned by this user; never
+  // silently delete an arbitrary file or steal a live peer's socket path.
+  struct stat st {};
+  if (::lstat(path.c_str(), &st) == 0) {
+    if (!S_ISSOCK(st.st_mode) || st.st_uid != ::geteuid()) {
+      ::close(fd);
+      return Status::invalid_argument("uds path exists and is not a usable socket");
+    }
+    // Check whether a live endpoint still owns it; if so, do not steal it.
+    int probe = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0) {
+      // Non-blocking probe: a live listener with a full backlog must not make
+      // the listen() caller block while we check ownership.
+      int flags = ::fcntl(probe, F_GETFL, 0);
+      if (flags >= 0) (void)::fcntl(probe, F_SETFL, flags | O_NONBLOCK);
+      int rc = ::connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+      ::close(probe);
+      if (rc == 0) {
+        ::close(fd);
+        return Status::invalid_argument("uds path already in use by a live endpoint");
+      }
+      if (errno != ECONNREFUSED && errno != ENOENT && errno != EAGAIN &&
+          errno != EWOULDBLOCK && errno != EINPROGRESS) {
+        ::close(fd);
+        return Status::io_error("connect probe failed for uds path: " + path);
+      }
+    }
+    if (::unlink(path.c_str()) != 0) {
+      ::close(fd);
+      return Status::io_error("unlink() failed for uds path: " + path);
+    }
+  } else if (errno != ENOENT) {
+    ::close(fd);
+    return Status::io_error("lstat() failed for uds path: " + path);
+  }
 
   if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
     ::close(fd);

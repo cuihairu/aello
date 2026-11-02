@@ -185,6 +185,16 @@ class EventLoop {
         cv_.wait_for(lock, std::chrono::milliseconds(100));
       }
     }
+
+    // The loop has exited. If stop() was called from a callback on this same
+    // thread, no external caller is joining (an external join sets joining_ and
+    // clears the handle after join). Release our own handle so a later stop()
+    // or runInBackground() sees a clean, non-joinable thread.
+    if (!joining_ && thread_.get_id() == std::this_thread::get_id()) {
+      thread_ = {};
+      stopping_ = false;
+      stop_cv_.notify_all();
+    }
   }
 
   /**
@@ -208,27 +218,36 @@ class EventLoop {
    */
   void stop() {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (stopping_ || thread_.get_id() == std::this_thread::get_id()) {
-      // Already stopping, or called from a loop callback: the running thread
-      // will observe running_ == false and exit; joining ourselves would
-      // deadlock. Either way, do not re-enter the join path.
+    const bool self = thread_.get_id() == std::this_thread::get_id();
+    if (!stopping_) {
+      stopping_ = true;
+      running_ = false;
+      cv_.notify_all();
+    }
+    if (self) {
+      // Called from a loop callback. We cannot join ourselves; set running_ =
+      // false (done above) so the running thread observes it and exits. The
+      // next stop() (typically the destructor) performs the join.
       return;
     }
-    stopping_ = true;
-    running_ = false;
-    cv_.notify_all();
     if (!thread_.joinable()) {
       stopping_ = false;
       stop_cv_.notify_all();
       return;
     }
+    if (joining_) {
+      // Another thread is already joining; it will reset the state.
+      return;
+    }
     // Do not move thread_ while joining: a concurrent runInBackground() must
     // see stopping_ and wait, then only restart after the old thread has fully
     // exited and stop() has released ownership.
+    joining_ = true;
     lock.unlock();
     thread_.join();
     lock.lock();
     thread_ = {};
+    joining_ = false;
     stopping_ = false;
     stop_cv_.notify_all();
   }
@@ -246,6 +265,7 @@ class EventLoop {
   std::condition_variable cv_;
   std::condition_variable stop_cv_;
   bool stopping_ = false;
+  bool joining_ = false;
   bool running_ = true;
 };
 

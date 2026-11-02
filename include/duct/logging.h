@@ -150,7 +150,7 @@ class PrefixLogger : public Logger {
 // ==============================================================================
 
 namespace detail {
-  Logger& get_default_logger();
+  std::shared_ptr<Logger> get_default_logger();
   void set_default_logger(std::shared_ptr<Logger> logger);
 }  // namespace detail
 
@@ -158,25 +158,25 @@ inline void set_logger(std::shared_ptr<Logger> logger) {
   detail::set_default_logger(std::move(logger));
 }
 
-inline Logger& get_logger() {
+inline std::shared_ptr<Logger> get_logger() {
   return detail::get_default_logger();
 }
 
 inline void set_log_level(LogLevel level) {
-  get_logger().set_level(level);
+  get_logger()->set_level(level);
 }
 
 // 全局便捷函数
 inline void log(LogLevel level, std::string_view msg) {
-  get_logger().log(level, msg);
+  get_logger()->log(level, msg);
 }
 
-inline void trace(std::string_view msg) { get_logger().trace(msg); }
-inline void debug(std::string_view msg) { get_logger().debug(msg); }
-inline void info(std::string_view msg) { get_logger().info(msg); }
-inline void warning(std::string_view msg) { get_logger().warning(msg); }
-inline void error(std::string_view msg) { get_logger().error(msg); }
-inline void fatal(std::string_view msg) { get_logger().fatal(msg); }
+inline void trace(std::string_view msg) { get_logger()->trace(msg); }
+inline void debug(std::string_view msg) { get_logger()->debug(msg); }
+inline void info(std::string_view msg) { get_logger()->info(msg); }
+inline void warning(std::string_view msg) { get_logger()->warning(msg); }
+inline void error(std::string_view msg) { get_logger()->error(msg); }
+inline void fatal(std::string_view msg) { get_logger()->fatal(msg); }
 
 // ==============================================================================
 // 日志宏
@@ -185,12 +185,12 @@ inline void fatal(std::string_view msg) { get_logger().fatal(msg); }
 // 日志流式构建器
 class LogStream {
  public:
-  LogStream(LogLevel level, Logger& logger)
-      : level_(level), logger_(logger) {}
+  LogStream(LogLevel level, std::shared_ptr<Logger> logger)
+      : level_(level), logger_(std::move(logger)) {}
 
   ~LogStream() {
     if (!handled_) {
-      logger_.log(level_, buffer_);
+      logger_->log(level_, buffer_);
     }
   }
 
@@ -200,7 +200,7 @@ class LogStream {
 
   // 移动支持
   LogStream(LogStream&& other) noexcept
-      : level_(other.level_), logger_(other.logger_),
+      : level_(other.level_), logger_(std::move(other.logger_)),
         buffer_(std::move(other.buffer_)), handled_(other.handled_) {
     other.handled_ = true;
   }
@@ -215,7 +215,7 @@ class LogStream {
 
  private:
   LogLevel level_;
-  Logger& logger_;
+  std::shared_ptr<Logger> logger_;
   std::string buffer_;
   bool handled_ = false;
 };

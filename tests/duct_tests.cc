@@ -1,4 +1,5 @@
 #include "duct/duct.h"
+#include "duct/logging.h"
 #include "duct/protocol.h"
 #include "duct/qos_pipe.h"
 #include "duct/wire.h"
@@ -9,9 +10,12 @@
 #include <condition_variable>
 #include <csignal>
 #include <chrono>
+#include <fcntl.h>
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -19,6 +23,7 @@
 
 #if !defined(_WIN32)
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #else
@@ -610,6 +615,129 @@ static void test_tcp_dial_timeout_honored() {
 #endif
 }
 
+static void test_tcp_connect_refused_is_io_error() {
+#if defined(_WIN32)
+  return;
+#else
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(500);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("tcp://127.0.0.1:1", dial_opt);
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kIoError);
+  }
+#endif
+}
+
+static void test_uds_dial_rejects_negative_timeout() {
+#if defined(_WIN32)
+  return;
+#else
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(-1);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds:///tmp/duct_negative_timeout.sock", dial_opt);
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+#endif
+}
+
+static void test_uds_listen_rejects_non_socket_path() {
+#if defined(_WIN32)
+  return;
+#else
+  std::string path = "/tmp/duct_regular_file_" + std::to_string(::getpid()) + ".sock";
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  EXPECT_TRUE(fd >= 0);
+  if (fd >= 0) ::close(fd);
+
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  struct stat st {};
+  EXPECT_EQ(::lstat(path.c_str(), &st), 0);
+  EXPECT_TRUE(S_ISREG(st.st_mode));
+  ::unlink(path.c_str());
+#endif
+}
+
+static void test_uds_positive_connect_timeout_is_preserved() {
+#if defined(_WIN32)
+  return;
+#else
+  std::string path = "/tmp/duct_uds_timeout_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+
+  duct::ListenOptions listen_opt;
+  listen_opt.backlog = 1;
+  auto lis_r = duct::listen("uds://" + path, listen_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Occupy the listener's accept queue. A fresh connection is accepted into the
+  // completed queue quickly, so dial a few times to guarantee the queue is full.
+  duct::DialOptions occupy_opt;
+  occupy_opt.timeout = std::chrono::milliseconds(200);
+  occupy_opt.qos.snd_hwm_bytes = 0;
+  occupy_opt.qos.rcv_hwm_bytes = 0;
+  std::vector<std::shared_ptr<duct::Pipe>> occupied;
+  for (int i = 0; i < 8; ++i) {
+    auto occ = duct::dial("uds://" + path, occupy_opt);
+    if (occ.ok()) {
+      occupied.emplace_back(occ.value().release());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_TRUE(!occupied.empty());
+
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(150);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  const auto start = std::chrono::steady_clock::now();
+  auto c = duct::dial("uds://" + path, dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(!c.ok());
+  // A full-backlog connect surfaces an immediate EAGAIN/backlog-full error (or
+  // a bounded timeout) on most platforms; the key guarantee is that the dial
+  // returns promptly instead of hanging.
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+
+  for (auto& p : occupied) p->close();
+  lis_r.value()->close();
+#endif
+}
+
+static void test_log_stream_survives_logger_replacement() {
+  auto old_logger = std::make_shared<duct::ConsoleLogger>();
+  duct::set_logger(old_logger);
+
+  // Build the stream while `old_logger` is installed, then replace it several
+  // times before the temporary stream destructor logs. The stream must retain
+  // shared ownership of the original logger rather than a dangling reference.
+  {
+    auto stream = DUCT_LOG_STREAM(kInfo);
+    stream << "stream after logger replacement";
+    for (int i = 0; i < 6; ++i) {
+      auto replacement = std::make_shared<duct::ConsoleLogger>();
+      duct::set_logger(replacement);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  // The stream has been destroyed by the scope exit; the original logger was
+  // replaced six times, which would have been a use-after-free under the old
+  // bounded-retired-window design. Restore the default for subsequent tests.
+  duct::set_logger(std::make_shared<duct::ConsoleLogger>());
+}
+
 static void test_shm_dial_timeout_honored() {
 #if defined(_WIN32)
   // Windows shm dial honors opt.timeout via WaitNamedPipe. A missing bootstrap
@@ -659,6 +787,38 @@ static void test_dial_rejects_negative_timeout() {
   if (!s.ok()) {
     EXPECT_EQ(s.status().code(), duct::StatusCode::kInvalidArgument);
   }
+}
+
+static void test_wire_clears_send_timeout_for_blocking_write() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  // Leave a timeout behind as a prior bounded send would. The next unbounded
+  // send must restore blocking behavior; we verify this directly on the fd.
+  struct timeval timeout {};
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 50 * 1000;
+  EXPECT_EQ(::setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)), 0);
+
+  auto st = duct::wire::write_frame(
+      fds[0], duct::Message::from_string("x"), /*flags=*/0,
+      std::chrono::milliseconds(0));
+  EXPECT_TRUE(st.ok());
+
+  struct timeval actual {};
+  socklen_t length = sizeof(actual);
+  EXPECT_EQ(::getsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &actual, &length), 0);
+  EXPECT_EQ(actual.tv_sec, 0);
+  EXPECT_EQ(actual.tv_usec, 0);
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
 }
 
 static void test_shm_burst_without_receiver() {
@@ -1096,8 +1256,14 @@ int main() {
   test_tcp_recv_timeout_honored();
   test_tcp_dial_timeout_happy_path();
   test_tcp_dial_timeout_honored();
+  test_tcp_connect_refused_is_io_error();
+  test_uds_dial_rejects_negative_timeout();
+  test_uds_listen_rejects_non_socket_path();
+  test_uds_positive_connect_timeout_is_preserved();
+  test_log_stream_survives_logger_replacement();
   test_shm_dial_timeout_honored();
   test_dial_rejects_negative_timeout();
+  test_wire_clears_send_timeout_for_blocking_write();
   test_wire_write_no_sigpipe_on_macos();
   test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();

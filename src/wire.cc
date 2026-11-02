@@ -180,6 +180,9 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
         return Status::timeout("send() timed out");
       }
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+      if (ms <= std::chrono::milliseconds::zero()) {
+        ms = std::chrono::milliseconds(1);
+      }
       auto timeout_st = apply_socket_timeout(fd, /*writing=*/true, ms);
       if (!timeout_st.ok()) return timeout_st;
     }
@@ -271,6 +274,15 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
   auto deadline = timeout.count() > 0
       ? std::chrono::steady_clock::now() + timeout
       : std::chrono::steady_clock::time_point{};
+
+  // Explicitly clear the socket timeout before a "no timeout" send. A prior
+  // bounded write may have left SO_SNDTIMEO in place; leaving it set would
+  // silently turn this blocking send into a timed-out send.
+  if (timeout.count() == 0) {
+    auto timeout_st = apply_socket_timeout(fd, /*writing=*/true,
+                                           std::chrono::milliseconds(0));
+    if (!timeout_st.ok()) return timeout_st;
+  }
 
   FrameHeader h;
   h.magic = kProtocolMagic;

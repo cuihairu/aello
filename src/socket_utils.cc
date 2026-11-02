@@ -6,6 +6,8 @@
 
 #include <mutex>
 #else
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -74,9 +76,15 @@ Result<void> wait_readable(socket_t fd, std::chrono::milliseconds timeout) {
     return Status::timeout("read timed out");
   }
   if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    // Let the caller read SO_ERROR so the real connect failure (e.g.
-    // ECONNREFUSED) is preserved instead of being masked by a generic
-    // poll error.
+    // A readable side that has been shut down (POLLHUP) is a normal close, not
+    // an error: the subsequent recv() will return 0 and surface kClosed. This
+    // keeps UdsPipe::recv from misreporting a peer's normal shutdown as an
+    // error (which EventLoop::run() would forward to on_error).
+    if (pfd.revents & POLLHUP) {
+      return Status::closed("peer closed");
+    }
+    // POLLERR/POLLNVAL: let the caller read SO_ERROR so the real failure is
+    // preserved instead of being masked by a generic poll error.
     return Status::io_error("poll() reported error on fd");
   }
   return {};
@@ -125,10 +133,19 @@ Result<void> wait_writable(socket_t fd, std::chrono::milliseconds timeout) {
   if (rc == 0) {
     return Status::timeout("write timed out");
   }
-  if (pfd.revents & POLLHUP) {
-    return Status::closed("peer closed");
-  }
-  if (pfd.revents & (POLLERR | POLLNVAL)) {
+  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+    // A failed non-blocking connect surfaces POLLOUT|POLLERR|POLLHUP together.
+    // Reading SO_ERROR first preserves the real cause (e.g. ECONNREFUSED)
+    // instead of the POLLHUP branch swallowing it as a generic "peer closed".
+    int so_error = 0;
+    socklen_t errlen = sizeof(so_error);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) == 0 && so_error != 0) {
+      return Status::io_error("poll() reported error on fd: SO_ERROR=" +
+                              std::to_string(so_error) + " " + std::strerror(so_error));
+    }
+    if (pfd.revents & POLLHUP) {
+      return Status::closed("peer closed");
+    }
     return Status::io_error("poll() reported error on fd");
   }
   return {};
