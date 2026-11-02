@@ -18,7 +18,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## Transport wiring
 
-- [ ] Wire `DialOptions.timeout` into tcp/shm dial (currently ignored at src/tcp_transport.cc:242, src/shm_transport.cc:497).
+- [x] Honor `SendOptions`/`RecvOptions.timeout` on tcp; a mid-frame timeout is fatal. Evidence: bd157c7, cec8067.
+- [ ] Wire `DialOptions.timeout` into tcp/shm dial (currently ignored at src/tcp_transport.cc:242, src/shm_transport.cc:500).
 - [ ] Wire `uds://` into dial/listen (src/uds_transport.cc implemented but uncompiled and undispatched).
 - [ ] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled).
 - [ ] Wire `on_state_change` connection callback.
@@ -37,6 +38,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## QoS and backpressure
 
+- [x] Reject messages above the transport limit synchronously instead of dropping them later. Evidence: 011e118, b0d4f9e.
 - [ ] Item-count cap or per-slot charging (QosPipe limits bytes only, not entries).
 - [ ] Distinct queue-full status code (currently borrows kTimeout / kIoError).
 - [ ] Make the QoS wrap in dial() an explicit opt-in (currently implicit via non-zero default snd_hwm_bytes).
@@ -61,6 +63,6 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Cleanup (design audit delete/refactor list)
 
 - [ ] Delete or park async.h, utils.h, logging.h, queue.h, convenience.h, raii.h, socket_utils.h, duct_export.h (uncompiled; see docs/design/aello-audit-2026-10-16.md §3).
-- [ ] Resolve duplicate `QueuedMessage` definition (include/duct/queue.h:16 and include/duct/qos_pipe.h:18).
-- [ ] Fix malformed `DUCT Experimental [[deprecated(...)]]` macro (include/duct/duct_export.h:30).
+- [x] Resolve duplicate `QueuedMessage` definition (include/duct/queue.h:16 and include/duct/qos_pipe.h:18). Evidence: 3022436.
+- [x] Fix malformed `DUCT Experimental [[deprecated(...)]]` macro (include/duct/duct_export.h:30). Evidence: 3022436.
 - [ ] Make shm slot parameters configurable (currently hard-coded 64 slots x 64 KiB).
