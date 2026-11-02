@@ -141,7 +141,8 @@ Result<void> apply_socket_timeout(SocketHandle fd, bool writing,
   return {};
 }
 
-Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
+Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
+                       bool* frame_started) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
   if (!wsa.ok()) return wsa;
@@ -184,6 +185,12 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
       }
 #endif
       if (timed_out(error)) {
+        // Only a timeout before the first byte of a frame is safe to retry.
+        // Mid-frame the stream is already desynchronized; report a hard error
+        // so callers (e.g. QosPipe) close instead of resending the message.
+        if (*frame_started) {
+          return Status::io_error("send() timed out mid-frame");
+        }
         return Status::timeout("send() timed out");
       }
       return Status::io_error("send() failed");
@@ -196,6 +203,7 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
 #endif
       return Status::closed("peer closed");
     }
+    *frame_started = true;
     p += static_cast<std::size_t>(w);
     n -= static_cast<std::size_t>(w);
   }
@@ -207,7 +215,8 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
   return {};
 }
 
-Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n) {
+Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n,
+                        bool* frame_started) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
   if (!wsa.ok()) return wsa;
@@ -223,11 +232,15 @@ Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n) {
       int error = get_last_error();
       if (interrupted(error)) continue;
       if (timed_out(error)) {
+        if (*frame_started) {
+          return Status::io_error("recv() timed out mid-frame");
+        }
         return Status::timeout("recv() timed out");
       }
       return Status::io_error("recv() failed");
     }
     if (r == 0) return Status::closed("peer closed");
+    *frame_started = true;
     p += static_cast<std::size_t>(r);
     n -= static_cast<std::size_t>(r);
   }
@@ -254,9 +267,11 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
 
   std::uint8_t hdr[kHeaderLen];
   encode_header(h, hdr);
-  auto st = write_all(fd, hdr, sizeof(hdr));
+  bool frame_started = false;
+  auto st = write_all(fd, hdr, sizeof(hdr), &frame_started);
   if (!st.ok()) return st;
-  return write_all(fd, msg.data(), msg.size());
+  if (msg.size() == 0) return {};
+  return write_all(fd, msg.data(), msg.size(), &frame_started);
 }
 
 Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
@@ -264,7 +279,8 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
   if (!timeout_st.ok()) return timeout_st.status();
 
   std::uint8_t hdr[kHeaderLen];
-  auto st = read_exact(fd, hdr, sizeof(hdr));
+  bool frame_started = false;
+  auto st = read_exact(fd, hdr, sizeof(hdr), &frame_started);
   if (!st.ok()) return st.status();
   auto decoded = decode_header(hdr);
   if (!decoded.ok()) return decoded.status();
@@ -272,7 +288,9 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
   FrameHeader h = decoded.value();
   std::vector<std::uint8_t> buf(h.payload_len);
   if (h.payload_len != 0) {
-    st = read_exact(fd, buf.data(), buf.size());
+    // The header was consumed, so a timeout from here on is mid-frame.
+    bool payload_started = true;
+    st = read_exact(fd, buf.data(), buf.size(), &payload_started);
     if (!st.ok()) return st.status();
   }
   return Message::from_bytes(buf.data(), buf.size());

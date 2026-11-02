@@ -1,9 +1,11 @@
 #include "duct/duct.h"
+#include "duct/protocol.h"
 #include "duct/qos_pipe.h"
 #include "duct/wire.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <csignal>
 #include <chrono>
@@ -379,27 +381,63 @@ static void test_wire_write_timeout() {
   EXPECT_TRUE(rc == 0);
   if (rc != 0) return;
 
-  // Shrink the send buffer so a couple of max-size frames fill it and the
-  // next write has to wait long enough to hit the configured timeout.
-  int sndbuf = 4096;
-  (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-  const std::string big(duct::wire::kMaxFramePayload, 'x');
-  const auto msg = duct::Message::from_string(big);
-  const auto start = std::chrono::steady_clock::now();
-  bool saw_timeout = false;
-  for (int i = 0; i < 128 && !saw_timeout; ++i) {
-    auto st = duct::wire::write_frame(fds[0], msg, /*flags=*/0,
-                                      std::chrono::milliseconds(50));
-    if (!st.ok()) {
-      saw_timeout = st.status().code() == duct::StatusCode::kTimeout;
+  // Fill the socket send buffer first so the next frame cannot even write its
+  // header. That keeps the timeout boundary at frame start, which must be
+  // reported as kTimeout (mid-frame timeouts are kIoError, see below).
+  char filler[4096] = {};
+  for (;;) {
+    ssize_t w = ::send(fds[0], filler, sizeof(filler), MSG_DONTWAIT);
+    if (w < 0) {
+      EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
       break;
     }
+    EXPECT_TRUE(w > 0);
+    if (w <= 0) break;
   }
+
+  const std::string big(duct::wire::kMaxFramePayload, 'x');
+  const auto start = std::chrono::steady_clock::now();
+  auto st = duct::wire::write_frame(fds[0], duct::Message::from_string(big), /*flags=*/0,
+                                    std::chrono::milliseconds(50));
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
-  EXPECT_TRUE(saw_timeout);
-  EXPECT_TRUE(elapsed < std::chrono::seconds(5));
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kTimeout);
+  }
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
+}
+
+static void test_wire_partial_frame_timeout() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  // Send half a header, then stall: the stream is mid-frame, so the timeout must
+  // surface as kIoError rather than kTimeout (which callers may retry).
+  duct::wire::FrameHeader h;
+  h.magic = duct::kProtocolMagic;
+  h.version = duct::kProtocolVersion;
+  h.header_len = static_cast<std::uint16_t>(duct::wire::kHeaderLen);
+  h.payload_len = 4;
+  std::uint8_t hdr[duct::wire::kHeaderLen];
+  duct::wire::encode_header(h, hdr);
+  EXPECT_EQ(::send(fds[0], hdr, sizeof(hdr) / 2, 0),
+            static_cast<ssize_t>(sizeof(hdr) / 2));
+
+  auto r = duct::wire::read_frame(fds[1], std::chrono::milliseconds(50));
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kIoError);
+  }
 
   ::close(fds[0]);
   ::close(fds[1]);
@@ -868,6 +906,7 @@ int main() {
   test_wire_socketpair_frames();
   test_wire_read_timeout();
   test_wire_write_timeout();
+  test_wire_partial_frame_timeout();
   test_tcp_recv_timeout_honored();
   test_wire_write_no_sigpipe_on_macos();
   test_qos_block_zero_timeout_blocks();
