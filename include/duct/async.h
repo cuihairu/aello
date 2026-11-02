@@ -154,9 +154,13 @@ class EventLoop {
   void run() {
     std::unique_lock<std::mutex> lock(mutex_);
     while (running_) {
-      // 处理所有管道
+      // Never hold the mutex while blocking on I/O or invoking user callbacks:
+      // stop() and add_pipe() must be able to proceed concurrently.
+      auto pipes = pipes_;
+      lock.unlock();
+
       bool has_activity = false;
-      for (auto& entry : pipes_) {
+      for (auto& entry : pipes) {
         // 尝试接收消息（非阻塞）
         // 注意：当前实现使用轮询，实际应用中应该使用更高效的机制
         // 如 epoll/kqueue/IOCP 等
@@ -175,8 +179,9 @@ class EventLoop {
         }
       }
 
+      lock.lock();
       // 如果没有活动，等待新管道添加或停止信号
-      if (!has_activity) {
+      if (running_ && !has_activity) {
         cv_.wait_for(lock, std::chrono::milliseconds(100));
       }
     }
@@ -197,12 +202,18 @@ class EventLoop {
    * @brief 停止事件循环
    */
   void stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     running_ = false;
     cv_.notify_all();
-    if (thread_.joinable()) {
-      thread_.join();
+    if (!thread_.joinable() || thread_.get_id() == std::this_thread::get_id()) {
+      // Called from a loop callback: the thread will observe running_ == false
+      // and exit; joining ourselves here would deadlock.
+      return;
     }
+    // Join without the mutex so run() can reacquire it to observe running_.
+    std::thread worker = std::move(thread_);
+    lock.unlock();
+    worker.join();
   }
 
  private:
