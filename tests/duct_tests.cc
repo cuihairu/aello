@@ -1,13 +1,19 @@
 #include "duct/duct.h"
+#include "duct/qos_pipe.h"
 #include "duct/wire.h"
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <csignal>
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <sys/socket.h>
@@ -40,6 +46,78 @@ void fail(const char* file, int line, const std::string& msg) {
       fail(__FILE__, __LINE__, std::string(#a) + " != " + std::string(#b)); \
     }                                                                     \
   } while (0)
+
+// Test double: accepts most sends, rejects one configured payload with a
+// permanent error and records which payloads actually reached the transport.
+class RecordingPipe final : public duct::Pipe {
+ public:
+  explicit RecordingPipe(std::string reject = {}) : reject_(std::move(reject)) {}
+
+  duct::Result<void> send(const duct::Message& msg, const duct::SendOptions&) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!reject_.empty() && msg.as_string_view() == reject_) {
+      return duct::Status::invalid_argument("rejected by test transport");
+    }
+    sent_.emplace_back(msg.as_string_view());
+    cv_.notify_all();
+    return {};
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    return duct::Status::timeout("recording pipe has no inbound data");
+  }
+
+  void close() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    cv_.notify_all();
+  }
+
+  bool wait_for_sent(std::string_view payload, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] {
+      return std::find(sent_.begin(), sent_.end(), std::string(payload)) != sent_.end();
+    });
+  }
+
+ private:
+  std::string reject_;
+  std::vector<std::string> sent_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool closed_ = false;
+};
+
+// Test double: every send times out after a short delay, which keeps the QoS
+// worker busy without blocking close() indefinitely.
+class SlowTimeoutPipe final : public duct::Pipe {
+ public:
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      in_send_ = true;
+      cv_.notify_all();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return duct::Status::timeout("slow test transport");
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    return duct::Status::timeout("slow pipe has no inbound data");
+  }
+
+  void close() override {}
+
+  bool wait_until_send_started(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] { return in_send_; });
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool in_send_ = false;
+};
 
 static void test_address_parse() {
   {
@@ -468,6 +546,25 @@ static void test_wire_socketpair_frames() {
 #endif
 }
 
+static void test_qos_permanent_send_error_does_not_wedge() {
+  // A payload the transport rejects permanently (e.g. shm's 64 KiB limit when the
+  // QoS HWM is larger) must be dropped, not requeued forever. Requeueing spins the
+  // worker and starves every later message.
+  auto owned = std::make_unique<RecordingPipe>("bad-payload");
+  RecordingPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 1024 * 1024;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  duct::SendOptions opt;
+  opt.timeout = std::chrono::milliseconds(100);
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("bad-payload"), opt).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("good-payload"), opt).ok());
+  EXPECT_TRUE(transport->wait_for_sent("good-payload", std::chrono::milliseconds(1000)));
+  pipe.close();
+}
+
 static void test_qos_delivery_under_hwm() {
   // QoS-enabled dial (default snd_hwm_bytes wraps in QosPipe). A small HWM forces the
   // in-memory queue to reach its watermark quickly. The send worker must keep draining
@@ -607,6 +704,7 @@ int main() {
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
   test_wire_write_no_sigpipe_on_macos();
+  test_qos_permanent_send_error_does_not_wedge();
   test_qos_delivery_under_hwm();
   test_qos_close_under_full_ring();
 

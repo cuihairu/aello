@@ -69,23 +69,27 @@ void QosPipe::send_worker() {
     auto result = underlying_->send(msg_to_send.message, opt);
 
     if (!result.ok()) {
+      const StatusCode code = result.status().code();
       std::lock_guard<std::mutex> lock(send_mutex_);
-      if (result.status().code() == StatusCode::kClosed ||
-          result.status().code() == StatusCode::kIoError) {
+      if (code == StatusCode::kClosed || code == StatusCode::kIoError) {
         running_ = false;
+        send_cv_.notify_all();
         break;
       }
-      // Transient failure (e.g. kTimeout from the bounded send): keep the message,
-      // re-inserted at the front to preserve ordering. If close() ran meanwhile,
-      // drop it. Capture the size before the move: reading it afterwards would be
-      // a use-after-move and make the byte accounting depend on Message's
-      // unspecified moved-from state.
-      const std::size_t requeue_size = msg_to_send.message.size();
-      if (running_) {
-        send_queue_.push_front(std::move(msg_to_send));
-        send_bytes_ += requeue_size;
-        send_count_ += 1;
+      // A timeout is transient: keep the message and retry it at the head so
+      // ordering is preserved (e.g. a full ring or a slow peer).
+      if (code == StatusCode::kTimeout) {
+        const std::size_t requeue_size = msg_to_send.message.size();
+        if (running_) {
+          send_queue_.push_front(std::move(msg_to_send));
+          send_bytes_ += requeue_size;
+          send_count_ += 1;
+        }
+        continue;
       }
+      // Any other status (kInvalidArgument, kProtocolError, kNotSupported) is
+      // permanent for this message. Requeueing it would spin forever and block
+      // every message behind it, so drop it and keep draining.
     }
   }
 }
