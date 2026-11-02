@@ -27,7 +27,7 @@
 #endif
 
 // 标记为实验性 API
-#define DUCT Experimental [[deprecated("This is an experimental API and may change in future releases.")]]
+#define DUCT_EXPERIMENTAL [[deprecated("This is an experimental API and may change in future releases.")]]
 
 // 标记为内部实现细节
 #define DUCT_INTERNAL DUCT_PRIVATE

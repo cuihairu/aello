@@ -32,6 +32,9 @@ namespace detail {
 
 struct LoggerHolder {
   std::shared_ptr<Logger> logger = std::make_shared<ConsoleLogger>();
+  // Keep replaced loggers alive: get() hands out references, so destroying the
+  // previous instance while a caller still logs through it would be a UAF.
+  std::vector<std::shared_ptr<Logger>> retired;
   std::mutex mutex;
 
   Logger& get() {
@@ -41,6 +44,7 @@ struct LoggerHolder {
 
   void set(std::shared_ptr<Logger> new_logger) {
     std::lock_guard<std::mutex> lock(mutex);
+    retired.push_back(std::move(logger));
     logger = std::move(new_logger);
   }
 };

@@ -60,7 +60,7 @@ Result<void> MessageQueue::push(const Message& msg, std::chrono::milliseconds ti
   }
 
   // Enqueue the message.
-  QueuedMessage qm;
+  QueueEntry qm;
   qm.msg = msg;
   qm.enqueue_time = std::chrono::steady_clock::now();
   if (ttl_.count() > 0) {

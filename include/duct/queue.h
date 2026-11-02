@@ -13,7 +13,7 @@
 namespace duct {
 
 // Internal message wrapper with metadata for TTL and priority.
-struct QueuedMessage {
+struct QueueEntry {
   Message msg;
   std::chrono::steady_clock::time_point enqueue_time;
   std::chrono::steady_clock::time_point deadline;  // zero if no TTL
@@ -66,7 +66,7 @@ class MessageQueue {
   std::condition_variable not_full_cv_;
   std::condition_variable not_empty_cv_;
 
-  std::deque<QueuedMessage> queue_;
+  std::deque<QueueEntry> queue_;
   std::size_t total_bytes_ = 0;
   bool closed_ = false;
 
