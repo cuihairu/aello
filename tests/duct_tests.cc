@@ -710,6 +710,24 @@ static void test_qos_permanent_send_error_does_not_wedge() {
   pipe.close();
 }
 
+static void test_qos_oversized_message_rejected() {
+  // The shm/wire transports cap a message at 64 KiB. QoS must reject anything
+  // larger synchronously instead of accepting it and dropping it in the worker.
+  auto owned = std::make_unique<RecordingPipe>();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 1024 * 1024;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  const std::string big(duct::wire::kMaxFramePayload + 1, 'x');
+  auto st = pipe.send(duct::Message::from_string(big), {});
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+  pipe.close();
+}
+
 static void test_qos_delivery_under_hwm() {
   // QoS-enabled dial (default snd_hwm_bytes wraps in QosPipe). A small HWM forces the
   // in-memory queue to reach its watermark quickly. The send worker must keep draining
@@ -854,6 +872,7 @@ int main() {
   test_wire_write_no_sigpipe_on_macos();
   test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();
+  test_qos_oversized_message_rejected();
   test_qos_delivery_under_hwm();
   test_qos_close_under_full_ring();
 

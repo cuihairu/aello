@@ -99,8 +99,11 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
     return Status::closed("pipe closed");
   }
 
-  // Check message size against limits
-  if (msg.size() > qos_.snd_hwm_bytes) {
+  // Check message size against limits. snd_hwm_bytes == 0 means "unlimited".
+  if (msg.size() > qos_.max_message_bytes) {
+    return Status::invalid_argument("message too large for the transport");
+  }
+  if (qos_.snd_hwm_bytes != 0 && msg.size() > qos_.snd_hwm_bytes) {
     return Status::invalid_argument("message too large for queue limits");
   }
 
