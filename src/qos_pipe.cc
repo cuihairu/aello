@@ -1,5 +1,7 @@
 #include "duct/qos_pipe.h"
 
+#include "duct/wire.h"
+
 #include <algorithm>
 
 namespace duct {
@@ -31,6 +33,7 @@ void QosPipe::send_worker() {
       // Process expired messages (TTL)
       if (qos_.ttl.count() > 0) {
         auto now = std::chrono::steady_clock::now();
+        bool expired_messages_removed = false;
 
         send_queue_.erase(
           std::remove_if(send_queue_.begin(), send_queue_.end(),
@@ -39,11 +42,17 @@ void QosPipe::send_worker() {
               if (age > qos_.ttl) {
                 send_bytes_ -= queued_msg.message.size();
                 send_count_ -= 1;
+                expired_messages_removed = true;
                 return true;  // Remove expired message
               }
               return false;
             }),
           send_queue_.end());
+        // A blocked kBlock sender only relies on queue space released by TTL;
+        // wake it as soon as that space becomes available.
+        if (expired_messages_removed) {
+          send_cv_.notify_all();
+        }
       }
 
       if (send_queue_.empty()) continue;
@@ -100,7 +109,12 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
   }
 
   // Check message size against limits. snd_hwm_bytes == 0 means "unlimited".
-  if (msg.size() > qos_.max_message_bytes) {
+  // The wire frame limit is an absolute cap: a caller-configured QoS value above
+  // it must not re-open the path where send() accepts a message that the
+  // transport later rejects or drops.
+  const std::size_t max_message_bytes = std::min(qos_.max_message_bytes,
+                                                 wire::kMaxFramePayload);
+  if (msg.size() > max_message_bytes) {
     return Status::invalid_argument("message too large for the transport");
   }
   if (qos_.snd_hwm_bytes != 0 && msg.size() > qos_.snd_hwm_bytes) {
