@@ -192,3 +192,63 @@ repeat:       10/10 runs green
 ---
 
 **统计：发现 30 项 / 已修 13 项（P1×7、P2×6）/ 剩余 17 项（P2×11、P3×6）/ P0 = 0。**
+
+---
+
+## 独立审核意见（2026-11-02，异模型审核员）
+
+> 审核方式：干净上下文、不信任报告本身，逐条打开源码对照；已修 P0/P1 核对 commit 存在 + 测试真绿；另抽样 3 个报告未覆盖的高危面（认证 / 输入处理 / 资源释放）。证据统一对照**报告时点快照 `1fb4fac`**（报告写成时的 HEAD），避免被报告之后落地的提交（`4aa9785` 等）干扰。
+
+### 1. 逐条真实性判定（30 项）——证伪 0
+
+**已修 F-01..F-13（13 项）全部真实**：11 个修复 commit 均在 main（`ad7bd1c`…`cec8067`），diff 与声称一致。
+
+| ID | 核实要点 |
+|---|---|
+| F-01 | 旧 `qos_pipe.cc:82` 确为 `push_front(move)` 后读 `message.size()`（use-after-move）；`ad7bd1c` 改移动前捕获 `requeue_size` |
+| F-02 | 旧 worker 对非 kClosed/kIoError 一律 `push_front` 重试；`09c55d4` 改仅 kTimeout 重排、其余丢弃继续排空 |
+| F-03 | 旧 kBlock 无条件 `wait_for(lock, opt.timeout)`（0 立即返回误报 kTimeout）；`26001ab` 改 0 走无超时 `wait`；`duct.h`「If non-zero」口径一致 |
+| F-04 | 旧 `send()` 仅加锁前查 `running_`；`55e2949` 加锁内二次检查 |
+| F-05 | 旧 `tcp_transport.cc:57-65` send/recv 形参匿名、直传无超时；`bd157c7` 加 timeout、SO_SNDTIMEO/SO_RCVTIMEO、EAGAIN/EWOULDBLOCK/WSAETIMEDOUT→kTimeout |
+| F-06 | `async.h` `run()` 持 `mutex_` 阻塞 I/O+回调、`stop()` 持锁再 join；`cde3c45` 锁外 I/O、锁外 join、防自 join |
+| F-07 | `cec8067` 加 `frame_started`：半帧超时→kIoError（当前 `wire.cc:191-192,235-236`），帧首→kTimeout |
+| F-08 | 当前 `qos_pipe.cc:103` 同步拒 `> max_message_bytes`；`wire.h:13`/`shm_transport.cc:42` 64KiB 上限确认 |
+| F-09 | 旧 `win_shm.cc:236` `memset(h.mem,0,kShmSize)`；`5e8dac7` 改 placement-new + `<new>` |
+| F-10/11/12/13 | `3022436`：`queue.h` 现 `struct QueueEntry`（重名消除）；`logging.cc:37,47` `retired` 保活被替换 logger；`<vector>/<unordered_map>` 补齐；旧 `#define DUCT Experimental [[deprecated]]` 实为宏名+空格错位，现 `DUCT_EXPERIMENTAL` |
+
+**剩余 F-14..F-30（17 项）全部真实**（对照 `1fb4fac`）：F-14 报告时点 `tcp_dial:242`/`shm_dial:501` 确为 `(void)opt`、connect_tcp/uds_connect 无 timeout 参数——**真实**，已由报告后 `4aa9785 fix(dial): honor DialOptions.timeout...` 修复（非证伪，属「报告后已解决」，应从剩余清单摘除）。F-15..F-30 逐条在快照对应行找到所述问题（`(void)opt`、unmap 竞态、双重 join、`/tmp`+unlink、非法槽长不归还 spaces、`(void)opt`+无尺寸校验、rcv/linger 无消费者、queue `hwm==0` 无上限、`Histogram` 无界、`async` detached 线程、sanitize 碰撞、`sem_timedwait(CLOCK_REALTIME)`、kFailFast=kIoError、IPv6 方括号、clang-tidy、DACL Everyone）。
+
+**行号精校**：F-18/19/27 与快照**精确命中**；F-21 引 `duct.h:59,66`，实际 `rcv_hwm_bytes`/`linger` 在 `:60,:67`（±1，引到相邻字段/注释）；F-30 引 `:52-64` 实际 `:55-65`（±3）。属引用不精，**不影响结论成立**。
+
+### 2. 已修 P0/P1「commit 存在 + 测试真绿」核验
+
+- 11 个修复 commit 全部 `merge-base --is-ancestor` main ✓。
+- 独立复现质量门（本机 GCC 15.2.0）：
+  - `build-review`：0 告警，ctest 1/1（当前 HEAD 为 21 用例，**含报告时点全部 18 用例**）✓
+  - `build-asan`（`-fsanitize=address,undefined`，`detect_leaks=1`）：0 告警，ctest 1/1 ✓
+  - `build-tsan`（`-fsanitize=thread`，`halt_on_error=1`）：0 告警，ctest 1/1 ✓
+- **结论：修复真实且有效，测试确实绿。** 无假修复、无「声称已修实则未修」。
+
+### 3. 抽样 3 个高危面（报告未覆盖）
+
+- **认证**：shm 段与信号量均以 **0600** 创建（`shm_open/sem_open`，`shm_transport.cc:340,365-368`）——权限面控制良好；客户端 `shm_open(O_RDWR,0600)`/`sem_open(name,0)`。**漏网 M-1**：UDS 引导套接字（`/tmp/duct_shm_<hash>.sock`）`bind` 后**无显式 `chmod`**，访问权限完全依赖进程 umask（`shm_transport.cc:205-222`）；umask 宽松时（0/002）任意本地用户可 connect，叠加 `:217` 无条件 unlink 与 F-18 的 /tmp 抢占面。P3（本地、可用性/冒名面，非数据泄露）。
+- **输入处理**：`decode_header` 校验 magic/version/`header_len==16`/`payload_len≤64K`，`read_frame` 按校验后长度分配；`write_frame` 同样拒 >64K——**防御完备，无漏网**。
+- **资源释放**：`close_handles` 优雅处理 SEM_FAILED/munmap/fd；`shm_setup` 各失败路径均 close_handles+unlink 全部资源（`:344-349,356-361,371-378`）；`shm_dial` 的 uds_connect 失败也完整清理（`:545-553`）；`uds_listen` 各错误路径关 fd。**漏网 M-2**：`apply_socket_timeout` 把 `SO_SNDTIMEO/SO_RCVTIMEO` 设为每次 `send()`/`recv()` 系统调用的超时，而 `write_all/read_exact` 逐字节循环——**超时是「每次系统调用」而非「整帧截止」**；慢对端逐字节滴流可把 64KiB 帧拉远超过时值（`wire.cc:121-142`）。与 `Send/RecvOptions.timeout`（整次操作截止）语义不符，但非内存安全。P3。
+
+### 4. 漏网发现汇总（2 项，均 P3）
+
+| # | 面 | 问题 | 证据 | 严重度 |
+|---|---|---|---|---|
+| M-1 | 认证 | UDS 引导套接字无显式 chmod，权限依赖 umask；宽松 umask 下任意本地用户可 connect | `src/shm_transport.cc:205-222` | P3 |
+| M-2 | 输入/契约 | `Send/RecvOptions.timeout` 按每次系统调用而非整帧计时，慢滴流可远超超时 | `src/wire.cc:121-142` | P3 |
+
+### 5. 报告自洽性（小瑕疵，不涉证据）
+
+- F-29 clang-tidy 称「剩余 6 条」：本机复现**7 处**——`duct.h:59/:60/:74` 三处整型加宽（报告引 `:58` 单处）、`wire.h:13`、`shm_transport.cc:44`、`qos_pipe.cc:14` 析构虚调用、`tcp_transport.cc:231` 相邻易混参数；全部为风格/P3 类，**无正确性缺陷**，报告「均为 P3 风格/误报类」定性成立，仅计数差 1、duct.h 站点数少计。
+- §7 新增用例 8 项 = 报告时点实际新增 8 项（基线 10 → 18，与 §0/§1 一致），准确；报告后 `4aa9785` 另加 3 项（dial timeout）不在 §7，正常。
+
+### 6. 总评
+
+- **可信度：92%**。证据层面 100% 真实（30/30 发现证据成立、13/13 修复有效、无证伪、无假修复）；扣分项为 1 处 clang-tidy 计数/站点误差、1 处 F-21 行号 ±1、2 处 P3 漏网（M-1/M-2）、F-14「报告后已解决」需知悉。
+- 「无 P0」结论成立；安全扫描零命中复核成立（反序列化/路径/整数/缓冲确有防御，0600 权限、decode_header、close_handles 均核实）。
+- 建议：M-1 补 `chmod(0600)`/`fchmod`；M-2 将超时改为整帧截止（或 deadline 折算剩余）；F-14 从剩余清单/todo 摘除（已由 `4aa9785` 修复）；F-29 更新为 7 处并标注 duct.h 三处站点。
