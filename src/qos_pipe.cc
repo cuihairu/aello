@@ -126,10 +126,18 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
         break;
 
       case BackpressurePolicy::kBlock:
-        // Wait for space in queue
-        send_cv_.wait_for(lock, opt.timeout, [this] {
-          return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
-        });
+        // SendOptions::timeout == 0 means "no timeout" (see duct.h). Only use a
+        // timed wait when the caller asked for one; wait_for(0ms) would return
+        // immediately and report a spurious timeout under backpressure.
+        if (opt.timeout.count() > 0) {
+          send_cv_.wait_for(lock, opt.timeout, [this] {
+            return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
+          });
+        } else {
+          send_cv_.wait(lock, [this] {
+            return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
+          });
+        }
         if (!running_) {
           return Status::closed("pipe closed");
         }

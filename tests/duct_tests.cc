@@ -546,6 +546,41 @@ static void test_wire_socketpair_frames() {
 #endif
 }
 
+static void test_qos_block_zero_timeout_blocks() {
+  // SendOptions::timeout == 0 means "no timeout". With kBlock backpressure a full
+  // queue must block until space is available (or close), not fail immediately.
+  auto owned = std::make_unique<SlowTimeoutPipe>();
+  SlowTimeoutPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 3;
+  qos.backpressure = duct::BackpressurePolicy::kBlock;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(1000)));
+
+  // The worker is busy in the transport for 300 ms; fill the 3-byte HWM meanwhile.
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("c"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("d"), {}).ok());
+
+  auto blocked = std::async(std::launch::async, [&] {
+    return pipe.send(duct::Message::from_string("e"), {});  // timeout 0 => block
+  });
+  EXPECT_TRUE(blocked.wait_for(std::chrono::milliseconds(150)) != std::future_status::ready);
+
+  pipe.close();
+  EXPECT_TRUE(blocked.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  if (blocked.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    auto result = blocked.get();
+    EXPECT_TRUE(!result.ok());
+    if (!result.ok()) {
+      EXPECT_EQ(result.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+}
+
 static void test_qos_permanent_send_error_does_not_wedge() {
   // A payload the transport rejects permanently (e.g. shm's 64 KiB limit when the
   // QoS HWM is larger) must be dropped, not requeued forever. Requeueing spins the
@@ -704,6 +739,7 @@ int main() {
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
   test_wire_write_no_sigpipe_on_macos();
+  test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();
   test_qos_delivery_under_hwm();
   test_qos_close_under_full_ring();
