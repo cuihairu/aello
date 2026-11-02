@@ -142,7 +142,8 @@ Result<void> apply_socket_timeout(SocketHandle fd, bool writing,
 }
 
 Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
-                       bool* frame_started) {
+                       bool* frame_started,
+                       std::chrono::steady_clock::time_point deadline) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
   if (!wsa.ok()) return wsa;
@@ -170,6 +171,18 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
   }
 #endif
   while (n != 0) {
+    if (deadline.time_since_epoch().count() != 0) {
+      auto remaining = deadline - std::chrono::steady_clock::now();
+      if (remaining <= std::chrono::milliseconds::zero()) {
+        if (*frame_started) {
+          return Status::io_error("send() timed out mid-frame");
+        }
+        return Status::timeout("send() timed out");
+      }
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+      auto timeout_st = apply_socket_timeout(fd, /*writing=*/true, ms);
+      if (!timeout_st.ok()) return timeout_st;
+    }
 #if defined(_WIN32)
     SOCKET sock = static_cast<SOCKET>(fd);
     int w = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0);
@@ -255,8 +268,9 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
     return Status::invalid_argument("message too large; enable fragmentation (todo)");
   }
 
-  auto timeout_st = apply_socket_timeout(fd, /*writing=*/true, timeout);
-  if (!timeout_st.ok()) return timeout_st;
+  auto deadline = timeout.count() > 0
+      ? std::chrono::steady_clock::now() + timeout
+      : std::chrono::steady_clock::time_point{};
 
   FrameHeader h;
   h.magic = kProtocolMagic;
@@ -268,10 +282,10 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
   std::uint8_t hdr[kHeaderLen];
   encode_header(h, hdr);
   bool frame_started = false;
-  auto st = write_all(fd, hdr, sizeof(hdr), &frame_started);
+  auto st = write_all(fd, hdr, sizeof(hdr), &frame_started, deadline);
   if (!st.ok()) return st;
   if (msg.size() == 0) return {};
-  return write_all(fd, msg.data(), msg.size(), &frame_started);
+  return write_all(fd, msg.data(), msg.size(), &frame_started, deadline);
 }
 
 Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
