@@ -1,11 +1,11 @@
 # Aello
 
-<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img src="https://img.shields.io/badge/status-in%20development-orange" alt="status"/></a> <a href="https://cuihairu.github.io/aello/zh/"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-blue" alt="docs"/></a></p>
+<p align="center"><a href="https://github.com/cuihairu/aello/releases"><img src="https://img.shields.io/badge/status-in%20development-orange" alt="status"/></a> </p>
 
 > [English](README.md) | **中文**
 
 <p align="center">
-<a href="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml"><img src="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a> <a href="https://isocpp.org/"><img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" alt="C++20"></a> <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
+<a href="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml"><img src="https://github.com/cuihairu/aello/actions/workflows/cmake-multi-platform.yml/badge.svg" alt="CI"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License"></a> <a href="https://isocpp.org/"><img src="https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white" alt="C++20"></a> <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status"> <a href="https://cuihairu.github.io/aello/zh/"><img src="https://img.shields.io/badge/%E6%96%87%E6%A1%A3-blue" alt="文档"></a>
 </p>
 
 **Aello** 是面向游戏服务器的消息运行时：解决服务器进程之间如何以低延迟、
