@@ -9,6 +9,7 @@ add_library(duct
   src/duct.cc
   src/message.cc
   src/qos_pipe.cc
+  src/socket_utils.cc
   src/shm_transport.cc
   src/tcp_transport.cc
   src/wire.cc

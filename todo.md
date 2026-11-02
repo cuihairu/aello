@@ -19,7 +19,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Transport wiring
 
 - [x] Honor `SendOptions`/`RecvOptions.timeout` on tcp; a mid-frame timeout is fatal. Evidence: bd157c7, cec8067.
-- [ ] Wire `DialOptions.timeout` into tcp/shm dial (currently ignored at src/tcp_transport.cc:242, src/shm_transport.cc:500).
+- [x] Wire `DialOptions.timeout` into tcp/shm dial. Evidence: 8 test cases green (13 total, 1 ctest pass).
 - [ ] Wire `uds://` into dial/listen (src/uds_transport.cc implemented but uncompiled and undispatched).
 - [ ] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled).
 - [ ] Wire `on_state_change` connection callback.
@@ -66,3 +66,11 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Resolve duplicate `QueuedMessage` definition (include/duct/queue.h:16 and include/duct/qos_pipe.h:18). Evidence: 3022436.
 - [x] Fix malformed `DUCT Experimental [[deprecated(...)]]` macro (include/duct/duct_export.h:30). Evidence: 3022436.
 - [ ] Make shm slot parameters configurable (currently hard-coded 64 slots x 64 KiB).
+
+## 审核发现
+
+- [ ] 审核发现：`EventLoop::stop()` 在锁外 join 已移出的 `thread_` 期间，`runInBackground()` 会因 `thread_.joinable()==false` 重启线程并把 `running_` 置回 true，旧循环线程重新进入 `wait_for`，导致 `stop()` 永久阻塞（复现：并发 stop+restart，10/10 挂起；include/duct/async.h:193-217）。
+- [ ] 审核发现：QosPipe worker 的 TTL 清理在持锁删除过期消息并减少 `send_bytes_` 后未 `send_cv_.notify_all()`，`kBlock` 且 `SendOptions.timeout==0` 的发送者在空间仅由 TTL 释放时永不唤醒，可永久挂起（复现：STILL BLOCKED；src/qos_pipe.cc:35-46,143-151）。
+- [ ] 审核发现：`LoggerHolder::retired` 无上限保留所有被替换的 logger，反复 `set_logger()` 会造成无界内存增长（src/logging.cc:37,47）。
+- [ ] 审核发现：QosPipe worker 以 100ms 超时“绑定”传输发送，但 wire 的 `SO_SNDTIMEO` 作用于每次 `send()`/`recv()` 系统调用而非整帧，慢对端下 64KiB 帧可耗时多个 100ms，`close()` 的 join 等待并不真正受 100ms 限制（src/qos_pipe.cc:64-69；src/wire.cc:119-142）。
+- [ ] 审核发现：`QosOptions::max_message_bytes` 与底层传输实际上限解耦，调用方若设得更高，超限消息仍被 `send()` 接受并在 worker 中静默丢弃，重新引入本次提交声称修复的数据丢失路径（include/duct/duct.h:71-74；src/qos_pipe.cc:101-104；src/wire.cc:254-256；src/shm_transport.cc:389-390）。

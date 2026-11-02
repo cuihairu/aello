@@ -494,6 +494,84 @@ static void test_tcp_recv_timeout_honored() {
 #endif
 }
 
+// DialTimeout must bound the connect attempt for tcp. We dial a port that is
+// unlikely to be listening (but reachable, not firewalled) and require a kTimeout
+// rather than an indefinite kernel connect timeout.
+static void test_tcp_dial_timeout_honored() {
+#if defined(_WIN32)
+  return;
+#else
+  // 10.255.255.0/24 is not on any local route and the upstream gateway drops the
+  // packets silently, so a blocking connect() would stall until the kernel
+  // timeout. The bounded dial must instead return kTimeout quickly.
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(150);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+
+  const auto start = std::chrono::steady_clock::now();
+  auto c = duct::dial("tcp://10.255.255.1:65000", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kTimeout);
+  }
+  // Allow generous slack for scheduler jitter but far below the default 60-130s.
+  EXPECT_TRUE(elapsed < std::chrono::seconds(3));
+#endif
+}
+
+static void test_shm_dial_timeout_honored() {
+#if defined(_WIN32)
+  // Windows shm dial honors opt.timeout via WaitNamedPipe. A missing bootstrap
+  // pipe must fail promptly (timeout), never hang.
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(150);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  const auto start = std::chrono::steady_clock::now();
+  auto c = duct::dial("shm://duct_timeout_no_listener", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kTimeout);
+  }
+  EXPECT_TRUE(elapsed < std::chrono::seconds(3));
+#else
+  // No listener on the bootstrap socket. AF_UNIX connect returns ENOENT immediately
+  // (Linux), so this verifies the timeout path is wired without hanging; a blocked
+  // connect would instead be bounded by the dial timeout. The key guarantee is that
+  // dial with a timeout never hangs indefinitely.
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(150);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  const auto start = std::chrono::steady_clock::now();
+  auto c = duct::dial("shm://duct_timeout_no_listener", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(!c.ok());
+  EXPECT_TRUE(elapsed < std::chrono::seconds(3));
+#endif
+}
+
+static void test_dial_rejects_negative_timeout() {
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(-1);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("tcp://127.0.0.1:1", dial_opt);
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+  auto s = duct::dial("shm://duct_negative_timeout", dial_opt);
+  EXPECT_TRUE(!s.ok());
+  if (!s.ok()) {
+    EXPECT_EQ(s.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+}
+
 static void test_shm_burst_without_receiver() {
   auto lis_r = duct::listen("shm://duct_testburst");
   EXPECT_TRUE(lis_r.ok());
@@ -926,6 +1004,9 @@ int main() {
   test_wire_write_timeout();
   test_wire_partial_frame_timeout();
   test_tcp_recv_timeout_honored();
+  test_tcp_dial_timeout_honored();
+  test_shm_dial_timeout_honored();
+  test_dial_rejects_negative_timeout();
   test_wire_write_no_sigpipe_on_macos();
   test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();

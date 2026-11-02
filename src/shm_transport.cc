@@ -12,6 +12,8 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 }  // namespace duct
 
 #else
+#include "duct/socket_utils.h"
+
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -224,7 +226,7 @@ static Result<int> uds_listen(std::string_view path, int backlog) {
   return fd;
 }
 
-static Result<int> uds_connect(std::string_view path) {
+static Result<int> uds_connect(std::string_view path, std::chrono::milliseconds timeout) {
   int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return Status::io_error("socket(AF_UNIX) failed" + errno_suffix());
 
@@ -235,6 +237,36 @@ static Result<int> uds_connect(std::string_view path) {
     return Status::invalid_argument("uds path too long");
   }
   std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", std::string(path).c_str());
+
+  if (timeout.count() > 0) {
+    auto st = socket_utils::set_nonblocking(fd, true);
+    if (!st.ok()) {
+      ::close(fd);
+      return st.status();
+    }
+    int rc = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == 0) {
+      (void)socket_utils::set_nonblocking(fd, false);
+      return fd;
+    }
+    if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) {
+      ::close(fd);
+      return Status::io_error("connect(AF_UNIX) failed" + errno_suffix());
+    }
+    st = socket_utils::wait_writable(fd, timeout);
+    if (!st.ok()) {
+      ::close(fd);
+      return st.status();
+    }
+    int so_error = 0;
+    socklen_t errlen = sizeof(so_error);
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) < 0 || so_error != 0) {
+      ::close(fd);
+      return Status::io_error("connect(AF_UNIX) failed" + errno_suffix());
+    }
+    (void)socket_utils::set_nonblocking(fd, false);
+    return fd;
+  }
 
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     ::close(fd);
@@ -498,14 +530,16 @@ Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const List
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
-  (void)opt;
+  if (opt.timeout.count() < 0) {
+    return Status::invalid_argument("dial timeout must not be negative");
+  }
   std::string connid = random_conn_id_hex16();
   ShmNames n = make_names(name, connid);
 
   auto created = create_resources(n);
   if (!created.ok()) return created.status();
 
-  auto cfd = uds_connect(n.bootstrap_path);
+  auto cfd = uds_connect(n.bootstrap_path, opt.timeout);
   if (!cfd.ok()) {
     close_handles(&created.value());
     ::sem_unlink(n.c2s_items_sem.c_str());

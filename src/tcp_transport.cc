@@ -1,8 +1,10 @@
 #include "duct/duct.h"
 
 #include "duct/protocol.h"
+#include "duct/socket_utils.h"
 #include "duct/wire.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -112,7 +114,57 @@ class TcpListener final : public Listener {
   std::uint16_t port_ = 0;
 };
 
-static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
+// Non-blocking connect bounded by `timeout`. Returns kTimeout on expiry.
+// On failure the caller must still close `fd` (we only report, we do not own it).
+static Result<void> connect_with_timeout(wire::SocketHandle fd, const sockaddr* addr, int addrlen,
+                                         std::chrono::milliseconds timeout) {
+  auto st = socket_utils::set_nonblocking(fd, true);
+  if (!st.ok()) return st.status();
+
+  int rc = 0;
+#if defined(_WIN32)
+  rc = ::connect(static_cast<SOCKET>(fd), addr, addrlen);
+#else
+  rc = ::connect(fd, addr, static_cast<socklen_t>(addrlen));
+#endif
+  if (rc == 0) {
+    (void)socket_utils::set_nonblocking(fd, false);
+    return {};
+  }
+
+#if defined(_WIN32)
+  int err = ::WSAGetLastError();
+  if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+    return Status::io_error("connect() failed");
+  }
+#else
+  if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) {
+    return Status::io_error("connect() failed");
+  }
+#endif
+
+  st = socket_utils::wait_writable(fd, timeout);
+  if (!st.ok()) return st.status();
+
+  int so_error = 0;
+  socklen_t errlen = sizeof(so_error);
+#if defined(_WIN32)
+  if (::getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &errlen) < 0 ||
+      so_error != 0) {
+    return Status::io_error("connect() failed");
+  }
+#else
+  if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) < 0 || so_error != 0) {
+    return Status::io_error("connect() failed");
+  }
+#endif
+
+  (void)socket_utils::set_nonblocking(fd, false);
+  return {};
+}
+
+static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port,
+                                              std::chrono::milliseconds timeout) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
   if (!wsa.ok()) return wsa.status();
@@ -140,6 +192,23 @@ static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint
 #else
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #endif
+
+    if (timeout.count() > 0) {
+      auto connected = connect_with_timeout(fd, p->ai_addr, static_cast<int>(p->ai_addrlen), timeout);
+      if (connected.ok()) {
+        break;
+      }
+      close_socket(fd);
+      // A bounded dial stops at the first address that times out. Other hard
+      // errors (e.g. connection refused) fall through to the next address, as
+      // the blocking path does.
+      if (connected.status().code() == StatusCode::kTimeout) {
+        ::freeaddrinfo(res);
+        return connected.status();
+      }
+      fd = wire::kInvalidSocket;
+      continue;
+    }
 
 #if defined(_WIN32)
     if (::connect(static_cast<SOCKET>(fd), p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
@@ -239,8 +308,10 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
 }
 
 Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt) {
-  (void)opt;
-  auto fd = connect_tcp(addr.host, addr.port);
+  if (opt.timeout.count() < 0) {
+    return Status::invalid_argument("dial timeout must not be negative");
+  }
+  auto fd = connect_tcp(addr.host, addr.port, opt.timeout);
   if (!fd.ok()) return fd.status();
   return std::unique_ptr<Pipe>(new TcpPipe(fd.value()));
 }
