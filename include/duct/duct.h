@@ -55,6 +55,7 @@ using ConnectionCallback = std::function<void(ConnectionState, const std::string
 
 struct QosOptions {
   // Bytes are more stable than msg-count when payload sizes vary.
+  // Zero disables the byte watermark (unlimited queue).
   std::size_t snd_hwm_bytes = 4 * 1024 * 1024;
   std::size_t rcv_hwm_bytes = 4 * 1024 * 1024;
   BackpressurePolicy backpressure = BackpressurePolicy::kBlock;

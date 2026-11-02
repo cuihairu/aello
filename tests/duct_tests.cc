@@ -766,6 +766,24 @@ static void test_qos_oversized_message_rejected() {
   pipe.close();
 }
 
+static void test_qos_zero_hwm_is_unlimited() {
+  // snd_hwm_bytes == 0 disables the byte watermark; a non-default backpressure
+  // policy must not silently drop/fail messages just because 0 >= 0.
+  auto owned = std::make_unique<RecordingPipe>();
+  RecordingPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 0;
+  qos.backpressure = duct::BackpressurePolicy::kDropNew;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
+  EXPECT_TRUE(transport->wait_for_sent("a", std::chrono::milliseconds(1000)));
+  EXPECT_TRUE(transport->wait_for_sent("b", std::chrono::milliseconds(1000)));
+  pipe.close();
+}
+
 static void test_qos_delivery_under_hwm() {
   // QoS-enabled dial (default snd_hwm_bytes wraps in QosPipe). A small HWM forces the
   // in-memory queue to reach its watermark quickly. The send worker must keep draining
@@ -912,6 +930,7 @@ int main() {
   test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();
   test_qos_oversized_message_rejected();
+  test_qos_zero_hwm_is_unlimited();
   test_qos_delivery_under_hwm();
   test_qos_close_under_full_ring();
 

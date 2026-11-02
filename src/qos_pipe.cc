@@ -117,8 +117,8 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
     return Status::closed("pipe closed");
   }
 
-  // Handle backpressure policies
-  if (send_bytes_.load() >= qos_.snd_hwm_bytes) {
+  // Handle backpressure policies. A zero watermark means unlimited.
+  if (qos_.snd_hwm_bytes != 0 && send_bytes_.load() >= qos_.snd_hwm_bytes) {
     switch (qos_.backpressure) {
       case BackpressurePolicy::kFailFast:
         return Status::io_error("send queue at high water mark (fail fast)");
