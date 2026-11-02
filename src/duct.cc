@@ -20,6 +20,10 @@ Result<std::unique_ptr<Listener>> pipe_listen(const std::string& name, const Lis
 Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptions& opt);
 #endif
 
+// Implemented in uds_transport.cc (returns not_supported on Windows).
+Result<std::unique_ptr<Listener>> uds_listen(const std::string& path, const ListenOptions& opt);
+Result<std::unique_ptr<Pipe>> uds_dial(const std::string& path, const DialOptions& opt);
+
 Result<std::unique_ptr<Listener>> listen(const std::string& address, const ListenOptions& opt) {
   auto parsed = Address::parse(address);
   if (!parsed.ok()) {
@@ -37,6 +41,9 @@ Result<std::unique_ptr<Listener>> listen(const std::string& address, const Liste
     return pipe_listen(a.name, opt);
   }
 #endif
+  if (a.scheme == Scheme::kUds) {
+    return uds_listen(a.name, opt);
+  }
   return Status::not_supported("listen scheme not supported yet: " + a.scheme_text);
 }
 
@@ -68,6 +75,12 @@ Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions
     }
     base_pipe = std::move(result.value());
 #endif
+  } else if (a.scheme == Scheme::kUds) {
+    auto result = uds_dial(a.name, opt);
+    if (!result.ok()) {
+      return result.status();
+    }
+    base_pipe = std::move(result.value());
   } else {
     return Status::not_supported("dial scheme not supported yet: " + a.scheme_text);
   }

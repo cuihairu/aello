@@ -201,6 +201,60 @@ static void test_shm_echo_one() {
   lis_r.value()->close();
 }
 
+static void test_uds_echo_one() {
+#if !defined(_WIN32)
+  // Unique socket path so parallel/rerun invocations do not collide.
+  std::string path = "/tmp/duct_uds_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());  // clear any stale socket from a crashed run
+
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  // Disable QoS wrapper to exercise the raw uds transport path.
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds://" + path, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  auto st = c.value()->send(duct::Message::from_string("hello-uds"), {});
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    std::string s(reinterpret_cast<const char*>(echoed.value().data()), echoed.value().size());
+    EXPECT_EQ(s, "hello-uds");
+  }
+
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  EXPECT_TRUE(sst == std::future_status::ready);
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  }
+
+  lis_r.value()->close();
+#endif
+}
+
 static void test_pipe_echo_one() {
 #if !defined(_WIN32)
   auto lis_r = duct::listen("pipe://duct_testpipe_echo");
@@ -1030,6 +1084,7 @@ static void test_qos_close_under_full_ring() {
 int main() {
   test_address_parse();
   test_shm_echo_one();
+  test_uds_echo_one();
   test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();

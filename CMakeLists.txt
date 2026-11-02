@@ -12,6 +12,7 @@ add_library(duct
   src/socket_utils.cc
   src/shm_transport.cc
   src/tcp_transport.cc
+  src/uds_transport.cc
   src/wire.cc
 )
 
