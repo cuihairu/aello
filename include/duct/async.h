@@ -191,7 +191,12 @@ class EventLoop {
    * @brief 在后台线程运行事件循环
    */
   void runInBackground() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Wait for any previous stop() join to drain before restarting. Without
+    // this a restart racing an in-flight stop() can set running_ = true while
+    // stop() still owns the (already moved) thread, so the old loop continues
+    // and stop() blocks forever on the moved handle.
+    stop_cv_.wait(lock, [this] { return !stopping_; });
     if (!thread_.joinable()) {
       running_ = true;
       thread_ = std::thread([this]() { this->run(); });
@@ -203,17 +208,29 @@ class EventLoop {
    */
   void stop() {
     std::unique_lock<std::mutex> lock(mutex_);
-    running_ = false;
-    cv_.notify_all();
-    if (!thread_.joinable() || thread_.get_id() == std::this_thread::get_id()) {
-      // Called from a loop callback: the thread will observe running_ == false
-      // and exit; joining ourselves here would deadlock.
+    if (stopping_ || thread_.get_id() == std::this_thread::get_id()) {
+      // Already stopping, or called from a loop callback: the running thread
+      // will observe running_ == false and exit; joining ourselves would
+      // deadlock. Either way, do not re-enter the join path.
       return;
     }
-    // Join without the mutex so run() can reacquire it to observe running_.
-    std::thread worker = std::move(thread_);
+    stopping_ = true;
+    running_ = false;
+    cv_.notify_all();
+    if (!thread_.joinable()) {
+      stopping_ = false;
+      stop_cv_.notify_all();
+      return;
+    }
+    // Do not move thread_ while joining: a concurrent runInBackground() must
+    // see stopping_ and wait, then only restart after the old thread has fully
+    // exited and stop() has released ownership.
     lock.unlock();
-    worker.join();
+    thread_.join();
+    lock.lock();
+    thread_ = {};
+    stopping_ = false;
+    stop_cv_.notify_all();
   }
 
  private:
@@ -227,6 +244,8 @@ class EventLoop {
   std::thread thread_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable stop_cv_;
+  bool stopping_ = false;
   bool running_ = true;
 };
 
