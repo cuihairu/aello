@@ -77,10 +77,13 @@ void QosPipe::send_worker() {
       }
       // Transient failure (e.g. kTimeout from the bounded send): keep the message,
       // re-inserted at the front to preserve ordering. If close() ran meanwhile,
-      // drop it.
+      // drop it. Capture the size before the move: reading it afterwards would be
+      // a use-after-move and make the byte accounting depend on Message's
+      // unspecified moved-from state.
+      const std::size_t requeue_size = msg_to_send.message.size();
       if (running_) {
         send_queue_.push_front(std::move(msg_to_send));
-        send_bytes_ += msg_to_send.message.size();
+        send_bytes_ += requeue_size;
         send_count_ += 1;
       }
     }
