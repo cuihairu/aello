@@ -19,7 +19,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Transport wiring
 
 - [x] Honor `SendOptions`/`RecvOptions.timeout` on tcp; a mid-frame timeout is fatal. Evidence: bd157c7, cec8067.
-- [x] Wire `DialOptions.timeout` into tcp/shm dial. Evidence: 8 test cases green (13 total, 1 ctest pass).
+- [x] Wire `DialOptions.timeout` into tcp/shm dial. Evidence: 4aa9785; 8 new test cases green (13 total, ctest 1/1).
 - [ ] Wire `uds://` into dial/listen (src/uds_transport.cc implemented but uncompiled and undispatched).
 - [ ] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled).
 - [ ] Wire `on_state_change` connection callback.
