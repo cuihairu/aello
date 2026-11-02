@@ -254,6 +254,9 @@ Result<std::unique_ptr<Listener>> pipe_listen(const std::string& name, const Lis
 }
 
 Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptions& opt) {
+  if (opt.timeout.count() < 0) {
+    return Status::invalid_argument("dial timeout must not be negative");
+  }
   std::string pipe_path = make_pipe_path(name);
 
   // Wait for pipe to become available with timeout

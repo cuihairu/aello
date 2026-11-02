@@ -144,18 +144,24 @@ static Result<void> connect_with_timeout(wire::SocketHandle fd, const sockaddr* 
 #endif
 
   st = socket_utils::wait_writable(fd, timeout);
-  if (!st.ok()) return st.status();
+  if (!st.ok()) {
+    if (st.status().code() == StatusCode::kTimeout) {
+      return Status::timeout("connect() timed out");
+    }
+    return st.status();
+  }
 
   int so_error = 0;
   socklen_t errlen = sizeof(so_error);
 #if defined(_WIN32)
   if (::getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_error), &errlen) < 0 ||
       so_error != 0) {
-    return Status::io_error("connect() failed");
+    return Status::io_error("connect() failed: SO_ERROR=" + std::to_string(so_error));
   }
 #else
   if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) < 0 || so_error != 0) {
-    return Status::io_error("connect() failed");
+    return Status::io_error("connect() failed: SO_ERROR=" +
+                            std::to_string(so_error) + " " + std::strerror(so_error));
   }
 #endif
 
@@ -180,6 +186,10 @@ static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint
     return Status::io_error("getaddrinfo() failed");
   }
 
+  const auto deadline = timeout.count() > 0
+      ? std::chrono::steady_clock::now() + timeout
+      : std::chrono::steady_clock::time_point{};
+
   wire::SocketHandle fd = wire::kInvalidSocket;
   for (auto* p = res; p != nullptr; p = p->ai_next) {
     fd = static_cast<wire::SocketHandle>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
@@ -194,7 +204,14 @@ static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint
 #endif
 
     if (timeout.count() > 0) {
-      auto connected = connect_with_timeout(fd, p->ai_addr, static_cast<int>(p->ai_addrlen), timeout);
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining <= std::chrono::milliseconds::zero()) {
+        close_socket(fd);
+        ::freeaddrinfo(res);
+        return Status::timeout("connect deadline expired");
+      }
+      auto connected = connect_with_timeout(fd, p->ai_addr, static_cast<int>(p->ai_addrlen), remaining);
       if (connected.ok()) {
         break;
       }

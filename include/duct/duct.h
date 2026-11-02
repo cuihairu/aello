@@ -105,8 +105,8 @@ class Listener {
 };
 
 struct DialOptions {
-  // Dial timeout for a single connection attempt. Reserved: tcp/shm dial do not honor it yet
-  // (uds supports a connect timeout via socket_utils). Reconnect-enabled dials are not wired.
+  // Bound for the overall connection attempt. A zero timeout uses the transport's
+  // default behavior. Reconnect-enabled dials are not wired yet.
   std::chrono::milliseconds timeout{0};
   QosOptions qos{};
   // Reserved: not yet honored by dial() (see src/duct.cc).

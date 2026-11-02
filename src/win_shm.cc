@@ -478,6 +478,9 @@ Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const List
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
+  if (opt.timeout.count() < 0) {
+    return Status::invalid_argument("dial timeout must not be negative");
+  }
   std::string connid = random_conn_id_hex16();
   ShmNames n = make_names(name, connid);
 

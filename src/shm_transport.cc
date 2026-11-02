@@ -256,13 +256,20 @@ static Result<int> uds_connect(std::string_view path, std::chrono::milliseconds 
     st = socket_utils::wait_writable(fd, timeout);
     if (!st.ok()) {
       ::close(fd);
+      if (st.status().code() == StatusCode::kTimeout) {
+        return Status::timeout("connect(AF_UNIX) timed out");
+      }
       return st.status();
     }
     int so_error = 0;
     socklen_t errlen = sizeof(so_error);
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) < 0 || so_error != 0) {
       ::close(fd);
-      return Status::io_error("connect(AF_UNIX) failed" + errno_suffix());
+      if (so_error != 0) {
+        errno = so_error;
+      }
+      return Status::io_error("connect(AF_UNIX) failed: SO_ERROR=" +
+                              std::to_string(so_error) + " " + std::strerror(so_error));
     }
     (void)socket_utils::set_nonblocking(fd, false);
     return fd;

@@ -73,10 +73,10 @@ Result<void> wait_readable(socket_t fd, std::chrono::milliseconds timeout) {
   if (rc == 0) {
     return Status::timeout("read timed out");
   }
-  if (pfd.revents & POLLHUP) {
-    return Status::closed("peer closed");
-  }
-  if (pfd.revents & (POLLERR | POLLNVAL)) {
+  if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+    // Let the caller read SO_ERROR so the real connect failure (e.g.
+    // ECONNREFUSED) is preserved instead of being masked by a generic
+    // poll error.
     return Status::io_error("poll() reported error on fd");
   }
   return {};
