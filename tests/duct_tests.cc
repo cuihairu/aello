@@ -346,6 +346,116 @@ static void test_wire_write_no_sigpipe_on_macos() {
 #endif
 }
 
+static void test_wire_read_timeout() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  const auto start = std::chrono::steady_clock::now();
+  auto r = duct::wire::read_frame(fds[0], std::chrono::milliseconds(50));
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kTimeout);
+  }
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
+}
+
+static void test_wire_write_timeout() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  // Shrink the send buffer so a couple of max-size frames fill it and the
+  // next write has to wait long enough to hit the configured timeout.
+  int sndbuf = 4096;
+  (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+  const std::string big(duct::wire::kMaxFramePayload, 'x');
+  const auto msg = duct::Message::from_string(big);
+  const auto start = std::chrono::steady_clock::now();
+  bool saw_timeout = false;
+  for (int i = 0; i < 128 && !saw_timeout; ++i) {
+    auto st = duct::wire::write_frame(fds[0], msg, /*flags=*/0,
+                                      std::chrono::milliseconds(50));
+    if (!st.ok()) {
+      saw_timeout = st.status().code() == duct::StatusCode::kTimeout;
+      break;
+    }
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_TRUE(saw_timeout);
+  EXPECT_TRUE(elapsed < std::chrono::seconds(5));
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
+}
+
+static void test_tcp_recv_timeout_honored() {
+#if defined(_WIN32)
+  return;
+#else
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto fut = accepted.get_future();
+  auto* listener = lis_r.value().get();
+  std::thread t([&] { accepted.set_value(listener->accept()); });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto client = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(client.ok());
+  if (!client.ok()) {
+    t.join();
+    return;
+  }
+
+  auto server = fut.get();
+  EXPECT_TRUE(server.ok());
+  if (!server.ok()) {
+    t.join();
+    return;
+  }
+
+  duct::RecvOptions opt;
+  opt.timeout = std::chrono::milliseconds(50);
+  const auto start = std::chrono::steady_clock::now();
+  auto r = server.value()->recv(opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kTimeout);
+  }
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+
+  t.join();
+#endif
+}
+
 static void test_shm_burst_without_receiver() {
   auto lis_r = duct::listen("shm://duct_testburst");
   EXPECT_TRUE(lis_r.ok());
@@ -738,6 +848,9 @@ int main() {
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
+  test_wire_read_timeout();
+  test_wire_write_timeout();
+  test_tcp_recv_timeout_honored();
   test_wire_write_no_sigpipe_on_macos();
   test_qos_block_zero_timeout_blocks();
   test_qos_permanent_send_error_does_not_wedge();

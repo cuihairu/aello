@@ -54,14 +54,14 @@ class TcpPipe final : public Pipe {
   explicit TcpPipe(wire::SocketHandle fd) : fd_(fd) {}
   ~TcpPipe() override { close(); }
 
-  Result<void> send(const Message& msg, const SendOptions&) override {
+  Result<void> send(const Message& msg, const SendOptions& opt) override {
     if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
-    return wire::write_frame(fd_, msg, /*flags=*/0);
+    return wire::write_frame(fd_, msg, /*flags=*/0, opt.timeout);
   }
 
-  Result<Message> recv(const RecvOptions&) override {
+  Result<Message> recv(const RecvOptions& opt) override {
     if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
-    return wire::read_frame(fd_);
+    return wire::read_frame(fd_, opt.timeout);
   }
 
   void close() override {

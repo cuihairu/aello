@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
@@ -34,9 +35,15 @@ struct FrameHeader {
 void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]);
 Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]);
 
-// Socket I/O functions (cross-platform)
-Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags = 0);
-Result<Message> read_frame(SocketHandle fd);
+// Socket I/O functions (cross-platform).
+// timeout == 0 keeps the blocking behavior; a positive value bounds each
+// underlying send()/recv() call and yields StatusCode::kTimeout on expiry.
+// A timeout that lands mid-frame leaves the byte stream out of sync, so the
+// caller must close the connection rather than retry on the same handle.
+Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags = 0,
+                         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+Result<Message> read_frame(SocketHandle fd,
+                           std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
 }  // namespace duct::wire
 

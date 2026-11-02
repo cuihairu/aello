@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <csignal>
 #include <pthread.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -106,6 +107,40 @@ inline bool interrupted(int error) {
 }
 #endif
 
+// True when a send()/recv() hit the socket timeout configured below.
+inline bool timed_out(int error) {
+#if defined(_WIN32)
+  return error == WSAEWOULDBLOCK || error == WSAETIMEDOUT;
+#else
+  return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+// Apply a per-call socket send/receive timeout. A zero duration restores the
+// blocking behavior; this also clears a timeout left by a previous call.
+Result<void> apply_socket_timeout(SocketHandle fd, bool writing,
+                                  std::chrono::milliseconds timeout) {
+#if defined(_WIN32)
+  DWORD ms = timeout.count() > 0 ? static_cast<DWORD>(timeout.count()) : 0;
+  int opt = writing ? SO_SNDTIMEO : SO_RCVTIMEO;
+  if (::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, opt,
+                   reinterpret_cast<const char*>(&ms), static_cast<int>(sizeof(ms))) != 0) {
+    return Status::io_error("setsockopt(timeout) failed");
+  }
+#else
+  struct timeval tv{};
+  if (timeout.count() > 0) {
+    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+  }
+  int opt = writing ? SO_SNDTIMEO : SO_RCVTIMEO;
+  if (::setsockopt(fd, SOL_SOCKET, opt, &tv, sizeof(tv)) != 0) {
+    return Status::io_error("setsockopt(timeout) failed");
+  }
+#endif
+  return {};
+}
+
 Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
@@ -148,6 +183,9 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
         (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
       }
 #endif
+      if (timed_out(error)) {
+        return Status::timeout("send() timed out");
+      }
       return Status::io_error("send() failed");
     }
     if (w == 0) {
@@ -184,6 +222,9 @@ Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n) {
     if (r < 0) {
       int error = get_last_error();
       if (interrupted(error)) continue;
+      if (timed_out(error)) {
+        return Status::timeout("recv() timed out");
+      }
       return Status::io_error("recv() failed");
     }
     if (r == 0) return Status::closed("peer closed");
@@ -195,10 +236,14 @@ Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n) {
 
 }  // namespace
 
-Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags) {
+Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags,
+                         std::chrono::milliseconds timeout) {
   if (msg.size() > kMaxFramePayload) {
     return Status::invalid_argument("message too large; enable fragmentation (todo)");
   }
+
+  auto timeout_st = apply_socket_timeout(fd, /*writing=*/true, timeout);
+  if (!timeout_st.ok()) return timeout_st;
 
   FrameHeader h;
   h.magic = kProtocolMagic;
@@ -214,7 +259,10 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
   return write_all(fd, msg.data(), msg.size());
 }
 
-Result<Message> read_frame(SocketHandle fd) {
+Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
+  auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
+  if (!timeout_st.ok()) return timeout_st.status();
+
   std::uint8_t hdr[kHeaderLen];
   auto st = read_exact(fd, hdr, sizeof(hdr));
   if (!st.ok()) return st.status();
