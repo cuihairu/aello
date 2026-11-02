@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -233,7 +234,9 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
     return Status::io_error("MapViewOfFile failed");
   }
 
-  std::memset(h.mem, 0, kShmSize);
+  // Construct the layout in place instead of memset: RingMeta holds atomics,
+  // and byte-wise clearing of an atomic object is undefined behavior.
+  ::new (static_cast<void*>(h.mem)) ShmLayout{};
 
   // IMPORTANT: use counting semaphores (not Events). Auto-reset Events behave like capacity=1 and
   // break ring-buffer backpressure. Semaphores correctly model item/space counts.
