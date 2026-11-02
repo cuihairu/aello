@@ -106,6 +106,14 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
 
   std::unique_lock<std::mutex> lock(send_mutex_);
 
+  // Re-check under the lock: close() sets running_ = false and joins the worker.
+  // Without this check a send() that passed the fast-path check above could
+  // enqueue after the worker exited, returning Ok for a message that will never
+  // be sent.
+  if (!running_) {
+    return Status::closed("pipe closed");
+  }
+
   // Handle backpressure policies
   if (send_bytes_.load() >= qos_.snd_hwm_bytes) {
     switch (qos_.backpressure) {
