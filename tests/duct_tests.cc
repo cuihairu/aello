@@ -1877,6 +1877,21 @@ static void test_qos_rate_limit_paces_delivery() {
   pipe.close();
 }
 
+static void test_qos_rate_limit_default_burst_drains() {
+  // burst_bytes == 0 documents "one second's worth"; with rate limiting enabled
+  // it must still drain a non-empty message instead of token-starving forever.
+  auto owned = std::make_unique<RecordingPipe>();
+  RecordingPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.rate_bytes_per_sec = 1000;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string(std::string(100, 'x')), {}).ok());
+  EXPECT_TRUE(transport->wait_for_sent(std::string(100, 'x'), std::chrono::milliseconds(500)));
+  pipe.close();
+}
+
 static void test_qos_channel_multiplexing() {
   // A QoS-wrapped tcp pipe must preserve channel_id end-to-end, matching the
   // direct tcp/uds behavior: send on a channel, receive on that same channel,
@@ -2492,6 +2507,7 @@ int main() {
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_qos_rate_limit_paces_delivery();
+  test_qos_rate_limit_default_burst_drains();
   test_qos_channel_multiplexing();
   test_tcp_handshake_negotiates_version();
   test_qos_item_count_cap();

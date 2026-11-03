@@ -31,8 +31,11 @@ QosPipe::~QosPipe() {
 
 void QosPipe::send_worker() {
   // Token-bucket state for rate limiting. Tokens are refilled continuously up
-  // to burst_bytes; each drained message consumes msg.size() tokens.
-  std::size_t tokens = qos_.burst_bytes;
+  // to the effective burst; each drained message consumes msg.size() tokens.
+  // A zero burst_bytes means "one second's worth" of rate (the documented
+  // default), so the limiter never deadlocks on a non-empty message.
+  const std::size_t burst = qos_.burst_bytes != 0 ? qos_.burst_bytes : qos_.rate_bytes_per_sec;
+  std::size_t tokens = burst;
   auto last_refill = std::chrono::steady_clock::now();
 
   while (running_) {
@@ -90,7 +93,7 @@ void QosPipe::send_worker() {
           if (elapsed_ms > 0) {
             const std::size_t added = static_cast<std::size_t>(
                 (static_cast<double>(qos_.rate_bytes_per_sec) * elapsed_ms) / 1000.0);
-            tokens = std::min<std::size_t>(qos_.burst_bytes, tokens + added);
+            tokens = std::min<std::size_t>(burst, tokens + added);
             last_refill = now;
           }
           if (tokens >= next_cost) break;
