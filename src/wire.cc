@@ -326,6 +326,7 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
 
 Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
                                            std::chrono::milliseconds timeout) {
+  constexpr std::size_t kMaxReassembledBytes = 64 * 1024 * 1024;  // 64 MiB
   auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
   if (!timeout_st.ok()) return timeout_st.status();
 
@@ -347,6 +348,9 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
 
     if (first) {
       if (!is_frag) {
+        if (payload_len > kMaxReassembledBytes) {
+          return Status::protocol_error("frame payload too large");
+        }
         // Single-frame message.
         std::vector<std::uint8_t> buf(payload_len);
         if (payload_len != 0) {
@@ -355,6 +359,9 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
           if (!st.ok()) return st.status();
         }
         return FrameMessage{Message::from_bytes(buf.data(), buf.size()), frame_flags};
+      }
+      if (payload_len > kMaxReassembledBytes) {
+        return Status::protocol_error("fragment stream too large");
       }
       assembled.resize(payload_len);
       if (payload_len != 0) {
@@ -369,6 +376,9 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
 
     // Continuation chunk: grow and append.
     const std::size_t old_size = assembled.size();
+    if (old_size + payload_len > kMaxReassembledBytes) {
+      return Status::protocol_error("fragment stream too large");
+    }
     assembled.resize(old_size + payload_len);
     if (payload_len != 0) {
       bool payload_started = true;

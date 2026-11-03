@@ -1160,6 +1160,35 @@ static void test_wire_socketpair_frames() {
 #endif
 }
 
+static void test_wire_fragment_stream_size_capped() {
+#if !defined(_WIN32)
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  // A malformed peer declares an oversized first fragment; the reader must
+  // reject it instead of growing the reassembly buffer without bound.
+  duct::wire::FrameHeader h;
+  h.magic = duct::kProtocolMagic;
+  h.version = duct::kProtocolVersion;
+  h.header_len = duct::wire::kHeaderLen;
+  h.payload_len = 64 * 1024 * 1024 + 1;
+  h.flags = static_cast<std::uint32_t>(duct::FrameFlags::kFrag);
+  std::uint8_t hdr[duct::wire::kHeaderLen]{};
+  duct::wire::encode_header(h, hdr);
+  EXPECT_TRUE(::write(fds[0], hdr, sizeof(hdr)) == static_cast<ssize_t>(sizeof(hdr)));
+
+  auto r = duct::wire::read_frame_with_flags(fds[1], std::chrono::milliseconds(500));
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kProtocolError);
+  }
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
+}
+
 static void test_qos_block_zero_timeout_blocks() {
   // SendOptions::timeout == 0 means "no timeout". With kBlock backpressure a full
   // queue must block until space is available (or close), not fail immediately.
@@ -2685,6 +2714,7 @@ int main() {
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
+  test_wire_fragment_stream_size_capped();
   test_wire_read_timeout();
   test_wire_write_timeout();
   test_wire_partial_frame_timeout();
