@@ -43,9 +43,6 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 namespace duct {
 namespace {
 
-#if !defined(_WIN32)
-constexpr std::size_t kSlotPayloadMax = 64 * 1024;
-constexpr std::uint32_t kSlotCount = 64;  // 64 * 64KB = 4MB per ring
 constexpr std::uint32_t kFirstChunkFlag = 1u << 31;
 constexpr std::uint32_t kLastChunkFlag = 1u << 30;
 
@@ -155,26 +152,61 @@ struct alignas(64) RingMeta {
   std::atomic_uint32_t tail{0};  // consumer increments
 };
 
-struct Slot {
-  std::uint32_t len = 0;
-  std::uint32_t _pad = 0;
-  std::uint8_t data[kSlotPayloadMax];
-};
-
-struct Ring {
-  RingMeta meta;
-  Slot slots[kSlotCount];
-};
-
 struct ShmLayout {
-  Ring c2s;
-  Ring s2c;
+  std::uint32_t slot_bytes = 0;   // payload capacity per slot
+  std::uint32_t slot_count = 0;   // slots per ring (each direction)
   std::atomic_uint32_t owner_pid{0};  // PID of the creating (owner) process
   std::atomic_uint32_t magic{0};      // kShmMagic on a live, initialized segment
+  RingMeta c2s_meta;
+  RingMeta s2c_meta;
+  // Slot data follows the header, laid out as:
+  //   c2s slot[0..slot_count), s2c slot[0..slot_count)
+  // Each slot is 8-byte-aligned: [u32 len][u32 pad][slot_bytes bytes].
 };
 
 static constexpr std::uint32_t kShmMagic = 0x4D484353;  // 'SHCM' little-endian marker
-static constexpr std::size_t kShmSize = sizeof(ShmLayout);
+
+// Total mapped size for a validated geometry.
+static std::size_t layout_size(std::uint32_t slot_bytes, std::uint32_t slot_count) {
+  // Each slot is 8 bytes of header (u32 len + u32 pad) followed by the payload,
+  // rounded up to 8-byte alignment so the stride is stable across peers.
+  const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
+  return sizeof(ShmLayout) + 2u * static_cast<std::size_t>(slot_count) * slot_stride;
+}
+
+struct Slot {
+  std::uint32_t len = 0;
+  std::uint32_t _pad = 0;
+  // Flexible payload: layout_size() sizes the mapping. We cannot use a
+  // flexible array member in a struct that participates in layout math with
+  // offsetof, so treat slots as raw bytes and index them manually.
+};
+
+// A slot within a ring. data points into the shared mapping.
+static std::uint8_t* slot_data(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
+  std::size_t ring_base = sizeof(ShmLayout);
+  // c2s comes first, s2c second.
+  if (!c2s) ring_base += static_cast<std::size_t>(l->slot_count) * slot_stride;
+  return reinterpret_cast<std::uint8_t*>(l) + ring_base + static_cast<std::size_t>(idx) * slot_stride;
+}
+
+static std::uint32_t* slot_len(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  return reinterpret_cast<std::uint32_t*>(slot_data(l, c2s, idx, slot_bytes));
+}
+
+static std::uint8_t* slot_payload(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  return slot_data(l, c2s, idx, slot_bytes) + 8u;
+}
+
+static RingMeta* ring_meta(ShmLayout* l, bool c2s) {
+  return c2s ? &l->c2s_meta : &l->s2c_meta;
+}
+
+static bool geometry_valid(std::uint32_t slot_bytes, std::uint32_t slot_count) {
+  // slot_bytes must leave the top two bits of the 32-bit length word free.
+  return slot_bytes != 0 && slot_bytes <= (kFirstChunkFlag - 1u) && slot_count != 0;
+}
 
 struct ShmNames {
   std::string base;  // already sanitized
@@ -323,6 +355,8 @@ static Result<void> read_exact(int fd, void* p, std::size_t n) {
 struct ShmHandles {
   int shm_fd = -1;
   ShmLayout* mem = nullptr;
+  std::uint32_t slot_bytes = 0;
+  std::uint32_t slot_count = 0;
   sem_t* c2s_items = SEM_FAILED;
   sem_t* c2s_spaces = SEM_FAILED;
   sem_t* s2c_items = SEM_FAILED;
@@ -332,7 +366,11 @@ struct ShmHandles {
 static void close_handles(ShmHandles* h) {
   if (!h) return;
   if (h->mem) {
-    ::munmap(h->mem, kShmSize);
+    std::size_t size = sizeof(ShmLayout);
+    if (h->slot_bytes != 0 && h->slot_count != 0) {
+      size = layout_size(h->slot_bytes, h->slot_count);
+    }
+    ::munmap(h->mem, size);
     h->mem = nullptr;
   }
   if (h->shm_fd >= 0) {
@@ -349,19 +387,25 @@ static void close_handles(ShmHandles* h) {
   h->s2c_spaces = SEM_FAILED;
 }
 
-static Result<ShmHandles> create_resources(const ShmNames& n) {
+static Result<ShmHandles> create_resources(const ShmNames& n, const ShmOptions& opt) {
   ShmHandles h;
+  if (!geometry_valid(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count)) {
+    return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
+  }
+  const std::size_t size = layout_size(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count);
+  h.slot_bytes = static_cast<std::uint32_t>(opt.slot_bytes);
+  h.slot_count = opt.slot_count;
 
   h.shm_fd = ::shm_open(n.shm.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (h.shm_fd < 0) {
     return Status::io_error("shm_open(create) failed: " + n.shm + errno_suffix());
   }
-  if (::ftruncate(h.shm_fd, static_cast<off_t>(kShmSize)) != 0) {
+  if (::ftruncate(h.shm_fd, static_cast<off_t>(size)) != 0) {
     close_handles(&h);
     ::shm_unlink(n.shm.c_str());
     return Status::io_error("ftruncate(shm) failed" + errno_suffix());
   }
-  void* p = ::mmap(nullptr, kShmSize, PROT_READ | PROT_WRITE, MAP_SHARED, h.shm_fd, 0);
+  void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, h.shm_fd, 0);
   if (p == MAP_FAILED) {
     close_handles(&h);
     ::shm_unlink(n.shm.c_str());
@@ -373,6 +417,8 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   // (-Wclass-memaccess). The fresh shm segment is already zeroed by the OS, and
   // value-initialization makes the atomics/slots explicitly zero.
   ::new (static_cast<void*>(h.mem)) ShmLayout{};
+  h.mem->slot_bytes = h.slot_bytes;
+  h.mem->slot_count = h.slot_count;
   h.mem->owner_pid.store(static_cast<std::uint32_t>(::getpid()), std::memory_order_release);
   h.mem->magic.store(kShmMagic, std::memory_order_release);
 
@@ -380,9 +426,9 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   // - items start at 0
   // - spaces start at slot count
   h.c2s_items = ::sem_open(n.c2s_items_sem.c_str(), O_CREAT | O_EXCL, 0600, 0);
-  h.c2s_spaces = ::sem_open(n.c2s_spaces_sem.c_str(), O_CREAT | O_EXCL, 0600, kSlotCount);
+  h.c2s_spaces = ::sem_open(n.c2s_spaces_sem.c_str(), O_CREAT | O_EXCL, 0600, h.slot_count);
   h.s2c_items = ::sem_open(n.s2c_items_sem.c_str(), O_CREAT | O_EXCL, 0600, 0);
-  h.s2c_spaces = ::sem_open(n.s2c_spaces_sem.c_str(), O_CREAT | O_EXCL, 0600, kSlotCount);
+  h.s2c_spaces = ::sem_open(n.s2c_spaces_sem.c_str(), O_CREAT | O_EXCL, 0600, h.slot_count);
 
   if (h.c2s_items == SEM_FAILED || h.c2s_spaces == SEM_FAILED || h.s2c_items == SEM_FAILED ||
       h.s2c_spaces == SEM_FAILED) {
@@ -398,18 +444,49 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   return h;
 }
 
-static Result<ShmHandles> open_resources(const ShmNames& n) {
+static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& expected) {
   ShmHandles h;
   h.shm_fd = ::shm_open(n.shm.c_str(), O_RDWR, 0600);
   if (h.shm_fd < 0) {
     return Status::io_error("shm_open(open) failed: " + n.shm + errno_suffix());
   }
-  void* p = ::mmap(nullptr, kShmSize, PROT_READ | PROT_WRITE, MAP_SHARED, h.shm_fd, 0);
+  // Map the header first to read the geometry. fstat gives the real size.
+  struct stat st{};
+  if (::fstat(h.shm_fd, &st) != 0) {
+    ::close(h.shm_fd);
+    return Status::io_error("fstat(shm) failed" + errno_suffix());
+  }
+  const std::uint32_t slot_bytes = static_cast<std::uint32_t>(expected.slot_bytes);
+  const std::uint32_t slot_count = expected.slot_count;
+  if (!geometry_valid(slot_bytes, slot_count)) {
+    ::close(h.shm_fd);
+    return Status::invalid_argument("invalid expected shm geometry");
+  }
+  const std::size_t size = layout_size(slot_bytes, slot_count);
+  if (static_cast<std::size_t>(st.st_size) < size) {
+    ::close(h.shm_fd);
+    return Status::protocol_error("shm segment smaller than expected layout");
+  }
+  void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, h.shm_fd, 0);
   if (p == MAP_FAILED) {
+    ::close(h.shm_fd);
     close_handles(&h);
     return Status::io_error("mmap(shm) failed" + errno_suffix());
   }
   h.mem = static_cast<ShmLayout*>(p);
+  h.slot_bytes = slot_bytes;
+  h.slot_count = slot_count;
+
+  // The dialer records the geometry it actually created. A mismatch means the
+  // peers disagree on layout and would corrupt the ring.
+  if (h.mem->magic.load(std::memory_order_acquire) != kShmMagic) {
+    close_handles(&h);
+    return Status::protocol_error("shm segment not initialized");
+  }
+  if (h.mem->slot_bytes != slot_bytes || h.mem->slot_count != slot_count) {
+    close_handles(&h);
+    return Status::protocol_error("shm geometry mismatch");
+  }
 
   h.c2s_items = ::sem_open(n.c2s_items_sem.c_str(), 0);
   h.c2s_spaces = ::sem_open(n.c2s_spaces_sem.c_str(), 0);
@@ -436,9 +513,12 @@ class ShmPipe final : public Pipe {
   Result<void> send(const Message& msg, const SendOptions& opt) override {
     if (!h_.mem) return Status::closed("pipe closed");
 
-    Ring* tx = is_client_ ? &h_.mem->c2s : &h_.mem->s2c;
+    const bool tx_ring = is_client_;  // client sends on c2s
     sem_t* spaces = is_client_ ? h_.c2s_spaces : h_.s2c_spaces;
     sem_t* items = is_client_ ? h_.c2s_items : h_.s2c_items;
+    RingMeta* tx = ring_meta(h_.mem, tx_ring);
+    const std::uint32_t slot_bytes = h_.slot_bytes;
+    const std::uint32_t slot_count = h_.slot_count;
 
     // Fragment payloads larger than one slot into multiple slots. Each slot
     // header stores the remaining length; the final slot carries a zero-length
@@ -448,7 +528,7 @@ class ShmPipe final : public Pipe {
     std::size_t offset = 0;
     bool first = true;
     do {
-      const std::size_t chunk = std::min(kSlotPayloadMax, total - offset);
+      const std::size_t chunk = std::min(static_cast<std::size_t>(slot_bytes), total - offset);
       const bool last = (offset + chunk == total);
 
       // Once the first chunk is committed the message cannot be rolled back.
@@ -458,16 +538,16 @@ class ShmPipe final : public Pipe {
       auto st = sem_wait_opt(spaces, first ? opt.timeout : std::chrono::milliseconds(0));
       if (!st.ok()) return st;
 
-      std::uint32_t head = tx->meta.head.load(std::memory_order_relaxed);
-      std::uint32_t idx = head % kSlotCount;
+      std::uint32_t head = tx->head.load(std::memory_order_relaxed);
+      std::uint32_t idx = head % slot_count;
       std::uint32_t len = static_cast<std::uint32_t>(chunk);
       if (first) len |= kFirstChunkFlag;
       if (last) len |= kLastChunkFlag;
-      tx->slots[idx].len = len;
+      *slot_len(h_.mem, tx_ring, idx, slot_bytes) = len;
       if (chunk != 0) {
-        std::memcpy(tx->slots[idx].data, msg.data() + offset, chunk);
+        std::memcpy(slot_payload(h_.mem, tx_ring, idx, slot_bytes), msg.data() + offset, chunk);
       }
-      tx->meta.head.store(head + 1, std::memory_order_release);
+      tx->head.store(head + 1, std::memory_order_release);
       ::sem_post(items);
       offset += chunk;
       first = false;
@@ -478,9 +558,12 @@ class ShmPipe final : public Pipe {
   Result<Message> recv(const RecvOptions& opt) override {
     if (!h_.mem) return Status::closed("pipe closed");
 
-    Ring* rx = is_client_ ? &h_.mem->s2c : &h_.mem->c2s;
+    const bool rx_ring = !is_client_;  // client receives on s2c
     sem_t* items = is_client_ ? h_.s2c_items : h_.c2s_items;
     sem_t* spaces = is_client_ ? h_.s2c_spaces : h_.c2s_spaces;
+    RingMeta* rx = ring_meta(h_.mem, rx_ring);
+    const std::uint32_t slot_bytes = h_.slot_bytes;
+    const std::uint32_t slot_count = h_.slot_count;
 
     std::vector<std::uint8_t> assembled;
     bool first = true;
@@ -490,22 +573,22 @@ class ShmPipe final : public Pipe {
       auto st = sem_wait_opt(items, first ? opt.timeout : std::chrono::milliseconds(0));
       if (!st.ok()) return st.status();
 
-      std::uint32_t tail = rx->meta.tail.load(std::memory_order_relaxed);
-      std::uint32_t idx = tail % kSlotCount;
-      std::uint32_t len = rx->slots[idx].len;
+      std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
+      std::uint32_t idx = tail % slot_count;
+      std::uint32_t len = *slot_len(h_.mem, rx_ring, idx, slot_bytes);
       const bool is_first = (len & kFirstChunkFlag) != 0;
       const bool is_last = (len & kLastChunkFlag) != 0;
       len &= ~(kFirstChunkFlag | kLastChunkFlag);
-      if (len > kSlotPayloadMax) {
+      if (len > slot_bytes) {
         return Status::protocol_error("shm slot len too large");
       }
 
       if (first) {
         if (!is_first) return Status::protocol_error("shm fragment stream out of sync");
         assembled.resize(len);
-        if (len != 0) std::memcpy(assembled.data(), rx->slots[idx].data, len);
+        if (len != 0) std::memcpy(assembled.data(), slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
         first = false;
-        rx->meta.tail.store(tail + 1, std::memory_order_release);
+        rx->tail.store(tail + 1, std::memory_order_release);
         ::sem_post(spaces);
         if (is_last) return Message::from_bytes(assembled.data(), assembled.size());
         continue;
@@ -513,8 +596,8 @@ class ShmPipe final : public Pipe {
 
       const std::size_t old = assembled.size();
       assembled.resize(old + len);
-      if (len != 0) std::memcpy(assembled.data() + old, rx->slots[idx].data, len);
-      rx->meta.tail.store(tail + 1, std::memory_order_release);
+      if (len != 0) std::memcpy(assembled.data() + old, slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
+      rx->tail.store(tail + 1, std::memory_order_release);
       ::sem_post(spaces);
       if (is_last) return Message::from_bytes(assembled.data(), assembled.size());
     }
@@ -541,7 +624,8 @@ class ShmPipe final : public Pipe {
 
 class ShmListener final : public Listener {
  public:
-  explicit ShmListener(ShmNames names, int fd) : names_(std::move(names)), fd_(fd) {}
+  ShmListener(ShmNames names, int fd, ShmOptions expected)
+      : names_(std::move(names)), fd_(fd), expected_(expected) {}
   ~ShmListener() override { close(); }
 
   Result<std::unique_ptr<Pipe>> accept() override {
@@ -555,7 +639,7 @@ class ShmListener final : public Listener {
     if (!st.ok()) return st.status();
 
     ShmNames n = make_names(names_.base, std::string(connid, sizeof(connid)));
-    auto h = open_resources(n);
+    auto h = open_resources(n, expected_);
     if (!h.ok()) return h.status();
     return std::unique_ptr<Pipe>(new ShmPipe(h.value(), std::move(n), /*owner=*/false, /*is_client=*/false));
   }
@@ -574,9 +658,9 @@ class ShmListener final : public Listener {
  private:
   ShmNames names_;
   int fd_ = -1;
+  ShmOptions expected_{};
 };
 }  // namespace duct
-#endif  // !_WIN32
 
 #if !defined(_WIN32)
 // Reclaim orphaned shm resources for a bus. A connection's owner records its
@@ -604,16 +688,21 @@ static void reclaim_orphaned_bus(const std::string& bus_name) {
     const std::string seg_name = "/" + name;
     int fd = ::shm_open(seg_name.c_str(), O_RDWR, 0600);
     if (fd < 0) continue;
-    void* p = ::mmap(nullptr, kShmSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // Read the header to get geometry. We cannot know the size without it, so
+    // map just the fixed header then the full size.
+    void* p = ::mmap(nullptr, sizeof(ShmLayout), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     ::close(fd);
     if (p == MAP_FAILED) continue;
 
     const auto* layout = static_cast<const ShmLayout*>(p);
     const std::uint32_t owner = layout->owner_pid.load(std::memory_order_acquire);
     const std::uint32_t magic = layout->magic.load(std::memory_order_acquire);
-    ::munmap(p, kShmSize);
+    const std::uint32_t slot_bytes = layout->slot_bytes;
+    const std::uint32_t slot_count = layout->slot_count;
+    ::munmap(p, sizeof(ShmLayout));
 
     if (magic != kShmMagic) continue;  // not a live aello segment
+    if (!geometry_valid(slot_bytes, slot_count)) continue;
     if (owner == 0) continue;
     if (::kill(static_cast<pid_t>(owner), 0) == 0 || errno == EPERM) {
       continue;  // owner still alive
@@ -639,10 +728,13 @@ Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const List
 #if !defined(_WIN32)
   reclaim_orphaned_bus(name);
 #endif
+  if (!geometry_valid(static_cast<std::uint32_t>(opt.shm.slot_bytes), opt.shm.slot_count)) {
+    return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
+  }
   ShmNames n = make_names(name, "0000000000000000");
   auto fd = uds_listen(n.bootstrap_path, opt.backlog);
   if (!fd.ok()) return fd.status();
-  return std::unique_ptr<Listener>(new ShmListener(std::move(n), fd.value()));
+  return std::unique_ptr<Listener>(new ShmListener(std::move(n), fd.value(), opt.shm));
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
@@ -652,7 +744,7 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
   std::string connid = random_conn_id_hex16();
   ShmNames n = make_names(name, connid);
 
-  auto created = create_resources(n);
+  auto created = create_resources(n, opt.shm);
   if (!created.ok()) return created.status();
 
   auto cfd = uds_connect(n.bootstrap_path, opt.timeout);

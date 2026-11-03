@@ -1927,6 +1927,79 @@ static void test_shm_fragmentation_midway_timeout_keeps_stream_synced() {
 #endif
 }
 
+static void test_shm_configurable_slot_geometry() {
+  duct::ListenOptions listen_opt;
+  listen_opt.shm.slot_bytes = 16;
+  listen_opt.shm.slot_count = 2;
+  auto lis_r = duct::listen("shm://duct_testgeom", listen_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  duct::DialOptions dial_opt;
+  dial_opt.shm.slot_bytes = 16;
+  dial_opt.shm.slot_count = 2;
+  auto c = duct::dial("shm://duct_testgeom", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  auto st = c.value()->send(duct::Message::from_string("ok"), {});
+  EXPECT_TRUE(st.ok());
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().as_string_view(), "ok");
+  }
+
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  EXPECT_TRUE(sst == std::future_status::ready);
+  if (sst == std::future_status::ready) {
+    EXPECT_TRUE(server.get().ok());
+  }
+  c.value()->close();
+  lis_r.value()->close();
+}
+
+static void test_shm_geometry_mismatch_rejected() {
+  duct::ListenOptions listen_opt;
+  listen_opt.shm.slot_bytes = 32;
+  listen_opt.shm.slot_count = 2;
+  auto lis_r = duct::listen("shm://duct_testgeom_mismatch", listen_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    return lis_r.value()->accept();
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  duct::DialOptions dial_opt;
+  dial_opt.shm.slot_bytes = 16;  // dialer creates a smaller segment
+  dial_opt.shm.slot_count = 2;
+  auto c = duct::dial("shm://duct_testgeom_mismatch", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (c.ok()) c.value()->close();
+
+  auto accepted = server.wait_for(std::chrono::seconds(2));
+  EXPECT_TRUE(accepted == std::future_status::ready);
+  if (accepted == std::future_status::ready) {
+    auto p = server.get();
+    EXPECT_TRUE(!p.ok());
+  }
+  lis_r.value()->close();
+}
+
 static void test_qos_priority_scheduling() {
   auto owned = std::make_unique<RecordingPipe>();
   RecordingPipe* transport = owned.get();
@@ -2772,6 +2845,8 @@ int main() {
   test_wire_fragmentation_and_reassembly();
   test_shm_fragmentation_and_reassembly();
   test_shm_fragmentation_midway_timeout_keeps_stream_synced();
+  test_shm_configurable_slot_geometry();
+  test_shm_geometry_mismatch_rejected();
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_tcp_channel_recv_does_not_drop_other_channel();

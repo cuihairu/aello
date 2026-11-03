@@ -25,10 +25,6 @@
 namespace duct {
 namespace {
 
-// Windows shared memory constants
-constexpr std::size_t kSlotPayloadMax = 64 * 1024;
-constexpr std::uint32_t kSlotCount = 64;  // 64 * 64KB = 4MB per ring
-
 static std::string sanitize_name(std::string_view s) {
   std::string out;
   out.reserve(s.size());
@@ -76,23 +72,41 @@ struct alignas(64) RingMeta {
   std::atomic_uint32_t tail{0};  // consumer increments
 };
 
-struct Slot {
-  std::uint32_t len = 0;
-  std::uint32_t _pad = 0;
-  std::uint8_t data[kSlotPayloadMax];
-};
-
-struct Ring {
-  RingMeta meta;
-  Slot slots[kSlotCount];
-};
-
 struct ShmLayout {
-  Ring c2s;  // client to server
-  Ring s2c;  // server to client
+  std::uint32_t slot_bytes = 0;
+  std::uint32_t slot_count = 0;
+  RingMeta c2s_meta;
+  RingMeta s2c_meta;
+  // Slot data follows, same layout as the POSIX implementation.
 };
 
-static constexpr std::size_t kShmSize = sizeof(ShmLayout);
+static bool geometry_valid(std::uint32_t slot_bytes, std::uint32_t slot_count) {
+  return slot_bytes != 0 && slot_bytes <= (1u << 30) && slot_count != 0;
+}
+
+static std::size_t layout_size(std::uint32_t slot_bytes, std::uint32_t slot_count) {
+  const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
+  return sizeof(ShmLayout) + 2u * static_cast<std::size_t>(slot_count) * slot_stride;
+}
+
+static std::uint8_t* slot_data(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
+  std::size_t base = sizeof(ShmLayout);
+  if (!c2s) base += static_cast<std::size_t>(l->slot_count) * slot_stride;
+  return reinterpret_cast<std::uint8_t*>(l) + base + static_cast<std::size_t>(idx) * slot_stride;
+}
+
+static std::uint32_t* slot_len(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  return reinterpret_cast<std::uint32_t*>(slot_data(l, c2s, idx, slot_bytes));
+}
+
+static std::uint8_t* slot_payload(ShmLayout* l, bool c2s, std::uint32_t idx, std::uint32_t slot_bytes) {
+  return slot_data(l, c2s, idx, slot_bytes) + 8u;
+}
+
+static RingMeta* ring_meta(ShmLayout* l, bool c2s) {
+  return c2s ? &l->c2s_meta : &l->s2c_meta;
+}
 
 struct ShmNames {
   std::string base;  // already sanitized
@@ -151,6 +165,8 @@ static SECURITY_ATTRIBUTES* get_global_security_attributes() {
 struct ShmHandles {
   HANDLE shm_handle = INVALID_HANDLE_VALUE;
   ShmLayout* mem = nullptr;
+  std::uint32_t slot_bytes = 0;
+  std::uint32_t slot_count = 0;
   HANDLE c2s_items = INVALID_HANDLE_VALUE;
   HANDLE c2s_spaces = INVALID_HANDLE_VALUE;
   HANDLE s2c_items = INVALID_HANDLE_VALUE;
@@ -206,8 +222,14 @@ static Result<void> wait_handle_opt(HANDLE handle, std::chrono::milliseconds tim
   }
 }
 
-static Result<ShmHandles> create_resources(const ShmNames& n) {
+static Result<ShmHandles> create_resources(const ShmNames& n, const ShmOptions& opt) {
   ShmHandles h;
+  if (!geometry_valid(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count)) {
+    return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
+  }
+  const std::size_t size = layout_size(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count);
+  h.slot_bytes = static_cast<std::uint32_t>(opt.slot_bytes);
+  h.slot_count = opt.slot_count;
 
   // Create shared memory with default security (current user session)
   h.shm_handle = CreateFileMappingA(
@@ -215,7 +237,7 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
     NULL,  // Use default security attributes
     PAGE_READWRITE,
     0,
-    static_cast<DWORD>(kShmSize),
+    static_cast<DWORD>(size),
     n.shm.c_str()
   );
   if (h.shm_handle == NULL) {
@@ -227,7 +249,7 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
     h.shm_handle,
     FILE_MAP_ALL_ACCESS,
     0, 0,
-    kShmSize
+    size
   ));
   if (h.mem == nullptr) {
     close_handles(&h);
@@ -237,6 +259,8 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   // Construct the layout in place instead of memset: RingMeta holds atomics,
   // and byte-wise clearing of an atomic object is undefined behavior.
   ::new (static_cast<void*>(h.mem)) ShmLayout{};
+  h.mem->slot_bytes = h.slot_bytes;
+  h.mem->slot_count = h.slot_count;
 
   // IMPORTANT: use counting semaphores (not Events). Auto-reset Events behave like capacity=1 and
   // break ring-buffer backpressure. Semaphores correctly model item/space counts.
@@ -245,7 +269,7 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   // - items starts at 0 (ring empty)
   // - spaces starts at kSlotCount (ring has capacity)
   // 命名信号量语义与 POSIX sem_t 对齐：items 初始为 0（空），spaces 初始为 kSlotCount（满容量）。
-  const LONG max_count = static_cast<LONG>(kSlotCount);
+  const LONG max_count = static_cast<LONG>(h.slot_count);
   h.c2s_items = CreateSemaphoreA(NULL, /*lInitialCount=*/0, max_count, n.c2s_items.c_str());
   h.c2s_spaces = CreateSemaphoreA(NULL, /*lInitialCount=*/max_count, max_count, n.c2s_spaces.c_str());
   h.s2c_items = CreateSemaphoreA(NULL, /*lInitialCount=*/0, max_count, n.s2c_items.c_str());
@@ -261,7 +285,7 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   return h;
 }
 
-static Result<ShmHandles> open_resources(const ShmNames& n) {
+static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& expected) {
   ShmHandles h;
 
   // Open shared memory
@@ -275,11 +299,18 @@ static Result<ShmHandles> open_resources(const ShmNames& n) {
     h.shm_handle,
     FILE_MAP_ALL_ACCESS,
     0, 0,
-    kShmSize
+    layout_size(static_cast<std::uint32_t>(expected.slot_bytes), expected.slot_count)
   ));
   if (h.mem == nullptr) {
     close_handles(&h);
     return Status::io_error("MapViewOfFile failed");
+  }
+
+  h.slot_bytes = static_cast<std::uint32_t>(expected.slot_bytes);
+  h.slot_count = expected.slot_count;
+  if (h.mem->slot_bytes != h.slot_bytes || h.mem->slot_count != h.slot_count) {
+    close_handles(&h);
+    return Status::protocol_error("shm geometry mismatch");
   }
 
   // Open semaphores. Need SYNCHRONIZE for waits and SEMAPHORE_MODIFY_STATE for release.
@@ -330,24 +361,24 @@ class ShmPipe final : public Pipe {
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
     if (!h_.mem) return Status::closed("pipe closed");
-    if (msg.size() > kSlotPayloadMax) {
-      return Status::invalid_argument("message too large; fragmentation TODO");
-    }
 
-    Ring* tx = is_client_ ? &h_.mem->c2s : &h_.mem->s2c;
+    const bool tx_ring = is_client_;
     HANDLE spaces = is_client_ ? h_.c2s_spaces : h_.s2c_spaces;
     HANDLE items = is_client_ ? h_.c2s_items : h_.s2c_items;
+    RingMeta* tx = ring_meta(h_.mem, tx_ring);
+    const std::uint32_t slot_bytes = h_.slot_bytes;
+    const std::uint32_t slot_count = h_.slot_count;
 
     auto st = wait_handle_opt(spaces, opt.timeout);
     if (!st.ok()) return st;
 
-    std::uint32_t head = tx->meta.head.load(std::memory_order_relaxed);
-    std::uint32_t idx = head % kSlotCount;
-    tx->slots[idx].len = static_cast<std::uint32_t>(msg.size());
+    std::uint32_t head = tx->head.load(std::memory_order_relaxed);
+    std::uint32_t idx = head % slot_count;
+    *slot_len(h_.mem, tx_ring, idx, slot_bytes) = static_cast<std::uint32_t>(msg.size());
     if (msg.size() != 0) {
-      std::memcpy(tx->slots[idx].data, msg.data(), msg.size());
+      std::memcpy(slot_payload(h_.mem, tx_ring, idx, slot_bytes), msg.data(), msg.size());
     }
-    tx->meta.head.store(head + 1, std::memory_order_release);
+    tx->head.store(head + 1, std::memory_order_release);
 
     if (!ReleaseSemaphore(items, /*lReleaseCount=*/1, NULL)) {
       DWORD error = GetLastError();
@@ -359,22 +390,25 @@ class ShmPipe final : public Pipe {
   Result<Message> recv(const RecvOptions& opt) override {
     if (!h_.mem) return Status::closed("pipe closed");
 
-    Ring* rx = is_client_ ? &h_.mem->s2c : &h_.mem->c2s;
+    const bool rx_ring = !is_client_;
     HANDLE items = is_client_ ? h_.s2c_items : h_.c2s_items;
     HANDLE spaces = is_client_ ? h_.s2c_spaces : h_.c2s_spaces;
+    RingMeta* rx = ring_meta(h_.mem, rx_ring);
+    const std::uint32_t slot_bytes = h_.slot_bytes;
+    const std::uint32_t slot_count = h_.slot_count;
 
     auto st = wait_handle_opt(items, opt.timeout);
     if (!st.ok()) return st.status();
 
-    std::uint32_t tail = rx->meta.tail.load(std::memory_order_relaxed);
-    std::uint32_t idx = tail % kSlotCount;
-    std::uint32_t len = rx->slots[idx].len;
-    if (len > kSlotPayloadMax) {
+    std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
+    std::uint32_t idx = tail % slot_count;
+    std::uint32_t len = *slot_len(h_.mem, rx_ring, idx, slot_bytes);
+    if (len > slot_bytes) {
       return Status::protocol_error("shm slot len too large");
     }
 
-    Message m = Message::from_bytes(rx->slots[idx].data, len);
-    rx->meta.tail.store(tail + 1, std::memory_order_release);
+    Message m = Message::from_bytes(slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
+    rx->tail.store(tail + 1, std::memory_order_release);
 
     if (!ReleaseSemaphore(spaces, /*lReleaseCount=*/1, NULL)) {
       DWORD error = GetLastError();
@@ -402,7 +436,8 @@ class ShmPipe final : public Pipe {
 
 class ShmListener final : public Listener {
  public:
-  ShmListener(ShmNames names, HANDLE bootstrap_pipe) : names_(std::move(names)), bootstrap_pipe_(bootstrap_pipe) {}
+  ShmListener(ShmNames names, HANDLE bootstrap_pipe, ShmOptions expected)
+      : names_(std::move(names)), bootstrap_pipe_(bootstrap_pipe), expected_(expected) {}
   ~ShmListener() override { close(); }
 
   Result<std::unique_ptr<Pipe>> accept() override {
@@ -444,7 +479,7 @@ class ShmListener final : public Listener {
     }
 
     ShmNames n = make_names(names_.base, std::string(connid, sizeof(connid)));
-    auto h = open_resources(n);
+    auto h = open_resources(n, expected_);
     if (!h.ok()) return h.status();
 
     return std::unique_ptr<Pipe>(new ShmPipe(h.value(), std::move(n),
@@ -465,16 +500,19 @@ class ShmListener final : public Listener {
  private:
   ShmNames names_;
   HANDLE bootstrap_pipe_ = INVALID_HANDLE_VALUE;
+  ShmOptions expected_{};
 };
 
 }  // namespace
 
 Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const ListenOptions& opt) {
-  (void)opt;
+  if (!geometry_valid(static_cast<std::uint32_t>(opt.shm.slot_bytes), opt.shm.slot_count)) {
+    return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
+  }
   ShmNames n = make_names(name, "0000000000000000");
   auto pipe = create_bootstrap_pipe(n.bootstrap_pipe);
   if (!pipe.ok()) return pipe.status();
-  return std::unique_ptr<Listener>(new ShmListener(std::move(n), pipe.value()));
+  return std::unique_ptr<Listener>(new ShmListener(std::move(n), pipe.value(), opt.shm));
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
@@ -484,7 +522,7 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
   std::string connid = random_conn_id_hex16();
   ShmNames n = make_names(name, connid);
 
-  auto created = create_resources(n);
+  auto created = create_resources(n, opt.shm);
   if (!created.ok()) return created.status();
 
   // Connect to bootstrap pipe with retry + timeout:

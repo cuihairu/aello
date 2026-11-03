@@ -88,6 +88,17 @@ struct QosOptions {
   std::size_t burst_bytes = 0;
 };
 
+// Geometry of a shared-memory ring. Both peers must agree on these values;
+// the listener validates them against the segment header on accept().
+struct ShmOptions {
+  // Per-slot payload capacity in bytes. Must be positive and leave the top
+  // two bits of the 32-bit length word free for fragmentation flags.
+  std::size_t slot_bytes = 64 * 1024;
+  // Slots per ring. Each direction (client->server and server->client) has
+  // its own ring of this many slots. Must be positive.
+  std::uint32_t slot_count = 64;
+};
+
 struct SendOptions {
   // If non-zero, send will time out (where supported).
   std::chrono::milliseconds timeout{0};
@@ -150,6 +161,7 @@ struct DialOptions {
   // default behavior. Reconnect-enabled dials are not wired yet.
   std::chrono::milliseconds timeout{0};
   QosOptions qos{};
+  ShmOptions shm{};
   // Reserved: not yet honored by dial() (see src/duct.cc).
   ReconnectPolicy reconnect{};
   // Reserved: not yet honored by dial() (see src/duct.cc).
@@ -159,6 +171,9 @@ struct DialOptions {
 struct ListenOptions {
   // Reserved: no listener implementation applies it yet.
   QosOptions qos{};
+  // Expected shm ring geometry. The listener validates that the segment the
+  // dialer created matches these values, rejecting a mismatched peer.
+  ShmOptions shm{};
   int backlog = 128;
   // Bound for transport-level handshake completion on accepted sockets.
   // A silent peer is rejected after this interval instead of blocking accept().
