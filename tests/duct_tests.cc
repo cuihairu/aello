@@ -126,6 +126,67 @@ class SlowTimeoutPipe final : public duct::Pipe {
   bool in_send_ = false;
 };
 
+// Test double: blocks the first transport send until released, then records
+// each subsequent payload that reaches the transport.
+class GatedRecordingPipe final : public duct::Pipe {
+ public:
+  duct::Result<void> send(const duct::Message& msg, const duct::SendOptions&) override {
+    std::unique_lock<std::mutex> lock(mu_);
+    const bool first_send = !in_send_ && sent_.empty();
+    if (first_send) {
+      in_send_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [&] { return released_ || closed_; });
+    }
+    if (closed_) return duct::Status::closed("closed while gated");
+    sent_.emplace_back(msg.as_string_view());
+    cv_.notify_all();
+    return {};
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    return duct::Status::timeout("gated pipe has no inbound data");
+  }
+
+  void close() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+    released_ = true;
+    cv_.notify_all();
+  }
+
+  bool wait_until_send_started(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] { return in_send_; });
+  }
+
+  bool wait_for_sent(std::string_view payload, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [&] {
+      return std::find(sent_.begin(), sent_.end(), std::string(payload)) != sent_.end();
+    });
+  }
+
+  bool was_sent(std::string_view payload) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return std::find(sent_.begin(), sent_.end(), std::string(payload)) != sent_.end();
+  }
+
+  void release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::vector<std::string> sent_;
+  bool in_send_ = false;
+  bool released_ = false;
+  bool closed_ = false;
+};
+
 // Test double that produces a bounded stream of messages on recv, then reports
 // kClosed. Lets the QoS recv worker drain into its queue.
 class SourcePipe final : public duct::Pipe {
@@ -1702,20 +1763,28 @@ static void test_qos_item_count_cap() {
 }
 
 static void test_qos_failfast_returns_queue_full() {
-  auto owned = std::make_unique<SlowTimeoutPipe>();
+  auto owned = std::make_unique<GatedRecordingPipe>();
+  GatedRecordingPipe* transport = owned.get();
   duct::QosOptions qos;
   qos.snd_hwm_bytes = 3;
   qos.backpressure = duct::BackpressurePolicy::kFailFast;
   duct::QosPipe pipe(std::move(owned), qos);
 
+  // Pin the first message in-flight so the queue watermark is deterministic:
+  // the in-flight message does not count against the HWM.
   EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(500)));
   EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
   EXPECT_TRUE(pipe.send(duct::Message::from_string("c"), {}).ok());
-  auto r = pipe.send(duct::Message::from_string("d"), {});
+  // Queue is now at exactly snd_hwm_bytes (3); the next send must fail fast.
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("d"), {}).ok());
+  auto r = pipe.send(duct::Message::from_string("e"), {});
   EXPECT_TRUE(!r.ok());
   if (!r.ok()) {
     EXPECT_EQ(r.status().code(), duct::StatusCode::kQueueFull);
   }
+  // Release the gated first send so the worker can finish and close() can join.
+  transport->release();
   pipe.close();
 }
 
@@ -1741,6 +1810,51 @@ static void test_qos_dial_opt_in_disabled_by_default() {
     c.value()->close();
   }
   lis_r.value()->close();
+}
+
+static void test_qos_ttl_expires_queued_message() {
+  auto owned = std::make_unique<GatedRecordingPipe>();
+  GatedRecordingPipe* transport = owned.get();
+  duct::QosOptions qos;
+  qos.ttl = std::chrono::milliseconds(200);
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("first"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(500)));
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("expired"), {}).ok());
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  transport->release();
+  EXPECT_TRUE(transport->wait_for_sent("first", std::chrono::milliseconds(500)));
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("after-expiry"), {}).ok());
+  EXPECT_TRUE(transport->wait_for_sent("after-expiry", std::chrono::milliseconds(500)));
+  EXPECT_TRUE(!transport->was_sent("expired"));
+  pipe.close();
+}
+
+static void test_qos_drop_old_evicts_oldest_queued() {
+  auto owned = std::make_unique<GatedRecordingPipe>();
+  GatedRecordingPipe* transport = owned.get();
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 2;
+  qos.backpressure = duct::BackpressurePolicy::kDropOld;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(500)));
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("c"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("d"), {}).ok());
+  transport->release();
+
+  // "a" was already picked up by the worker (in-flight) and is delivered on
+  // release. "b" was evicted from the queue by kDropOld. "c" and "d" remain.
+  EXPECT_TRUE(transport->wait_for_sent("a", std::chrono::milliseconds(500)));
+  EXPECT_TRUE(transport->wait_for_sent("c", std::chrono::milliseconds(500)));
+  EXPECT_TRUE(transport->wait_for_sent("d", std::chrono::milliseconds(500)));
+  EXPECT_TRUE(!transport->was_sent("b"));
+  pipe.close();
 }
 
 }  // namespace
@@ -1788,6 +1902,8 @@ int main() {
   test_qos_item_count_cap();
   test_qos_failfast_returns_queue_full();
   test_qos_dial_opt_in_disabled_by_default();
+  test_qos_ttl_expires_queued_message();
+  test_qos_drop_old_evicts_oldest_queued();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

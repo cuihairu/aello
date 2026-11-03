@@ -163,6 +163,12 @@ class ReconnectPipe final : public Pipe {
 
         auto r = dial_once_();
         if (r.ok()) {
+          // Publish the state change before exposing the new inner pipe. A
+          // sender that wakes on inner_ must be able to observe the kConnected
+          // transition (and its callback) already completed; otherwise the
+          // callback can race with a successful send and be observed late.
+          set_state(ConnectionState::kConnected, "connected");
+          if (is_closed()) return;
           {
             std::lock_guard<std::mutex> lk(mu_);
             inner_ = std::shared_ptr<Pipe>(std::move(r.value()));
@@ -170,7 +176,6 @@ class ReconnectPipe final : public Pipe {
             last_error_.clear();
             cv_.notify_all();
           }
-          set_state(ConnectionState::kConnected, "connected");
           break;
         }
 
