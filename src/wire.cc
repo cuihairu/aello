@@ -400,7 +400,6 @@ Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
 
 Result<std::uint32_t> handshake_server(SocketHandle fd, std::uint32_t server_capabilities,
                                        std::chrono::milliseconds timeout) {
-  (void)server_capabilities;
   auto r = read_frame_with_flags(fd, timeout);
   if (!r.ok()) return r.status();
   const auto& sv = r.value().message.as_string_view();
@@ -415,6 +414,9 @@ Result<std::uint32_t> handshake_server(SocketHandle fd, std::uint32_t server_cap
   std::uint8_t reply[kHandshakeLen] = {};
   reply[0] = kProtocolVersion;
   std::memcpy(reply + 1, &server_capabilities, sizeof(server_capabilities));
+  auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
+                        to_u32(FrameFlags::kCtrl), timeout);
+  if (!ws.ok()) return ws.status();
   return client_caps;
 }
 

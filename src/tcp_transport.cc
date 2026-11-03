@@ -84,7 +84,13 @@ class TcpPipe final : public Pipe {
     if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
     auto hs = ensure_handshake();
     if (!hs.ok()) return hs.status();
-    return wire::read_frame_with_flags(fd_, opt.timeout);
+    // Transparently consume the server's kCtrl handshake reply; it is protocol
+    // metadata, not an application frame.
+    for (;;) {
+      auto r = wire::read_frame_with_flags(fd_, opt.timeout);
+      if (!r.ok()) return r.status();
+      if ((r.value().flags & to_u32(FrameFlags::kCtrl)) == 0) return r;
+    }
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
@@ -107,14 +113,15 @@ class TcpPipe final : public Pipe {
 
  private:
   Result<void> ensure_handshake() {
-    if (handshake_ready_) return {};
-    auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
-    if (!hs.ok()) {
-      close_socket(fd_);
-      fd_ = wire::kInvalidSocket;
-      return hs;
+    if (!handshake_ready_) {
+      auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
+      if (!hs.ok()) {
+        close_socket(fd_);
+        fd_ = wire::kInvalidSocket;
+        return hs;
+      }
+      handshake_ready_ = true;
     }
-    handshake_ready_ = true;
     return {};
   }
 
