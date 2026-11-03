@@ -5,6 +5,7 @@
 #include "duct/pubsub.h"
 #include "duct/rpc.h"
 #include "duct/wire.h"
+#include "../src/reconnect_pipe.h"
 
 #include <algorithm>
 #include <atomic>
@@ -192,6 +193,27 @@ class GatedRecordingPipe final : public duct::Pipe {
   bool in_send_ = false;
   bool released_ = false;
   bool closed_ = false;
+};
+
+// Test double for ReconnectPipe: the first connection's recv immediately
+// reports a disconnect; the second records a send made from a reconnect
+// callback so we can assert it completed without deadlocking.
+class ReconnectCallbackPipe final : public duct::Pipe {
+ public:
+  bool disconnect_on_recv = false;
+  bool sent_in_callback = false;
+
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    sent_in_callback = true;
+    return {};
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    if (disconnect_on_recv) return duct::Status::closed("peer closed");
+    return duct::Status::timeout("no inbound data");
+  }
+
+  void close() override {}
 };
 
 // Test double that produces a bounded stream of messages on recv, then reports
@@ -1637,6 +1659,58 @@ static void test_reconnect_dial_fails_after_attempts() {
   c.value()->close();
 }
 
+// A reconnect callback that sends inside on_state_change must not deadlock:
+// the kConnected transition used to fire before inner_ was published, so
+// wait_connected() never observed the new pipe and blocked forever.
+static void test_reconnect_callback_ops_pipe() {
+  std::atomic<int> attempts{0};
+  ReconnectCallbackPipe* second = nullptr;
+  std::atomic<bool> callback_sent{false};
+  std::shared_ptr<duct::Pipe> holder;
+
+  duct::ReconnectPolicy policy;
+  policy.initial_delay = std::chrono::milliseconds(5);
+  policy.max_delay = std::chrono::milliseconds(20);
+  policy.backoff_multiplier = 1.0;
+  policy.max_attempts = 10;
+
+  auto dial_once = [&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    int n = ++attempts;
+    auto p = std::make_unique<ReconnectCallbackPipe>();
+    if (n == 1) {
+      p->disconnect_on_recv = true;
+    } else {
+      second = p.get();
+    }
+    return std::unique_ptr<duct::Pipe>(std::move(p));
+  };
+
+  duct::ConnectionCallback cb = [&](duct::ConnectionState s, const std::string&) {
+    if (s != duct::ConnectionState::kConnected) return;
+    if (attempts < 2) return;  // first connect: holder not assigned yet.
+    if (!holder) return;
+    auto st = holder->send(duct::Message::from_string("cb-ping"), {});
+    if (st.ok()) callback_sent.store(true);
+  };
+
+  auto pipe = duct::make_reconnect_pipe(std::move(dial_once), policy, std::move(cb));
+  holder = std::shared_ptr<duct::Pipe>(std::move(pipe));
+
+  // First recv hits the fake disconnect and the worker reconnects.
+  duct::RecvOptions ro;
+  ro.timeout = std::chrono::milliseconds(1000);
+  (void)holder->recv(ro);
+
+  for (int i = 0; i < 20 && !callback_sent.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_TRUE(callback_sent.load());
+  if (second) {
+    EXPECT_TRUE(second->sent_in_callback);
+  }
+  holder->close();
+}
+
 static void test_qos_recv_watermark_and_worker() {
   auto owned = std::make_unique<SourcePipe>(8);
   SourcePipe* source = owned.get();
@@ -2541,6 +2615,7 @@ int main() {
   test_qos_close_under_full_ring();
   test_reconnect_dial_connects_and_echoes();
   test_reconnect_dial_fails_after_attempts();
+  test_reconnect_callback_ops_pipe();
   test_qos_recv_watermark_and_worker();
   test_qos_linger_drains_before_close();
   test_wire_fragmentation_and_reassembly();
