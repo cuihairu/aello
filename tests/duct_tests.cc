@@ -2,6 +2,7 @@
 #include "duct/logging.h"
 #include "duct/protocol.h"
 #include "duct/qos_pipe.h"
+#include "duct/pubsub.h"
 #include "duct/rpc.h"
 #include "duct/wire.h"
 
@@ -14,6 +15,7 @@
 #include <fcntl.h>
 #include <future>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sys/socket.h>
@@ -2202,6 +2204,46 @@ static void test_rpc_request_timeout() {
   lis_r.value()->close();
 }
 
+static void test_pubsub_multiple_subscribers() {
+  duct::pubsub::Broker broker;
+
+  std::mutex mu;
+  std::map<std::string, std::vector<std::string>> received;
+  auto make_sub = [&](const std::string& filter) {
+    return broker.subscribe(filter, [&, filter](const std::string& topic, const duct::Message& msg) {
+      std::lock_guard<std::mutex> lock(mu);
+      received[filter].push_back(topic + ":" + std::string(msg.as_string_view()));
+    });
+  };
+
+  auto s1 = make_sub("a");       // matches a, a/x, but not b
+  auto s2 = make_sub("a/x");     // narrower
+  auto s3 = make_sub("");        // everything
+
+  broker.publish("a", duct::Message::from_string("hello"));
+  broker.publish("a/x", duct::Message::from_string("world"));
+  broker.publish("b", duct::Message::from_string("other"));
+
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_EQ(received["a"].size(), 2u);       // a + a/x
+    EXPECT_EQ(received["a/x"].size(), 1u);     // a/x only
+    EXPECT_EQ(received[""].size(), 3u);        // everything
+  }
+
+  // Unsubscribe: s1 is destroyed, so it stops receiving.
+  s1.reset();
+  broker.publish("a", duct::Message::from_string("again"));
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    EXPECT_EQ(received["a"].size(), 2u);       // no new "a" after unsubscribe
+    EXPECT_EQ(received[""].size(), 4u);        // s3 still gets it
+  }
+
+  (void)s2;
+  (void)s3;
+}
+
 }  // namespace
 
 int main() {
@@ -2254,6 +2296,7 @@ int main() {
   test_multi_process_kill9_restart();
   test_rpc_request_correlation();
   test_rpc_request_timeout();
+  test_pubsub_multiple_subscribers();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

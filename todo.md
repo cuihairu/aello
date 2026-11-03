@@ -54,7 +54,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Deferred features
 
 - [x] RPC request correlation, timeout, and cancellation. Evidence: ec2983b; include/duct/rpc.h adds a correlated Client (u32 id frame + dispatch thread), concurrent calls matched by id, kTimeout/kCancelled status; tests green (50 duct cases, ctest 3/3, 15x stress).
-- [ ] Pub/sub with multiple subscribers.
+- [x] Pub/sub with multiple subscribers. Evidence: commit; include/duct/pubsub.h adds a topic-filter Broker with per-subscriber prefix filters and unsubscribe-on-destroy; multi-subscriber delivery + unsubscribe test green (51 duct cases, ctest 3/3, 12x stress).
 - [ ] Async/event-loop API (async.h is on the design audit delete list; not part of the library).
 - [ ] TLS / mTLS for tcp, peer credential checks for uds.
 - [ ] Crash recovery for orphaned shm segments.
