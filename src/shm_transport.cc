@@ -289,7 +289,10 @@ static Result<int> uds_connect(std::string_view path, std::chrono::milliseconds 
       (void)socket_utils::set_nonblocking(fd, false);
       return fd;
     }
-    if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) {
+    // EINPROGRESS/EALREADY: connect is pending. EAGAIN: Linux reports a full
+    // listen backlog this way; the connection is still in progress and we must
+    // wait for POLLOUT then check SO_ERROR. Any other error is immediate.
+    if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR && errno != EAGAIN) {
       ::close(fd);
       return Status::io_error("connect(AF_UNIX) failed" + errno_suffix());
     }

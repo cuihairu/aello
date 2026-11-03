@@ -888,6 +888,50 @@ static void test_shm_dial_timeout_honored() {
 #endif
 }
 
+static void test_shm_dial_positive_timeout_path() {
+#if defined(_WIN32)
+  return;
+#else
+  duct::ListenOptions listen_opt;
+  listen_opt.backlog = 1;
+  auto lis_r = duct::listen("shm://duct_shm_timeout_pos", listen_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Occupy the listener's accept queue. Each successful shm dial completes a
+  // UDS connection into the backlog (the server never accepts), so a later
+  // dial must hit the full-backlog EAGAIN and then the bounded wait path.
+  duct::DialOptions occupy_opt;
+  occupy_opt.timeout = std::chrono::milliseconds(200);
+  occupy_opt.qos.snd_hwm_bytes = 0;
+  occupy_opt.qos.rcv_hwm_bytes = 0;
+  std::vector<std::shared_ptr<duct::Pipe>> occupied;
+  for (int i = 0; i < 8; ++i) {
+    auto occ = duct::dial("shm://duct_shm_timeout_pos", occupy_opt);
+    if (occ.ok()) {
+      occupied.emplace_back(occ.value().release());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(!occupied.empty());
+
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(150);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  const auto start = std::chrono::steady_clock::now();
+  auto c = duct::dial("shm://duct_shm_timeout_pos", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_TRUE(!c.ok());
+  // The full-backlog connect must enter the bounded non-blocking wait and fail
+  // promptly (kTimeout or kIoError), never hang.
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+
+  for (auto& p : occupied) p->close();
+  lis_r.value()->close();
+#endif
+}
+
 static void test_dial_rejects_negative_timeout() {
   duct::DialOptions dial_opt;
   dial_opt.timeout = std::chrono::milliseconds(-1);
@@ -2828,6 +2872,7 @@ int main() {
   test_uds_listen_rejects_non_socket_path();
   test_uds_positive_connect_timeout_is_preserved();
   test_shm_dial_timeout_honored();
+  test_shm_dial_positive_timeout_path();
   test_dial_rejects_negative_timeout();
   test_wire_clears_send_timeout_for_blocking_write();
   test_wire_write_no_sigpipe_on_macos();
