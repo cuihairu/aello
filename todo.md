@@ -49,7 +49,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Concurrent send/recv tests. Evidence: 2fe13c4; 4 send+4 recv threads over QoS-wrapped tcp, each response consumed exactly once (46 duct cases, ctest 2/2, 12x stress).
 - [x] Multi-process and `kill -9` / restart test matrix. Evidence: 9a3ff36; fork()ed echo server cross-process echo, SIGKILL server, restart and recovery green (47 duct cases, ctest 2/2, 10x stress, no orphans).
 - [x] UDS tests (blocked until UDS is wired). Evidence: 2c7062a; uds wired (src/uds_transport.cc), echo, multi-message echo, negative timeout, non-socket path rejection, positive timeout preserved tests green (48 duct cases, ctest 2/2, 10x stress).
-- [x] Benchmarks (aello-bench): shm round-trip latency and throughput vs UDS/TCP. Evidence: commit; bench/aello_bench.cc forks a per-transport echo server, 50k RTT @64B: shm 25us / uds 61us / tcp 121us; @8KiB: shm 99us / uds 148us / tcp 124us. Also fixed accept-side TCP_NODELAY (echo RTT 41ms -> 121us). ctest 3/3.
+- [x] Benchmarks (aello-bench): shm round-trip latency and throughput vs UDS/TCP. Evidence: 545a80e; bench/aello_bench.cc forks a per-transport echo server, 50k RTT @64B: shm 25us / uds 61us / tcp 121us; @8KiB: shm 99us / uds 148us / tcp 124us. Also fixed accept-side TCP_NODELAY (echo RTT 41ms -> 121us). ctest 3/3.
 
 ## Deferred features
 
