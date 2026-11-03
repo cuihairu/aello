@@ -2030,6 +2030,58 @@ static void test_tcp_channel_multiplexing() {
   lis_r.value()->close();
 }
 
+static void test_tcp_channel_recv_does_not_drop_other_channel() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::SendOptions s7;
+    s7.channel_id = 7;
+    auto a = p.value()->send(duct::Message::from_string("ch-7"), s7);
+    if (!a.ok()) return a.status();
+    duct::SendOptions s8;
+    s8.channel_id = 8;
+    return p.value()->send(duct::Message::from_string("ch-8"), s8);
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(500);
+  r7.channel_id = 7;
+  auto m7 = c.value()->recv(r7);
+  EXPECT_TRUE(m7.ok());
+  if (m7.ok()) EXPECT_EQ(m7.value().as_string_view(), "ch-7");
+
+  // The ch-8 frame must still be readable by its own consumer.
+  duct::RecvOptions r8;
+  r8.timeout = std::chrono::milliseconds(500);
+  r8.channel_id = 8;
+  auto m8 = c.value()->recv(r8);
+  EXPECT_TRUE(m8.ok());
+  if (m8.ok()) EXPECT_EQ(m8.value().as_string_view(), "ch-8");
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    EXPECT_TRUE(server.get().ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
 static void test_qos_rate_limit_paces_delivery() {
   auto owned = std::make_unique<RecordingPipe>();
   RecordingPipe* transport = owned.get();
@@ -2746,6 +2798,7 @@ int main() {
   test_shm_fragmentation_midway_timeout_keeps_stream_synced();
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
+  test_tcp_channel_recv_does_not_drop_other_channel();
   test_qos_rate_limit_paces_delivery();
   test_qos_rate_limit_default_burst_drains();
   test_qos_channel_multiplexing();

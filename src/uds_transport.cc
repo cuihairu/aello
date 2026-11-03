@@ -6,8 +6,11 @@
 
 #include <cstring>
 #include <cerrno>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 // UDS is not available on Windows; use named pipes instead.
@@ -52,13 +55,28 @@ class UdsPipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
-    auto r = recv_frame(opt);
-    if (!r.ok()) return r.status();
-    if (opt.channel_id != 0 &&
-        flags_to_channel_id(r.value().flags) != opt.channel_id) {
-      return recv(opt);
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(ch_mu_);
+        auto it = pending_.find(opt.channel_id);
+        if (it != pending_.end() && !it->second.empty()) {
+          auto msg = std::move(it->second.front().message);
+          it->second.erase(it->second.begin());
+          if (it->second.empty()) pending_.erase(it);
+          return msg;
+        }
+      }
+      auto r = recv_frame(opt);
+      if (!r.ok()) return r.status();
+      if (opt.channel_id == 0 ||
+          flags_to_channel_id(r.value().flags) == opt.channel_id) {
+        return std::move(r.value().message);
+      }
+      {
+        std::lock_guard<std::mutex> lock(ch_mu_);
+        pending_[flags_to_channel_id(r.value().flags)].push_back(std::move(r.value()));
+      }
     }
-    return std::move(r.value().message);
   }
 
   void close() override {
@@ -89,6 +107,8 @@ class UdsPipe final : public Pipe {
 
  private:
   int fd_ = -1;
+  std::mutex ch_mu_;
+  std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
 };
 
 class UdsListener final : public Listener {

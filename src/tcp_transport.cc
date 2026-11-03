@@ -7,8 +7,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #include <winsock2.h>
@@ -94,14 +97,31 @@ class TcpPipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
-    auto r = recv_frame(opt);
-    if (!r.ok()) return r.status();
-    if (opt.channel_id != 0 &&
-        flags_to_channel_id(r.value().flags) != opt.channel_id) {
-      // Not our channel. Re-read until a matching frame or timeout.
-      return recv(opt);
+    for (;;) {
+      // First serve any frame buffered for the requested channel so a message
+      // read while waiting on another channel is not lost.
+      {
+        std::lock_guard<std::mutex> lock(ch_mu_);
+        auto it = pending_.find(opt.channel_id);
+        if (it != pending_.end() && !it->second.empty()) {
+          auto msg = std::move(it->second.front().message);
+          it->second.erase(it->second.begin());
+          if (it->second.empty()) pending_.erase(it);
+          return msg;
+        }
+      }
+      auto r = recv_frame(opt);
+      if (!r.ok()) return r.status();
+      if (opt.channel_id == 0 ||
+          flags_to_channel_id(r.value().flags) == opt.channel_id) {
+        return std::move(r.value().message);
+      }
+      // Not our channel: stash it for the matching consumer and keep reading.
+      {
+        std::lock_guard<std::mutex> lock(ch_mu_);
+        pending_[flags_to_channel_id(r.value().flags)].push_back(std::move(r.value()));
+      }
     }
-    return std::move(r.value().message);
   }
 
   void close() override {
@@ -127,6 +147,8 @@ class TcpPipe final : public Pipe {
 
   wire::SocketHandle fd_ = wire::kInvalidSocket;
   bool handshake_ready_ = true;
+  std::mutex ch_mu_;
+  std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
 };
 
 class TcpListener final : public Listener {
