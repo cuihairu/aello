@@ -1271,6 +1271,60 @@ static void test_qos_delivery_under_hwm() {
   lis_r.value()->close();
 }
 
+static void test_uds_multi_message_echo() {
+#if !defined(_WIN32)
+  std::string path = "/tmp/duct_uds_multi_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < 3; ++i) {
+      auto msg = p.value()->recv({});
+      if (!msg.ok()) return msg.status();
+      auto st = p.value()->send(msg.value(), {});
+      if (!st.ok()) return st;
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds://" + path, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    const std::string payload = "uds-msg-" + std::to_string(i);
+    duct::SendOptions sopt;
+    sopt.timeout = std::chrono::milliseconds(500);
+    auto st = c.value()->send(duct::Message::from_string(payload), sopt);
+    EXPECT_TRUE(st.ok());
+    if (!st.ok()) break;
+    auto echoed = c.value()->recv({});
+    EXPECT_TRUE(echoed.ok());
+    if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), payload);
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  EXPECT_TRUE(sst == std::future_status::ready);
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  }
+  lis_r.value()->close();
+#endif
+}
+
 static void test_qos_close_under_full_ring() {
   // Fill the shm ring (server never reads) so the QoS send worker blocks on the
   // transport send. close() must still return promptly: previously it deadlocked on
@@ -2040,6 +2094,7 @@ int main() {
   test_address_parse();
   test_shm_echo_one();
   test_uds_echo_one();
+  test_uds_multi_message_echo();
   test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();

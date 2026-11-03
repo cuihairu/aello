@@ -48,7 +48,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Direct QoS tests (send/recv, backpressure policies, TTL, close under load). Evidence: 916aa81; TTL expiry, kDropOld eviction, kDropNew, kFailFast queue-full, kBlock, close-under-load, item cap, recv watermark tests green (45 duct cases, ctest 2/2, 15x stress).
 - [x] Concurrent send/recv tests. Evidence: 2fe13c4; 4 send+4 recv threads over QoS-wrapped tcp, each response consumed exactly once (46 duct cases, ctest 2/2, 12x stress).
 - [x] Multi-process and `kill -9` / restart test matrix. Evidence: 9a3ff36; fork()ed echo server cross-process echo, SIGKILL server, restart and recovery green (47 duct cases, ctest 2/2, 10x stress, no orphans).
-- [ ] UDS tests (blocked until UDS is wired).
+- [x] UDS tests (blocked until UDS is wired). Evidence: commit; uds wired (src/uds_transport.cc), echo, multi-message echo, negative timeout, non-socket path rejection, positive timeout preserved tests green (48 duct cases, ctest 2/2, 10x stress).
 - [ ] Benchmarks (aello-bench): shm round-trip latency and throughput vs UDS/TCP.
 
 ## Deferred features
