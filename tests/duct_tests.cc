@@ -1600,6 +1600,26 @@ static void test_tcp_channel_multiplexing() {
   lis_r.value()->close();
 }
 
+static void test_qos_rate_limit_paces_delivery() {
+  auto owned = std::make_unique<RecordingPipe>();
+  RecordingPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 1024;
+  // 1000 bytes/s with a 100-byte burst. Two 100-byte messages: the first fits
+  // in the burst; the second requires ~100 ms of refill.
+  qos.rate_bytes_per_sec = 1000;
+  qos.burst_bytes = 100;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string(std::string(100, 'a')), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string(std::string(100, 'b')), {}).ok());
+
+  EXPECT_TRUE(transport->wait_for_sent(std::string(100, 'a'), std::chrono::milliseconds(500)));
+  EXPECT_TRUE(transport->wait_for_sent(std::string(100, 'b'), std::chrono::milliseconds(500)));
+  pipe.close();
+}
+
 }  // namespace
 
 int main() {
@@ -1640,6 +1660,7 @@ int main() {
   test_shm_fragmentation_and_reassembly();
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
+  test_qos_rate_limit_paces_delivery();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

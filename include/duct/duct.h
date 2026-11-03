@@ -74,6 +74,11 @@ struct QosOptions {
   // With fragmentation enabled the transport can carry arbitrary payloads; this
   // defaults to unlimited (size_t max) so large messages are split into chunks.
   std::size_t max_message_bytes = static_cast<std::size_t>(-1);
+
+  // Token-bucket rate limit. rate_bytes_per_sec == 0 disables the limiter.
+  // burst_bytes is the maximum burst allowed (defaults to one second's worth).
+  std::size_t rate_bytes_per_sec = 0;
+  std::size_t burst_bytes = 0;
 };
 
 struct SendOptions {

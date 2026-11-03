@@ -3,6 +3,7 @@
 #include "duct/wire.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 
 namespace duct {
@@ -25,6 +26,11 @@ QosPipe::~QosPipe() {
 }
 
 void QosPipe::send_worker() {
+  // Token-bucket state for rate limiting. Tokens are refilled continuously up
+  // to burst_bytes; each drained message consumes msg.size() tokens.
+  std::size_t tokens = qos_.burst_bytes;
+  auto last_refill = std::chrono::steady_clock::now();
+
   while (running_) {
     QueuedMessage msg_to_send{Message{}};
     {
@@ -62,6 +68,39 @@ void QosPipe::send_worker() {
 
       if (send_queue_.empty()) continue;
 
+      // Enforce the token bucket before draining the next message. Block until
+      // enough tokens are available (or the worker is stopped).
+      if (qos_.rate_bytes_per_sec != 0) {
+        auto best_cost = [this]() -> std::size_t {
+          auto best = send_queue_.begin();
+          for (auto it = std::next(send_queue_.begin()); it != send_queue_.end(); ++it) {
+            if (it->priority > best->priority) best = it;
+          }
+          return best->message.size();
+        };
+        for (;;) {
+          const std::size_t next_cost = best_cost();
+          auto now = std::chrono::steady_clock::now();
+          const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - last_refill).count();
+          if (elapsed_ms > 0) {
+            const std::size_t added = static_cast<std::size_t>(
+                (static_cast<double>(qos_.rate_bytes_per_sec) * elapsed_ms) / 1000.0);
+            tokens = std::min<std::size_t>(qos_.burst_bytes, tokens + added);
+            last_refill = now;
+          }
+          if (tokens >= next_cost) break;
+          // Wait for enough refill time.
+          const auto needed_ms = static_cast<long long>(
+              (static_cast<double>(next_cost - tokens) * 1000.0) /
+              static_cast<double>(qos_.rate_bytes_per_sec));
+          send_cv_.wait_for(lock, std::chrono::milliseconds(std::max<long long>(1, needed_ms)),
+                            [this] { return !running_; });
+          if (!running_) break;
+        }
+        if (!running_) break;
+      }
+
       // Drain unconditionally. The HWM water mark gates the *enqueue* side (send()),
       // not the drain side: gating the worker here would stall the queue permanently
       // once it reaches snd_hwm_bytes (the worker is the only path that frees bytes).
@@ -74,6 +113,10 @@ void QosPipe::send_worker() {
         if (it->priority > best->priority) best = it;
       }
       msg_to_send = std::move(*best);
+      if (qos_.rate_bytes_per_sec != 0) {
+        const std::size_t cost = msg_to_send.message.size();
+        tokens = tokens >= cost ? tokens - cost : 0;
+      }
       send_queue_.erase(best);
       send_bytes_ -= msg_to_send.message.size();
       send_count_ -= 1;
