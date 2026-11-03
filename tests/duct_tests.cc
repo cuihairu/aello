@@ -195,6 +195,22 @@ class GatedRecordingPipe final : public duct::Pipe {
   bool closed_ = false;
 };
 
+// Test double whose recv ignores close() and sleeps for its full timeout; it
+// models transports that do not wake a blocked dispatch read on pipe close.
+class SleepyRecvPipe final : public duct::Pipe {
+ public:
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    return {};
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions& opt) override {
+    std::this_thread::sleep_for(opt.timeout.count() > 0 ? opt.timeout : std::chrono::milliseconds(10'000));
+    return duct::Status::timeout("sleepy recv");
+  }
+
+  void close() override {}
+};
+
 // Test double for ReconnectPipe: the first connection's recv immediately
 // reports a disconnect; the second records a send made from a reconnect
 // callback so we can assert it completed without deadlocking.
@@ -2591,6 +2607,18 @@ static void test_rpc_request_timeout() {
   lis_r.value()->close();
 }
 
+// close() must not hang when the transport does not wake a blocked read; the
+// RPC dispatch loop polls with a bounded timeout and joins promptly.
+static void test_rpc_close_joins_without_transport_wakeup() {
+  auto pipe = std::make_unique<SleepyRecvPipe>();
+  duct::rpc::Client client(std::move(pipe));
+  auto done = std::async(std::launch::async, [&] { client.close(); });
+  EXPECT_TRUE(done.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  if (done.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    done.get();
+  }
+}
+
 static void test_pubsub_multiple_subscribers() {
   duct::pubsub::Broker broker;
 
@@ -2702,6 +2730,7 @@ int main() {
   test_multi_process_kill9_restart();
   test_rpc_request_correlation();
   test_rpc_request_timeout();
+  test_rpc_close_joins_without_transport_wakeup();
   test_pubsub_multiple_subscribers();
   test_pubsub_subscription_outlives_broker();
 

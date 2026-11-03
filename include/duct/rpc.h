@@ -156,8 +156,15 @@ class Client {
 
   void dispatch_loop() {
     for (;;) {
-      auto msg = pipe_->recv({});
+      // Bound the transport recv so close() (which sets running_ false and
+      // closes the pipe) can always join the worker promptly, even if the
+      // underlying recv does not wake on close (e.g. a blocking tcp read).
+      auto msg = pipe_->recv({.timeout = std::chrono::milliseconds(100)});
       if (!msg.ok()) {
+        if (msg.status().code() == StatusCode::kTimeout) {
+          if (!running_) break;
+          continue;
+        }
         // Transport closed or errored: fail all waiters.
         std::lock_guard<std::mutex> lock(pending_mu_);
         running_ = false;
