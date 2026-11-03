@@ -1389,6 +1389,56 @@ static void test_uds_peer_credential() {
 #endif
 }
 
+static void test_shm_crash_recovery_reclaims_orphan() {
+#if !defined(_WIN32)
+  int pfd[2];
+  EXPECT_TRUE(::pipe(pfd) == 0);
+  pid_t listener = ::fork();
+  EXPECT_TRUE(listener >= 0);
+  if (listener < 0) return;
+  if (listener == 0) {
+    ::close(pfd[0]);
+    auto lis = duct::listen("shm://duct_crashbus");
+    if (!lis.ok()) _exit(1);
+    char ready = 'R';
+    (void)::write(pfd[1], &ready, 1);
+    auto p = lis.value()->accept();
+    if (!p.ok()) _exit(1);
+    for (;;) ::pause();
+  }
+  ::close(pfd[1]);
+  char ready = 0;
+  (void)::read(pfd[0], &ready, 1);
+  ::close(pfd[0]);
+
+  pid_t dialer = ::fork();
+  EXPECT_TRUE(dialer >= 0);
+  if (dialer < 0) {
+    ::kill(listener, SIGKILL);
+    ::waitpid(listener, nullptr, 0);
+    return;
+  }
+  if (dialer == 0) {
+    auto p = duct::dial("shm://duct_crashbus");
+    if (!p.ok()) _exit(1);
+    for (;;) ::pause();
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_TRUE(::kill(dialer, SIGKILL) == 0);
+  EXPECT_TRUE(::waitpid(dialer, nullptr, 0) == dialer);
+
+  EXPECT_TRUE(::kill(listener, SIGKILL) == 0);
+  EXPECT_TRUE(::waitpid(listener, nullptr, 0) == listener);
+
+  auto lis2 = duct::listen("shm://duct_crashbus");
+  EXPECT_TRUE(lis2.ok());
+  if (lis2.ok()) {
+    lis2.value()->close();
+  }
+#endif
+}
+
 static void test_qos_close_under_full_ring() {
   // Fill the shm ring (server never reads) so the QoS send worker blocks on the
   // transport send. close() must still return promptly: previously it deadlocked on
@@ -2313,6 +2363,7 @@ int main() {
   test_uds_echo_one();
   test_uds_multi_message_echo();
   test_uds_peer_credential();
+  test_shm_crash_recovery_reclaims_orphan();
   test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();

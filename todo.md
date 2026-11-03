@@ -58,7 +58,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Async/event-loop API (async.h is on the design audit delete list; not part of the library). Evidence: d00e310; deleted async.h, tests/async_tests.cc, examples/async_example.cc and the async_tests build target per design audit (aello-audit §7: conflicts with v1 no-general-event-loop direction); remaining ctest 2/2.
 - [x] Peer credential checks for uds (SO_PEERCRED uid/gid/pid, wired via Pipe::peer_credential(), both ends verify own-process identity; test green, 12x stress). Evidence: 8fd33cb.
 - [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).
-- [ ] Crash recovery for orphaned shm segments.
+- [x] Crash recovery for orphaned shm segments. Evidence: commit; shm header records owner PID+magic; shm_listen scans /dev/shm for dead-owner segments and unlinks them + their semaphores; fork/SIGKILL/orphan/reclaim test green (ctest 2/2, 12x stress, no leftover segments).
 - [ ] Install / packaging target (cmake templates unreferenced).
 
 ## Cleanup (design audit delete/refactor list)

@@ -22,10 +22,13 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <memory>
 #include <random>
+#include <signal.h>
 #include <string>
 #include <string_view>
+#include <sys/mman.h>
 #include <vector>
 
 #include <fcntl.h>
@@ -166,8 +169,11 @@ struct Ring {
 struct ShmLayout {
   Ring c2s;
   Ring s2c;
+  std::atomic_uint32_t owner_pid{0};  // PID of the creating (owner) process
+  std::atomic_uint32_t magic{0};      // kShmMagic on a live, initialized segment
 };
 
+static constexpr std::uint32_t kShmMagic = 0x4D484353;  // 'SHCM' little-endian marker
 static constexpr std::size_t kShmSize = sizeof(ShmLayout);
 
 struct ShmNames {
@@ -367,6 +373,8 @@ static Result<ShmHandles> create_resources(const ShmNames& n) {
   // (-Wclass-memaccess). The fresh shm segment is already zeroed by the OS, and
   // value-initialization makes the atomics/slots explicitly zero.
   ::new (static_cast<void*>(h.mem)) ShmLayout{};
+  h.mem->owner_pid.store(static_cast<std::uint32_t>(::getpid()), std::memory_order_release);
+  h.mem->magic.store(kShmMagic, std::memory_order_release);
 
   // Semaphores:
   // - items start at 0
@@ -564,8 +572,64 @@ class ShmListener final : public Listener {
 }  // namespace duct
 #endif  // !_WIN32
 
+#if !defined(_WIN32)
+// Reclaim orphaned shm resources for a bus. A connection's owner records its
+// PID in the segment header. If the owner died without running close() (e.g.
+// SIGKILL), the segment and its four semaphores are left behind. Scan /dev/shm
+// for segments of this bus and unlink any whose recorded owner PID is dead.
+static void reclaim_orphaned_bus(const std::string& bus_name) {
+  const std::string hash8 = hex8(fnv1a_32(sanitize_name(bus_name)));
+  const std::string prefix = "d" + hash8;
+
+  DIR* dir = ::opendir("/dev/shm");
+  if (!dir) return;
+  struct dirent* ent;
+  while ((ent = ::readdir(dir)) != nullptr) {
+    const std::string name = ent->d_name;
+    if (name.size() < prefix.size() + 8 || name.compare(0, prefix.size(), prefix) != 0) {
+      continue;
+    }
+    // Only consider shm segments (end with 'm' or the semaphore prefix). The
+    // segment is "<prefix><connid>m"; semaphores are "sem.<prefix><connid><a-d>".
+    if (name.compare(0, 4, "sem.") == 0) continue;
+    if (name.back() != 'm') continue;
+
+    const std::string seg_name = "/" + name;
+    int fd = ::shm_open(seg_name.c_str(), O_RDWR, 0600);
+    if (fd < 0) continue;
+    void* p = ::mmap(nullptr, kShmSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) continue;
+
+    const auto* layout = static_cast<const ShmLayout*>(p);
+    const std::uint32_t owner = layout->owner_pid.load(std::memory_order_acquire);
+    const std::uint32_t magic = layout->magic.load(std::memory_order_acquire);
+    ::munmap(p, kShmSize);
+
+    if (magic != kShmMagic) continue;  // not a live aello segment
+    if (owner == 0) continue;
+    if (::kill(static_cast<pid_t>(owner), 0) == 0 || errno == EPERM) {
+      continue;  // owner still alive
+    }
+
+    // Owner is gone: unlink the segment and its semaphores.
+    ::shm_unlink(seg_name.c_str());
+    const std::string conn = name.substr(prefix.size(), name.size() - prefix.size() - 1);
+    const std::string sem_prefix = "/sem.d" + hash8 + conn;
+    ::sem_unlink((sem_prefix + "a").c_str());
+    ::sem_unlink((sem_prefix + "b").c_str());
+    ::sem_unlink((sem_prefix + "c").c_str());
+    ::sem_unlink((sem_prefix + "d").c_str());
+  }
+  ::closedir(dir);
+}
+#endif
+
 // Linux/Unix implementation functions
 Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const ListenOptions& opt) {
+#if !defined(_WIN32)
+  reclaim_orphaned_bus(name);
+#endif
   ShmNames n = make_names(name, "0000000000000000");
   auto fd = uds_listen(n.bootstrap_path, opt.backlog);
   if (!fd.ok()) return fd.status();
