@@ -1852,6 +1852,59 @@ static void test_shm_fragmentation_and_reassembly() {
 #endif
 }
 
+static void test_shm_fragmentation_midway_timeout_keeps_stream_synced() {
+#if defined(_WIN32)
+  return;
+#else
+  auto lis_r = duct::listen("shm://duct_testfrag_timeout");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    // Delay consumption so the client's short per-chunk timeout expires while
+    // reassembly is still pending. The stream must remain synchronized.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testfrag_timeout", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  const std::string payload(64 * 1024 + 123, 'x');
+  duct::SendOptions so;
+  so.timeout = std::chrono::milliseconds(50);
+  auto st = c.value()->send(duct::Message::from_string(payload), so);
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) {
+    c.value()->close();
+    return;
+  }
+
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().size(), payload.size());
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    EXPECT_TRUE(server.get().ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+#endif
+}
+
 static void test_qos_priority_scheduling() {
   auto owned = std::make_unique<RecordingPipe>();
   RecordingPipe* transport = owned.get();
@@ -2620,6 +2673,7 @@ int main() {
   test_qos_linger_drains_before_close();
   test_wire_fragmentation_and_reassembly();
   test_shm_fragmentation_and_reassembly();
+  test_shm_fragmentation_midway_timeout_keeps_stream_synced();
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_qos_rate_limit_paces_delivery();

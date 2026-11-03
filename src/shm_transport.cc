@@ -451,7 +451,11 @@ class ShmPipe final : public Pipe {
       const std::size_t chunk = std::min(kSlotPayloadMax, total - offset);
       const bool last = (offset + chunk == total);
 
-      auto st = sem_wait_opt(spaces, opt.timeout);
+      // Once the first chunk is committed the message cannot be rolled back.
+      // Waits for subsequent chunks use the blocking form so a mid-message
+      // timeout does not leave a partially written stream that corrupts the
+      // peer's reassembly. The first chunk still honors the caller timeout.
+      auto st = sem_wait_opt(spaces, first ? opt.timeout : std::chrono::milliseconds(0));
       if (!st.ok()) return st;
 
       std::uint32_t head = tx->meta.head.load(std::memory_order_relaxed);
@@ -481,7 +485,9 @@ class ShmPipe final : public Pipe {
     std::vector<std::uint8_t> assembled;
     bool first = true;
     for (;;) {
-      auto st = sem_wait_opt(items, opt.timeout);
+      // Likewise once reassembly has started we must consume the whole message;
+      // a timeout mid-fragment would strand the receiver out of sync.
+      auto st = sem_wait_opt(items, first ? opt.timeout : std::chrono::milliseconds(0));
       if (!st.ok()) return st.status();
 
       std::uint32_t tail = rx->meta.tail.load(std::memory_order_relaxed);
