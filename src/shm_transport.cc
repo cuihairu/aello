@@ -43,6 +43,8 @@ namespace {
 #if !defined(_WIN32)
 constexpr std::size_t kSlotPayloadMax = 64 * 1024;
 constexpr std::uint32_t kSlotCount = 64;  // 64 * 64KB = 4MB per ring
+constexpr std::uint32_t kFirstChunkFlag = 1u << 31;
+constexpr std::uint32_t kLastChunkFlag = 1u << 30;
 
 static std::string sanitize_name(std::string_view s) {
   std::string out;
@@ -425,25 +427,39 @@ class ShmPipe final : public Pipe {
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
     if (!h_.mem) return Status::closed("pipe closed");
-    if (msg.size() > kSlotPayloadMax) {
-      return Status::invalid_argument("message too large; fragmentation TODO");
-    }
 
     Ring* tx = is_client_ ? &h_.mem->c2s : &h_.mem->s2c;
     sem_t* spaces = is_client_ ? h_.c2s_spaces : h_.s2c_spaces;
     sem_t* items = is_client_ ? h_.c2s_items : h_.s2c_items;
 
-    auto st = sem_wait_opt(spaces, opt.timeout);
-    if (!st.ok()) return st;
+    // Fragment payloads larger than one slot into multiple slots. Each slot
+    // header stores the remaining length; the final slot carries a zero-length
+    // marker via a high bit so recv() can reassemble. We use a leading bit in
+    // len to flag the first chunk and a separate marker for the last chunk.
+    const std::size_t total = msg.size();
+    std::size_t offset = 0;
+    bool first = true;
+    do {
+      const std::size_t chunk = std::min(kSlotPayloadMax, total - offset);
+      const bool last = (offset + chunk == total);
 
-    std::uint32_t head = tx->meta.head.load(std::memory_order_relaxed);
-    std::uint32_t idx = head % kSlotCount;
-    tx->slots[idx].len = static_cast<std::uint32_t>(msg.size());
-    if (msg.size() != 0) {
-      std::memcpy(tx->slots[idx].data, msg.data(), msg.size());
-    }
-    tx->meta.head.store(head + 1, std::memory_order_release);
-    ::sem_post(items);
+      auto st = sem_wait_opt(spaces, opt.timeout);
+      if (!st.ok()) return st;
+
+      std::uint32_t head = tx->meta.head.load(std::memory_order_relaxed);
+      std::uint32_t idx = head % kSlotCount;
+      std::uint32_t len = static_cast<std::uint32_t>(chunk);
+      if (first) len |= kFirstChunkFlag;
+      if (last) len |= kLastChunkFlag;
+      tx->slots[idx].len = len;
+      if (chunk != 0) {
+        std::memcpy(tx->slots[idx].data, msg.data() + offset, chunk);
+      }
+      tx->meta.head.store(head + 1, std::memory_order_release);
+      ::sem_post(items);
+      offset += chunk;
+      first = false;
+    } while (offset < total);
     return {};
   }
 
@@ -454,20 +470,40 @@ class ShmPipe final : public Pipe {
     sem_t* items = is_client_ ? h_.s2c_items : h_.c2s_items;
     sem_t* spaces = is_client_ ? h_.s2c_spaces : h_.c2s_spaces;
 
-    auto st = sem_wait_opt(items, opt.timeout);
-    if (!st.ok()) return st.status();
+    std::vector<std::uint8_t> assembled;
+    bool first = true;
+    for (;;) {
+      auto st = sem_wait_opt(items, opt.timeout);
+      if (!st.ok()) return st.status();
 
-    std::uint32_t tail = rx->meta.tail.load(std::memory_order_relaxed);
-    std::uint32_t idx = tail % kSlotCount;
-    std::uint32_t len = rx->slots[idx].len;
-    if (len > kSlotPayloadMax) {
-      return Status::protocol_error("shm slot len too large");
+      std::uint32_t tail = rx->meta.tail.load(std::memory_order_relaxed);
+      std::uint32_t idx = tail % kSlotCount;
+      std::uint32_t len = rx->slots[idx].len;
+      const bool is_first = (len & kFirstChunkFlag) != 0;
+      const bool is_last = (len & kLastChunkFlag) != 0;
+      len &= ~(kFirstChunkFlag | kLastChunkFlag);
+      if (len > kSlotPayloadMax) {
+        return Status::protocol_error("shm slot len too large");
+      }
+
+      if (first) {
+        if (!is_first) return Status::protocol_error("shm fragment stream out of sync");
+        assembled.resize(len);
+        if (len != 0) std::memcpy(assembled.data(), rx->slots[idx].data, len);
+        first = false;
+        rx->meta.tail.store(tail + 1, std::memory_order_release);
+        ::sem_post(spaces);
+        if (is_last) return Message::from_bytes(assembled.data(), assembled.size());
+        continue;
+      }
+
+      const std::size_t old = assembled.size();
+      assembled.resize(old + len);
+      if (len != 0) std::memcpy(assembled.data() + old, rx->slots[idx].data, len);
+      rx->meta.tail.store(tail + 1, std::memory_order_release);
+      ::sem_post(spaces);
+      if (is_last) return Message::from_bytes(assembled.data(), assembled.size());
     }
-
-    Message m = Message::from_bytes(rx->slots[idx].data, len);
-    rx->meta.tail.store(tail + 1, std::memory_order_release);
-    ::sem_post(spaces);
-    return m;
   }
 
   void close() override {

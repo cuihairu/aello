@@ -27,6 +27,8 @@ enum class FrameFlags : std::uint32_t {
 
   // Fragmentation (planned)
   kFrag = 1u << 4,
+  // Final fragment of a multi-frame message (set on the last chunk).
+  kFragFinal = 1u << 5,
 };
 
 inline constexpr FrameFlags operator|(FrameFlags a, FrameFlags b) {

@@ -112,12 +112,10 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
     return Status::closed("pipe closed");
   }
 
-  // Check message size against limits. snd_hwm_bytes == 0 means "unlimited".
-  // The wire frame limit is an absolute cap: a caller-configured QoS value above
-  // it must not re-open the path where send() accepts a message that the
-  // transport later rejects or drops.
-  const std::size_t max_message_bytes = std::min(qos_.max_message_bytes,
-                                                 wire::kMaxFramePayload);
+  // Check message size against an explicit caller-provided cap (defaults to
+  // unlimited; the transport fragments large payloads). snd_hwm_bytes == 0
+  // means "unlimited".
+  const std::size_t max_message_bytes = qos_.max_message_bytes;
   if (msg.size() > max_message_bytes) {
     return Status::invalid_argument("message too large for the transport");
   }

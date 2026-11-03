@@ -1109,12 +1109,13 @@ static void test_qos_permanent_send_error_does_not_wedge() {
 }
 
 static void test_qos_oversized_message_rejected() {
-  // The shm/wire transports cap a message at 64 KiB. QoS must reject anything
-  // larger synchronously instead of accepting it and dropping it in the worker.
+  // With fragmentation enabled the transport accepts payloads larger than a
+  // frame. QoS only rejects messages above an explicit caller-provided cap.
   auto owned = std::make_unique<RecordingPipe>();
 
   duct::QosOptions qos;
   qos.snd_hwm_bytes = 1024 * 1024;
+  qos.max_message_bytes = duct::wire::kMaxFramePayload;
   duct::QosPipe pipe(std::move(owned), qos);
 
   const std::string big(duct::wire::kMaxFramePayload + 1, 'x');
@@ -1439,6 +1440,86 @@ static void test_qos_linger_drains_before_close() {
   }
 }
 
+static void test_wire_fragmentation_and_reassembly() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  const std::string payload(duct::wire::kMaxFramePayload * 2 + 137, 'z');
+  auto st = duct::wire::write_frame(fds[0], duct::Message::from_string(payload));
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) {
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return;
+  }
+
+  auto r = duct::wire::read_frame(fds[1]);
+  EXPECT_TRUE(r.ok());
+  if (r.ok()) {
+    EXPECT_EQ(r.value().size(), payload.size());
+    EXPECT_EQ(r.value().as_string_view(), payload);
+  }
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+#endif
+}
+
+static void test_shm_fragmentation_and_reassembly() {
+#if defined(_WIN32)
+  return;
+#else
+  auto lis_r = duct::listen("shm://duct_testfrag");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testfrag", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  const std::string payload(64 * 1024 + 123, 'q');
+  auto st = c.value()->send(duct::Message::from_string(payload), {});
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) {
+    c.value()->close();
+    return;
+  }
+
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().size(), payload.size());
+    EXPECT_EQ(echoed.value().as_string_view(), payload);
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -1475,6 +1556,8 @@ int main() {
   test_reconnect_dial_fails_after_attempts();
   test_qos_recv_watermark_and_worker();
   test_qos_linger_drains_before_close();
+  test_wire_fragmentation_and_reassembly();
+  test_shm_fragmentation_and_reassembly();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

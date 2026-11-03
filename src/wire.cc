@@ -267,10 +267,6 @@ Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n,
 
 Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags,
                          std::chrono::milliseconds timeout) {
-  if (msg.size() > kMaxFramePayload) {
-    return Status::invalid_argument("message too large; enable fragmentation (todo)");
-  }
-
   auto deadline = timeout.count() > 0
       ? std::chrono::steady_clock::now() + timeout
       : std::chrono::steady_clock::time_point{};
@@ -284,42 +280,94 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
     if (!timeout_st.ok()) return timeout_st;
   }
 
-  FrameHeader h;
-  h.magic = kProtocolMagic;
-  h.version = kProtocolVersion;
-  h.header_len = static_cast<std::uint16_t>(kHeaderLen);
-  h.payload_len = static_cast<std::uint32_t>(msg.size());
-  h.flags = flags;
+  // Fragment payloads larger than one frame into kMaxFramePayload chunks. The
+  // reader concatenates them until the kFragFinal chunk. Each chunk carries the
+  // same flags so the receiver can identify the message family.
+  const std::size_t total = msg.size();
+  const std::uint8_t* data = msg.data();
+  std::size_t offset = 0;
+  const bool fragmented = total > kMaxFramePayload;
 
-  std::uint8_t hdr[kHeaderLen];
-  encode_header(h, hdr);
-  bool frame_started = false;
-  auto st = write_all(fd, hdr, sizeof(hdr), &frame_started, deadline);
-  if (!st.ok()) return st;
-  if (msg.size() == 0) return {};
-  return write_all(fd, msg.data(), msg.size(), &frame_started, deadline);
+  do {
+    const std::size_t chunk = std::min(kMaxFramePayload, total - offset);
+    const bool last = (offset + chunk == total);
+
+    FrameHeader h;
+    h.magic = kProtocolMagic;
+    h.version = kProtocolVersion;
+    h.header_len = static_cast<std::uint16_t>(kHeaderLen);
+    h.payload_len = static_cast<std::uint32_t>(chunk);
+    h.flags = flags;
+    if (fragmented) {
+      h.flags |= to_u32(FrameFlags::kFrag);
+      if (last) h.flags |= to_u32(FrameFlags::kFragFinal);
+    }
+
+    std::uint8_t hdr[kHeaderLen];
+    encode_header(h, hdr);
+    bool frame_started = false;
+    auto st = write_all(fd, hdr, sizeof(hdr), &frame_started, deadline);
+    if (!st.ok()) return st;
+    if (chunk != 0) {
+      st = write_all(fd, data + offset, chunk, &frame_started, deadline);
+      if (!st.ok()) return st;
+    }
+    offset += chunk;
+  } while (offset < total);
+
+  return {};
 }
 
 Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
   auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
   if (!timeout_st.ok()) return timeout_st.status();
 
-  std::uint8_t hdr[kHeaderLen];
-  bool frame_started = false;
-  auto st = read_exact(fd, hdr, sizeof(hdr), &frame_started);
-  if (!st.ok()) return st.status();
-  auto decoded = decode_header(hdr);
-  if (!decoded.ok()) return decoded.status();
-
-  FrameHeader h = decoded.value();
-  std::vector<std::uint8_t> buf(h.payload_len);
-  if (h.payload_len != 0) {
-    // The header was consumed, so a timeout from here on is mid-frame.
-    bool payload_started = true;
-    st = read_exact(fd, buf.data(), buf.size(), &payload_started);
+  std::vector<std::uint8_t> assembled;
+  bool first = true;
+  for (;;) {
+    std::uint8_t hdr[kHeaderLen];
+    bool frame_started = false;
+    auto st = read_exact(fd, hdr, sizeof(hdr), &frame_started);
     if (!st.ok()) return st.status();
+    auto decoded = decode_header(hdr);
+    if (!decoded.ok()) return decoded.status();
+
+    const std::uint32_t payload_len = decoded.value().payload_len;
+    const bool is_frag = (decoded.value().flags & to_u32(FrameFlags::kFrag)) != 0;
+    const bool is_final = (decoded.value().flags & to_u32(FrameFlags::kFragFinal)) != 0;
+
+    if (first) {
+      if (!is_frag) {
+        // Single-frame message.
+        std::vector<std::uint8_t> buf(payload_len);
+        if (payload_len != 0) {
+          bool payload_started = true;
+          st = read_exact(fd, buf.data(), buf.size(), &payload_started);
+          if (!st.ok()) return st.status();
+        }
+        return Message::from_bytes(buf.data(), buf.size());
+      }
+      assembled.resize(payload_len);
+      if (payload_len != 0) {
+        bool payload_started = true;
+        st = read_exact(fd, assembled.data(), payload_len, &payload_started);
+        if (!st.ok()) return st.status();
+      }
+      first = false;
+      if (is_final) return Message::from_bytes(assembled.data(), assembled.size());
+      continue;
+    }
+
+    // Continuation chunk: grow and append.
+    const std::size_t old_size = assembled.size();
+    assembled.resize(old_size + payload_len);
+    if (payload_len != 0) {
+      bool payload_started = true;
+      st = read_exact(fd, assembled.data() + old_size, payload_len, &payload_started);
+      if (!st.ok()) return st.status();
+    }
+    if (is_final) return Message::from_bytes(assembled.data(), assembled.size());
   }
-  return Message::from_bytes(buf.data(), buf.size());
 }
 
 }  // namespace duct::wire

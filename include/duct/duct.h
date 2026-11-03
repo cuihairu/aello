@@ -71,7 +71,9 @@ struct QosOptions {
   // Largest payload the underlying transport can carry in one message. A send
   // above this is rejected synchronously: accepting it and dropping it later in
   // the drain thread would lose data after send() already reported success.
-  std::size_t max_message_bytes = 64 * 1024;
+  // With fragmentation enabled the transport can carry arbitrary payloads; this
+  // defaults to unlimited (size_t max) so large messages are split into chunks.
+  std::size_t max_message_bytes = static_cast<std::size_t>(-1);
 };
 
 struct SendOptions {
