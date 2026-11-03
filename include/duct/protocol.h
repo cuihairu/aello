@@ -29,6 +29,10 @@ enum class FrameFlags : std::uint32_t {
   kFrag = 1u << 4,
   // Final fragment of a multi-frame message (set on the last chunk).
   kFragFinal = 1u << 5,
+
+  // Control frame (e.g. handshake/reliability ACK). Control frames carry
+  // protocol metadata rather than application data.
+  kCtrl = 1u << 6,
 };
 
 inline constexpr std::uint32_t channel_id_to_flags(std::uint32_t channel_id) {

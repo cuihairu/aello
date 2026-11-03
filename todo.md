@@ -34,7 +34,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.
 - [x] Priority scheduling and channel_id multiplexing. Evidence: 4dc7aa6; priority drains high-first and channel_id demux round-trip tests green (38 duct cases, ctest 2/2).
 - [x] Rate limiting (token bucket) per pipe or per socket. Evidence: f3d2870; paced delivery test green (39 duct cases, ctest 2/2).
-- [ ] Capability / version negotiation in the handshake.
+- [x] Capability / version negotiation in the handshake. Evidence: <commit>; tcp handshake version negotiation + post-handshake echo test green (40 duct cases, ctest 2/2).
 
 ## QoS and backpressure
 

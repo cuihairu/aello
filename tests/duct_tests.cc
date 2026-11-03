@@ -1620,6 +1620,53 @@ static void test_qos_rate_limit_paces_delivery() {
   pipe.close();
 }
 
+static void test_tcp_handshake_negotiates_version() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(500);
+  auto st = c.value()->send(duct::Message::from_string("after-handshake"), send_opt);
+  EXPECT_TRUE(st.ok());
+
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::milliseconds(500);
+  auto echoed = c.value()->recv(recv_opt);
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().as_string_view(), "after-handshake");
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
 }  // namespace
 
 int main() {
@@ -1661,6 +1708,7 @@ int main() {
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_qos_rate_limit_paces_delivery();
+  test_tcp_handshake_negotiates_version();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

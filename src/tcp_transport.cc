@@ -53,16 +53,37 @@ static void close_socket(wire::SocketHandle fd) {
 
 class TcpPipe final : public Pipe {
  public:
-  explicit TcpPipe(wire::SocketHandle fd) : fd_(fd) {}
+  // handshake_ready: true when the server side already completed negotiation in
+  // accept(). The client side performs it lazily on the first send/recv so a
+  // blocking dial() does not deadlock before the peer calls accept().
+  TcpPipe(wire::SocketHandle fd, bool handshake_ready = true)
+      : fd_(fd), handshake_ready_(handshake_ready) {
+    // Send the client's handshake eagerly (write-only, fire-and-forget). The
+    // peer's accept() reads it whenever it runs, so this never deadlocks even
+    // when accept() is called after dial() returns.
+    if (!handshake_ready_) {
+      auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
+      if (!hs.ok()) {
+        close_socket(fd_);
+        fd_ = wire::kInvalidSocket;
+      } else {
+        handshake_ready_ = true;
+      }
+    }
+  }
   ~TcpPipe() override { close(); }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
     if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
+    auto hs = ensure_handshake();
+    if (!hs.ok()) return hs;
     return wire::write_frame(fd_, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
     if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
+    auto hs = ensure_handshake();
+    if (!hs.ok()) return hs.status();
     auto r = wire::read_frame_with_flags(fd_, opt.timeout);
     if (!r.ok()) return r.status();
     if (opt.channel_id != 0 &&
@@ -81,7 +102,20 @@ class TcpPipe final : public Pipe {
   }
 
  private:
+  Result<void> ensure_handshake() {
+    if (handshake_ready_) return {};
+    auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
+    if (!hs.ok()) {
+      close_socket(fd_);
+      fd_ = wire::kInvalidSocket;
+      return hs;
+    }
+    handshake_ready_ = true;
+    return {};
+  }
+
   wire::SocketHandle fd_ = wire::kInvalidSocket;
+  bool handshake_ready_ = true;
 };
 
 class TcpListener final : public Listener {
@@ -100,7 +134,12 @@ class TcpListener final : public Listener {
     if (cfd == wire::kInvalidSocket) {
       return Status::io_error("accept() failed");
     }
-    return std::unique_ptr<Pipe>(new TcpPipe(cfd));
+    auto hs = wire::handshake_server(cfd, /*server_capabilities=*/0);
+    if (!hs.ok()) {
+      close_socket(cfd);
+      return hs.status();
+    }
+    return std::unique_ptr<Pipe>(new TcpPipe(cfd, /*handshake_ready=*/true));
   }
 
   Result<std::string> local_address() const override {
@@ -337,7 +376,7 @@ Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions
   }
   auto fd = connect_tcp(addr.host, addr.port, opt.timeout);
   if (!fd.ok()) return fd.status();
-  return std::unique_ptr<Pipe>(new TcpPipe(fd.value()));
+  return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/false));
 }
 
 }  // namespace duct

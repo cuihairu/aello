@@ -379,4 +379,43 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
   }
 }
 
+namespace {
+
+constexpr std::uint8_t kHandshakeKind = 0x01;
+constexpr std::size_t kHandshakeLen = 5;
+
+}  // namespace
+
+Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+                              std::chrono::milliseconds timeout) {
+  std::uint8_t payload[kHandshakeLen] = {};
+  payload[0] = kProtocolVersion;
+  std::memcpy(payload + 1, &capabilities, sizeof(capabilities));
+  // Fire-and-forget: write the request so a dial() that returns before the peer
+  // calls accept() cannot deadlock. The server validates the version and
+  // closes the connection on mismatch, so no synchronous reply is needed.
+  return write_frame(fd, Message::from_bytes(payload, sizeof(payload)),
+                     to_u32(FrameFlags::kCtrl), timeout);
+}
+
+Result<std::uint32_t> handshake_server(SocketHandle fd, std::uint32_t server_capabilities,
+                                       std::chrono::milliseconds timeout) {
+  (void)server_capabilities;
+  auto r = read_frame_with_flags(fd, timeout);
+  if (!r.ok()) return r.status();
+  const auto& sv = r.value().message.as_string_view();
+  if (sv.size() != kHandshakeLen) {
+    return Status::protocol_error("handshake length mismatch");
+  }
+  if (static_cast<std::uint8_t>(sv[0]) != kProtocolVersion) {
+    return Status::protocol_error("unsupported protocol version");
+  }
+  std::uint32_t client_caps = 0;
+  std::memcpy(&client_caps, sv.data() + 1, sizeof(client_caps));
+  std::uint8_t reply[kHandshakeLen] = {};
+  reply[0] = kProtocolVersion;
+  std::memcpy(reply + 1, &server_capabilities, sizeof(server_capabilities));
+  return client_caps;
+}
+
 }  // namespace duct::wire

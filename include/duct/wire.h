@@ -58,5 +58,15 @@ Result<FrameMessage> read_frame_with_flags(
     SocketHandle fd,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
+// Capability/version negotiation. The client sends its capabilities; the server
+// validates the protocol version and replies with its own. Payload layout:
+//   [0..1) version (u8)
+//   [1..5) capability bitmask (u32 LE)
+Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+                              std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+Result<std::uint32_t> handshake_server(
+    SocketHandle fd, std::uint32_t server_capabilities,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+
 }  // namespace duct::wire
 
