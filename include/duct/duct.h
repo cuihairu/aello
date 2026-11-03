@@ -10,6 +10,7 @@
 #include "duct/address.h"
 #include "duct/message.h"
 #include "duct/status.h"
+#include "duct/wire.h"
 
 namespace duct {
 
@@ -116,6 +117,14 @@ class Pipe {
   virtual ~Pipe() = default;
   virtual Result<void> send(const Message& msg, const SendOptions& opt) = 0;
   virtual Result<Message> recv(const RecvOptions& opt) = 0;
+  // Reads a frame together with its wire flags. Transports that carry a channel
+  // id on the wire (tcp/uds) return the real flags; others return flags == 0.
+  // The default delegates to recv(), so filtering wrappers keep working.
+  virtual Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) {
+    auto r = recv(opt);
+    if (!r.ok()) return r.status();
+    return wire::FrameMessage{std::move(r.value()), 0};
+  }
   virtual void close() = 0;
   // Returns the peer's credential (uid/gid/pid) when the transport supports it.
   // Default: not supported. TCP/SHM have no OS peer-identity mechanism yet.

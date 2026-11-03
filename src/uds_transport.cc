@@ -42,16 +42,17 @@ class UdsPipe final : public Pipe {
     return wire::write_frame(fd_, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
   }
 
-  Result<Message> recv(const RecvOptions& opt) override {
+  Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
     if (fd_ < 0) return Status::closed("pipe closed");
-
-    // Wait for readable if timeout is specified.
     if (opt.timeout.count() > 0) {
       auto st = socket_utils::wait_readable(fd_, opt.timeout);
       if (!st.ok()) return st.status();
     }
+    return wire::read_frame_with_flags(fd_, opt.timeout);
+  }
 
-    auto r = wire::read_frame_with_flags(fd_, opt.timeout);
+  Result<Message> recv(const RecvOptions& opt) override {
+    auto r = recv_frame(opt);
     if (!r.ok()) return r.status();
     if (opt.channel_id != 0 &&
         flags_to_channel_id(r.value().flags) != opt.channel_id) {

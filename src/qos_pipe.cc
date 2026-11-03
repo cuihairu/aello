@@ -133,6 +133,7 @@ void QosPipe::send_worker() {
     // must not block concurrent send() calls behind it.
     SendOptions opt;
     opt.timeout = std::chrono::milliseconds(100);
+    opt.channel_id = msg_to_send.channel_id;
     auto result = underlying_->send(msg_to_send.message, opt);
 
     if (!result.ok()) {
@@ -261,22 +262,35 @@ Result<Message> QosPipe::recv(const RecvOptions& opt) {
     return underlying_->recv(opt);
   }
   std::unique_lock<std::mutex> lock(recv_mutex_);
-  auto pred = [this] {
-    return !running_ || !recv_queue_.empty() || recv_errored_.load();
+  auto pred = [this, &opt] {
+    if (!running_ || recv_errored_.load()) return true;
+    if (opt.channel_id == 0) return !recv_queue_.empty();
+    return std::any_of(recv_queue_.begin(), recv_queue_.end(),
+                       [&](const QueuedMessage& queued) {
+                         return queued.channel_id == opt.channel_id;
+                       });
   };
   if (opt.timeout.count() > 0) {
-    if (!recv_cv_.wait_for(lock, opt.timeout, pred)) {
+    const auto deadline = std::chrono::steady_clock::now() + opt.timeout;
+    if (!recv_cv_.wait_until(lock, deadline, pred)) {
       return Status::timeout("recv timed out");
     }
   } else {
     recv_cv_.wait(lock, pred);
   }
 
-  if (!recv_queue_.empty()) {
-    Message msg = std::move(recv_queue_.front().message);
+  auto match = recv_queue_.begin();
+  if (opt.channel_id != 0) {
+    match = std::find_if(recv_queue_.begin(), recv_queue_.end(),
+                         [&](const QueuedMessage& queued) {
+                           return queued.channel_id == opt.channel_id;
+                         });
+  }
+  if (match != recv_queue_.end()) {
+    Message msg = std::move(match->message);
     recv_bytes_ -= msg.size();
     recv_count_ -= 1;
-    recv_queue_.pop_front();
+    recv_queue_.erase(match);
     // The recv watermark gates the *enqueue* side (recv_worker); draining a
     // message frees space and lets the worker resume pulling from the transport.
     recv_cv_.notify_all();
@@ -308,7 +322,7 @@ void QosPipe::recv_worker() {
     RecvOptions opt;
     // Bound the transport recv so close() can interrupt this worker promptly.
     opt.timeout = std::chrono::milliseconds(100);
-    auto result = underlying_->recv(opt);
+    auto result = underlying_->recv_frame(opt);
 
     if (!result.ok()) {
       const StatusCode code = result.status().code();
@@ -335,8 +349,9 @@ void QosPipe::recv_worker() {
     {
       std::lock_guard<std::mutex> lock(recv_mutex_);
       if (!running_) return;
-      recv_queue_.emplace_back(result.value());
-      recv_bytes_ += result.value().size();
+      const auto channel_id = flags_to_channel_id(result.value().flags);
+      recv_queue_.emplace_back(result.value().message, 0, channel_id);
+      recv_bytes_ += result.value().message.size();
       recv_count_ += 1;
       recv_cv_.notify_all();
     }

@@ -1877,6 +1877,75 @@ static void test_qos_rate_limit_paces_delivery() {
   pipe.close();
 }
 
+static void test_qos_channel_multiplexing() {
+  // A QoS-wrapped tcp pipe must preserve channel_id end-to-end, matching the
+  // direct tcp/uds behavior: send on a channel, receive on that same channel,
+  // and a different channel must not consume it.
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    for (;;) {
+      auto msg = p.value()->recv(opt);
+      if (!msg.ok()) return msg.status();
+      if (msg.value().as_string_view() == "quit") return {};
+      duct::SendOptions send_opt;
+      send_opt.channel_id = 7;
+      auto st = p.value()->send(msg.value(), send_opt);
+      if (!st.ok()) return st.status();
+    }
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = true;
+  dial_opt.qos.snd_hwm_bytes = 1024 * 1024;
+  dial_opt.qos.rcv_hwm_bytes = 1024 * 1024;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(500);
+  send_opt.channel_id = 7;
+  EXPECT_TRUE(c.value()->send(duct::Message::from_string("ch-7"), send_opt).ok());
+
+  // A recv for a different channel must not steal the ch-7 frame.
+  duct::RecvOptions wrong;
+  wrong.timeout = std::chrono::milliseconds(200);
+  wrong.channel_id = 8;
+  auto got = c.value()->recv(wrong);
+  EXPECT_TRUE(!got.ok());
+  EXPECT_EQ(got.status().code(), duct::StatusCode::kTimeout);
+
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::milliseconds(500);
+  recv_opt.channel_id = 7;
+  auto echoed = c.value()->recv(recv_opt);
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().as_string_view(), "ch-7");
+  }
+
+  EXPECT_TRUE(c.value()->send(duct::Message::from_string("quit"), {}).ok());
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  c.value()->close();
+  lis_r.value()->close();
+}
+
 static void test_tcp_handshake_negotiates_version() {
   auto lis_r = duct::listen("tcp://127.0.0.1:0");
   EXPECT_TRUE(lis_r.ok());
@@ -2423,6 +2492,7 @@ int main() {
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_qos_rate_limit_paces_delivery();
+  test_qos_channel_multiplexing();
   test_tcp_handshake_negotiates_version();
   test_qos_item_count_cap();
   test_qos_failfast_returns_queue_full();
