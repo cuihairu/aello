@@ -2,6 +2,7 @@
 #include "duct/logging.h"
 #include "duct/protocol.h"
 #include "duct/qos_pipe.h"
+#include "duct/rpc.h"
 #include "duct/wire.h"
 
 #include <algorithm>
@@ -2037,14 +2038,16 @@ static void test_multi_process_kill9_restart() {
       EXPECT_TRUE(echoed.ok());
       if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "ping-1");
     }
-    c.value()->close();
   }
 
-  // Kill the server with SIGKILL and reap it.
+  // Kill the server with SIGKILL while the connection is still alive so the
+  // child is blocked in recv and dies by signal deterministically. Then close
+  // the parent pipe (the child is already gone; no EOF race).
   EXPECT_TRUE(::kill(child, SIGKILL) == 0);
   int status = 0;
   EXPECT_TRUE(::waitpid(child, &status, 0) == child);
   EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  if (c.ok()) c.value()->close();
 
   // A fresh dial after restart works: start a second child on a new port.
   auto lis2_r = duct::listen("tcp://127.0.0.1:0");
@@ -2080,12 +2083,123 @@ static void test_multi_process_kill9_restart() {
       EXPECT_TRUE(echoed.ok());
       if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "ping-2");
     }
-    c2.value()->close();
   }
   EXPECT_TRUE(::kill(child2, SIGKILL) == 0);
   EXPECT_TRUE(::waitpid(child2, &status, 0) == child2);
+  if (c2.ok()) c2.value()->close();
   lis2_r.value()->close();
 #endif
+}
+
+static void test_rpc_request_correlation() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // Echo server: returns the framed request verbatim, preserving the request id.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < 3; ++i) {
+      auto msg = p.value()->recv({});
+      if (!msg.ok()) return msg.status();
+      auto st = p.value()->send(msg.value(), {});
+      if (!st.ok()) return st;
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto pipe = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(pipe.ok());
+  if (!pipe.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  duct::rpc::Client client(std::move(pipe.value()));
+
+  // Three concurrent correlated calls; each must get its own response.
+  std::vector<std::future<duct::Result<duct::Message>>> calls;
+  for (int i = 0; i < 3; ++i) {
+    calls.emplace_back(std::async(std::launch::async, [&, i] {
+      return client.call(duct::Message::from_string("req-" + std::to_string(i)),
+                         std::chrono::milliseconds(2000));
+    }));
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    auto r = calls[i].get();
+    EXPECT_TRUE(r.ok());
+    if (r.ok()) {
+      EXPECT_EQ(r.value().as_string_view(), "req-" + std::to_string(i));
+    }
+  }
+
+  client.close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
+static void test_rpc_request_timeout() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // Server accepts but never responds, so the call times out.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::RecvOptions ropt;
+    ropt.timeout = std::chrono::milliseconds(200);
+    auto msg = p.value()->recv(ropt);
+    (void)msg;
+    // Hang without replying so the client's call times out.
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto pipe = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(pipe.ok());
+  if (!pipe.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  duct::rpc::Client client(std::move(pipe.value()));
+  auto r = client.call(duct::Message::from_string("req-timeout"),
+                       std::chrono::milliseconds(150));
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kTimeout);
+  }
+
+  client.close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
 }
 
 }  // namespace
@@ -2138,6 +2252,8 @@ int main() {
   test_qos_drop_old_evicts_oldest_queued();
   test_concurrent_send_recv_channels();
   test_multi_process_kill9_restart();
+  test_rpc_request_correlation();
+  test_rpc_request_timeout();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

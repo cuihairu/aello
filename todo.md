@@ -53,7 +53,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## Deferred features
 
-- [ ] RPC request correlation, timeout, and cancellation.
+- [x] RPC request correlation, timeout, and cancellation. Evidence: commit; include/duct/rpc.h adds a correlated Client (u32 id frame + dispatch thread), concurrent calls matched by id, kTimeout/kCancelled status; tests green (50 duct cases, ctest 3/3, 15x stress).
 - [ ] Pub/sub with multiple subscribers.
 - [ ] Async/event-loop API (async.h is on the design audit delete list; not part of the library).
 - [ ] TLS / mTLS for tcp, peer credential checks for uds.
