@@ -1171,6 +1171,7 @@ static void test_qos_delivery_under_hwm() {
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = true;
   dial_opt.qos.snd_hwm_bytes = 4 * 1024;  // ~4 x 1KiB messages, forces HWM quickly.
   dial_opt.qos.rcv_hwm_bytes = 0;
   auto c = duct::dial("shm://duct_testqos_hwm", dial_opt);
@@ -1222,6 +1223,7 @@ static void test_qos_close_under_full_ring() {
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
   duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = true;
   dial_opt.qos.snd_hwm_bytes = 4 * 1024 * 1024;  // default-ish; wrap in QosPipe
   dial_opt.qos.rcv_hwm_bytes = 0;
   auto c = duct::dial("shm://duct_testqos_close", dial_opt);
@@ -1667,6 +1669,80 @@ static void test_tcp_handshake_negotiates_version() {
   lis_r.value()->close();
 }
 
+static void test_qos_item_count_cap() {
+  auto owned = std::make_unique<SlowTimeoutPipe>();
+  SlowTimeoutPipe* transport = owned.get();
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 0;    // No byte limit; count only.
+  qos.snd_hwm_count = 2;
+  qos.backpressure = duct::BackpressurePolicy::kBlock;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  // First send is picked up by the worker and held in-flight for 300ms, so it
+  // is not counted against the queue watermark. Pin it in-flight so the
+  // following two sends fill the queue deterministically.
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(500)));
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
+  // Queue is now full (count cap = 2); the in-flight message is excluded.
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("c"), {}).ok());
+  // Fourth send must block (count full) until close() aborts it.
+  auto fourth = std::async(std::launch::async, [&] {
+    duct::SendOptions opt;
+    opt.timeout = std::chrono::milliseconds(1000);
+    return pipe.send(duct::Message::from_string("d"), opt);
+  });
+  EXPECT_TRUE(fourth.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready);
+  pipe.close();
+  EXPECT_TRUE(fourth.wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  if (fourth.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    auto r = fourth.get();
+    EXPECT_TRUE(!r.ok());
+  }
+}
+
+static void test_qos_failfast_returns_queue_full() {
+  auto owned = std::make_unique<SlowTimeoutPipe>();
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 3;
+  qos.backpressure = duct::BackpressurePolicy::kFailFast;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("b"), {}).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("c"), {}).ok());
+  auto r = pipe.send(duct::Message::from_string("d"), {});
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kQueueFull);
+  }
+  pipe.close();
+}
+
+static void test_qos_dial_opt_in_disabled_by_default() {
+  // With qos.enabled == false (default), dial() returns the raw transport even
+  // though the default snd_hwm_bytes is non-zero.
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  duct::DialOptions dial_opt;  // qos.enabled defaults false
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (c.ok()) {
+    duct::SendOptions send_opt;
+    send_opt.timeout = std::chrono::milliseconds(200);
+    auto st = c.value()->send(duct::Message::from_string("raw"), send_opt);
+    // Raw transport: send succeeds (QoS off) without a QosPipe wrapper.
+    EXPECT_TRUE(st.ok());
+    c.value()->close();
+  }
+  lis_r.value()->close();
+}
+
 }  // namespace
 
 int main() {
@@ -1709,6 +1785,9 @@ int main() {
   test_tcp_channel_multiplexing();
   test_qos_rate_limit_paces_delivery();
   test_tcp_handshake_negotiates_version();
+  test_qos_item_count_cap();
+  test_qos_failfast_returns_queue_full();
+  test_qos_dial_opt_in_disabled_by_default();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

@@ -54,10 +54,16 @@ enum class ConnectionState {
 using ConnectionCallback = std::function<void(ConnectionState, const std::string& reason)>;
 
 struct QosOptions {
+  // Explicit opt-in for the QoS wrapper. When false, dial() returns the raw
+  // transport pipe even if other QoS fields are set.
+  bool enabled = false;
+
   // Bytes are more stable than msg-count when payload sizes vary.
   // Zero disables the byte watermark (unlimited queue).
   std::size_t snd_hwm_bytes = 4 * 1024 * 1024;
   std::size_t rcv_hwm_bytes = 4 * 1024 * 1024;
+  // Item-count cap on the send queue; zero disables it.
+  std::size_t snd_hwm_count = 0;
   BackpressurePolicy backpressure = BackpressurePolicy::kBlock;
 
   // Per-message TTL; zero means disabled.

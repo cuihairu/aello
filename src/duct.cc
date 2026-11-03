@@ -91,8 +91,8 @@ Result<std::unique_ptr<Pipe>> dial_impl(const std::string& address, const DialOp
     return Status::not_supported("dial scheme not supported yet: " + a.scheme_text);
   }
 
-  // Apply QoS wrapper if any QoS options are configured.
-  if (opt.qos.snd_hwm_bytes != 0 || opt.qos.backpressure != BackpressurePolicy::kBlock) {
+  // Apply the QoS wrapper only when explicitly enabled.
+  if (opt.qos.enabled) {
     auto qos_pipe = std::make_unique<QosPipe>(std::move(base_pipe), opt.qos);
     return std::unique_ptr<Pipe>(std::move(qos_pipe));
   }

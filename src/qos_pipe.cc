@@ -12,7 +12,9 @@ QosPipe::QosPipe(std::unique_ptr<Pipe> underlying, const QosOptions& qos)
     : underlying_(std::move(underlying)), qos_(qos) {
   running_ = true;
   send_thread_ = std::thread(&QosPipe::send_worker, this);
-  recv_thread_ = std::thread(&QosPipe::recv_worker, this);
+  if (qos_.rcv_hwm_bytes != 0) {
+    recv_thread_ = std::thread(&QosPipe::recv_worker, this);
+  }
 }
 
 QosPipe::~QosPipe() {
@@ -23,6 +25,8 @@ QosPipe::~QosPipe() {
   if (recv_thread_.joinable()) {
     recv_thread_.join();
   }
+  // No recv worker: recv() passes through to the underlying transport.
+  return;
 }
 
 void QosPipe::send_worker() {
@@ -183,11 +187,16 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
     return Status::closed("pipe closed");
   }
 
-  // Handle backpressure policies. A zero watermark means unlimited.
-  if (qos_.snd_hwm_bytes != 0 && send_bytes_.load() >= qos_.snd_hwm_bytes) {
+  // Handle backpressure policies. A zero watermark means unlimited. Both the
+  // byte watermark and the item-count cap gate enqueue.
+  const bool byte_full = qos_.snd_hwm_bytes != 0 &&
+                         send_bytes_.load() >= qos_.snd_hwm_bytes;
+  const bool count_full = qos_.snd_hwm_count != 0 &&
+                          send_count_.load() >= qos_.snd_hwm_count;
+  if (byte_full || count_full) {
     switch (qos_.backpressure) {
       case BackpressurePolicy::kFailFast:
-        return Status::io_error("send queue at high water mark (fail fast)");
+        return Status::queue_full("send queue at high water mark (fail fast)");
 
       case BackpressurePolicy::kDropNew:
         // Drop the new message
@@ -208,18 +217,27 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
         // immediately and report a spurious timeout under backpressure.
         if (opt.timeout.count() > 0) {
           send_cv_.wait_for(lock, opt.timeout, [this] {
-            return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
+            return !running_ ||
+                   ((qos_.snd_hwm_bytes == 0 ||
+                     send_bytes_.load() < qos_.snd_hwm_bytes) &&
+                    (qos_.snd_hwm_count == 0 ||
+                     send_count_.load() < qos_.snd_hwm_count));
           });
         } else {
           send_cv_.wait(lock, [this] {
-            return send_bytes_.load() < qos_.snd_hwm_bytes || !running_;
+            return !running_ ||
+                   ((qos_.snd_hwm_bytes == 0 ||
+                     send_bytes_.load() < qos_.snd_hwm_bytes) &&
+                    (qos_.snd_hwm_count == 0 ||
+                     send_count_.load() < qos_.snd_hwm_count));
           });
         }
         if (!running_) {
           return Status::closed("pipe closed");
         }
-        if (send_bytes_.load() >= qos_.snd_hwm_bytes) {
-          return Status::timeout("send queue full (timeout)");
+        if ((qos_.snd_hwm_bytes != 0 && send_bytes_.load() >= qos_.snd_hwm_bytes) ||
+            (qos_.snd_hwm_count != 0 && send_count_.load() >= qos_.snd_hwm_count)) {
+          return Status::queue_full("send queue full");
         }
         break;
     }
@@ -237,6 +255,11 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
 }
 
 Result<Message> QosPipe::recv(const RecvOptions& opt) {
+  // Without a recv worker (rcv_hwm_bytes == 0) recv passes through to the
+  // underlying transport, preserving the pre-QoS-queue behavior.
+  if (qos_.rcv_hwm_bytes == 0) {
+    return underlying_->recv(opt);
+  }
   std::unique_lock<std::mutex> lock(recv_mutex_);
   auto pred = [this] {
     return !running_ || !recv_queue_.empty() || recv_errored_.load();
@@ -289,6 +312,7 @@ void QosPipe::recv_worker() {
 
     if (!result.ok()) {
       const StatusCode code = result.status().code();
+      if (code == StatusCode::kTimeout) continue;
       if (code == StatusCode::kClosed || code == StatusCode::kIoError ||
           code == StatusCode::kProtocolError) {
         {
@@ -299,8 +323,6 @@ void QosPipe::recv_worker() {
         }
         return;
       }
-      // kTimeout is transient: keep pulling. Other statuses are surfaced once.
-      if (code == StatusCode::kTimeout) continue;
       {
         std::lock_guard<std::mutex> lock(recv_mutex_);
         recv_errored_ = true;

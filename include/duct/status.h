@@ -15,6 +15,7 @@ enum class StatusCode {
   kTimeout,
   kClosed,
   kProtocolError,
+  kQueueFull,
 };
 
 /**
@@ -29,6 +30,7 @@ constexpr std::string_view to_string(StatusCode code) {
     case StatusCode::kTimeout:        return "Timeout";
     case StatusCode::kClosed:         return "Closed";
     case StatusCode::kProtocolError:  return "Protocol error";
+    case StatusCode::kQueueFull:      return "Queue full";
     default:                          return "Unknown";
   }
 }
@@ -71,6 +73,7 @@ class Status {
   static Status timeout(std::string m) { return Status(StatusCode::kTimeout, std::move(m)); }
   static Status closed(std::string m) { return Status(StatusCode::kClosed, std::move(m)); }
   static Status protocol_error(std::string m) { return Status(StatusCode::kProtocolError, std::move(m)); }
+  static Status queue_full(std::string m) { return Status(StatusCode::kQueueFull, std::move(m)); }
 
   bool ok() const { return code_ == StatusCode::kOk; }
   explicit operator bool() const { return ok(); }
