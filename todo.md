@@ -23,9 +23,9 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Wire `uds://` into dial/listen (src/uds_transport.cc implemented but uncompiled and undispatched). Evidence: 5ee7c3a; uds echo test green (ctest 1/1).
 - [x] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled). Evidence: 8f9152c; reconnect connect/echo and attempt-exhaustion tests green (31 duct cases, ctest 2/2).
 - [x] Wire `on_state_change` connection callback. Evidence: 8f9152c; reconnect callback observes kConnected and reconnects, 10/10 stress runs green.
-- [ ] Implement recv-side watermarks (QosPipe recv currently passes through).
-- [ ] Implement `rcv_hwm_bytes` and `linger` consumers (declared, unused).
-- [ ] Add recv-side QoS queue and background recv worker.
+- [x] Implement recv-side watermarks (QosPipe recv currently passes through). Evidence: <commit>; recv watermark + FIFO + exhaustion test green (33 duct cases, ctest 2/2).
+- [x] Implement `rcv_hwm_bytes` and `linger` consumers (declared, unused). Evidence: <commit>; linger drains in-flight send before close test green (33 duct cases, ctest 2/2).
+- [x] Add recv-side QoS queue and background recv worker. Evidence: <commit>; SourcePipe drains into bounded queue, FIFO order, close test green (33 duct cases, ctest 2/2).
 - [x] Compile `socket_utils.cc` when UDS is wired. Evidence: 5ee7c3a; already in CMake source list, now referenced by uds_transport.cc.
 
 ## Protocol

@@ -126,6 +126,39 @@ class SlowTimeoutPipe final : public duct::Pipe {
   bool in_send_ = false;
 };
 
+// Test double that produces a bounded stream of messages on recv, then reports
+// kClosed. Lets the QoS recv worker drain into its queue.
+class SourcePipe final : public duct::Pipe {
+ public:
+  explicit SourcePipe(int count) : remaining_(count) {}
+
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    return duct::Status::not_supported("no send");
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (remaining_ <= 0) return duct::Status::closed("source exhausted");
+    --remaining_;
+    return duct::Message::from_string(std::to_string(remaining_));
+  }
+
+  void close() override {
+    std::lock_guard<std::mutex> lock(mu_);
+    closed_ = true;
+  }
+
+  bool is_closed() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return closed_;
+  }
+
+ private:
+  mutable std::mutex mu_;
+  int remaining_;
+  bool closed_ = false;
+};
+
 static void test_address_parse() {
   {
     auto a = duct::Address::parse("127.0.0.1:1234");
@@ -1345,6 +1378,67 @@ static void test_reconnect_dial_fails_after_attempts() {
   c.value()->close();
 }
 
+static void test_qos_recv_watermark_and_worker() {
+  auto owned = std::make_unique<SourcePipe>(8);
+  SourcePipe* source = owned.get();
+
+  duct::QosOptions qos;
+  qos.rcv_hwm_bytes = 2;  // Two 1-byte messages at a time.
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  // The recv worker should pull up to the watermark and then pause. Recv must
+  // drain the queued messages in FIFO order and not block on the transport.
+  for (int i = 7; i >= 0; --i) {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    auto r = pipe.recv(opt);
+    EXPECT_TRUE(r.ok());
+    if (!r.ok()) break;
+    EXPECT_EQ(r.value().as_string_view(), std::to_string(i));
+  }
+
+  // After the source is exhausted, recv should surface kClosed once drained.
+  duct::RecvOptions opt;
+  opt.timeout = std::chrono::milliseconds(500);
+  auto closed_result = pipe.recv(opt);
+  EXPECT_TRUE(!closed_result.ok());
+  if (!closed_result.ok()) {
+    EXPECT_EQ(closed_result.status().code(), duct::StatusCode::kClosed);
+  }
+  EXPECT_TRUE(source->is_closed() == false);
+  pipe.close();
+  EXPECT_TRUE(source->is_closed() == true);
+}
+
+static void test_qos_linger_drains_before_close() {
+  auto owned = std::make_unique<SlowTimeoutPipe>();
+  SlowTimeoutPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 1024;
+  qos.linger = std::chrono::milliseconds(300);
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  // Queue one message; the worker starts sending it (which takes ~300 ms).
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("a"), {}).ok());
+  EXPECT_TRUE(transport->wait_until_send_started(std::chrono::milliseconds(1000)));
+
+  // close() must wait for the in-flight send to finish (linger), not cancel it.
+  auto closed = std::promise<void>();
+  auto closed_fut = closed.get_future();
+  std::thread closer([&] {
+    pipe.close();
+    closed.set_value();
+  });
+  auto cf = closed_fut.wait_for(std::chrono::seconds(2));
+  EXPECT_TRUE(cf == std::future_status::ready);
+  if (cf != std::future_status::ready) {
+    closer.detach();
+  } else {
+    closer.join();
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1379,6 +1473,8 @@ int main() {
   test_qos_close_under_full_ring();
   test_reconnect_dial_connects_and_echoes();
   test_reconnect_dial_fails_after_attempts();
+  test_qos_recv_watermark_and_worker();
+  test_qos_linger_drains_before_close();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

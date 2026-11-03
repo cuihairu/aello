@@ -10,12 +10,16 @@ QosPipe::QosPipe(std::unique_ptr<Pipe> underlying, const QosOptions& qos)
     : underlying_(std::move(underlying)), qos_(qos) {
   running_ = true;
   send_thread_ = std::thread(&QosPipe::send_worker, this);
+  recv_thread_ = std::thread(&QosPipe::recv_worker, this);
 }
 
 QosPipe::~QosPipe() {
   close();
   if (send_thread_.joinable()) {
     send_thread_.join();
+  }
+  if (recv_thread_.joinable()) {
+    recv_thread_.join();
   }
 }
 
@@ -185,20 +189,114 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
 }
 
 Result<Message> QosPipe::recv(const RecvOptions& opt) {
-  return underlying_->recv(opt);
+  std::unique_lock<std::mutex> lock(recv_mutex_);
+  auto pred = [this] {
+    return !running_ || !recv_queue_.empty() || recv_errored_.load();
+  };
+  if (opt.timeout.count() > 0) {
+    if (!recv_cv_.wait_for(lock, opt.timeout, pred)) {
+      return Status::timeout("recv timed out");
+    }
+  } else {
+    recv_cv_.wait(lock, pred);
+  }
+
+  if (!recv_queue_.empty()) {
+    Message msg = std::move(recv_queue_.front().message);
+    recv_bytes_ -= msg.size();
+    recv_count_ -= 1;
+    recv_queue_.pop_front();
+    // The recv watermark gates the *enqueue* side (recv_worker); draining a
+    // message frees space and lets the worker resume pulling from the transport.
+    recv_cv_.notify_all();
+    return msg;
+  }
+
+  if (recv_errored_.load()) {
+    return recv_error_;
+  }
+  if (!running_) {
+    return Status::closed("pipe closed");
+  }
+  return Status::timeout("recv timed out");
+}
+
+void QosPipe::recv_worker() {
+  while (running_) {
+    // Wait for space below the recv watermark. A zero watermark means
+    // unlimited. Never hold the lock while blocking on the transport recv.
+    {
+      std::unique_lock<std::mutex> lock(recv_mutex_);
+      recv_cv_.wait(lock, [this] {
+        return !running_ || qos_.rcv_hwm_bytes == 0 ||
+               recv_bytes_.load() < qos_.rcv_hwm_bytes;
+      });
+      if (!running_) return;
+    }
+
+    RecvOptions opt;
+    // Bound the transport recv so close() can interrupt this worker promptly.
+    opt.timeout = std::chrono::milliseconds(100);
+    auto result = underlying_->recv(opt);
+
+    if (!result.ok()) {
+      const StatusCode code = result.status().code();
+      if (code == StatusCode::kClosed || code == StatusCode::kIoError ||
+          code == StatusCode::kProtocolError) {
+        {
+          std::lock_guard<std::mutex> lock(recv_mutex_);
+          recv_errored_ = true;
+          recv_error_ = result.status();
+          recv_cv_.notify_all();
+        }
+        return;
+      }
+      // kTimeout is transient: keep pulling. Other statuses are surfaced once.
+      if (code == StatusCode::kTimeout) continue;
+      {
+        std::lock_guard<std::mutex> lock(recv_mutex_);
+        recv_errored_ = true;
+        recv_error_ = result.status();
+        recv_cv_.notify_all();
+      }
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(recv_mutex_);
+      if (!running_) return;
+      recv_queue_.emplace_back(result.value());
+      recv_bytes_ += result.value().size();
+      recv_count_ += 1;
+      recv_cv_.notify_all();
+    }
+  }
 }
 
 void QosPipe::close() {
+  // Linger: allow queued outbound messages to drain for up to qos_.linger
+  // before force-closing. Zero means best-effort immediate close.
+  if (qos_.linger.count() > 0) {
+    std::unique_lock<std::mutex> lock(send_mutex_);
+    send_cv_.wait_for(lock, qos_.linger, [this] {
+      return !running_ || send_queue_.empty();
+    });
+  }
+
   {
     std::lock_guard<std::mutex> lock(send_mutex_);
     running_ = false;
   }
   send_cv_.notify_all();
+  recv_cv_.notify_all();
   // Join the worker before closing the underlying transport. The worker's send is
   // bounded (see send_worker), so this cannot hang; joining first avoids closing the
   // transport while a send is still in flight.
   if (send_thread_.joinable()) {
     send_thread_.join();
+  }
+  if (recv_thread_.joinable()) {
+    recv_thread_.join();
   }
   underlying_->close();
 }

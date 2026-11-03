@@ -35,6 +35,8 @@ class QosPipe : public Pipe {
  private:
   // Background thread for processing send queue
   void send_worker();
+  // Background thread for draining the underlying transport into the recv queue.
+  void recv_worker();
 
   std::unique_ptr<Pipe> underlying_;
   QosOptions qos_;
@@ -49,6 +51,20 @@ class QosPipe : public Pipe {
   // Current queue sizes
   std::atomic<size_t> send_bytes_{0};
   std::atomic<size_t> send_count_{0};
+
+  // Recv queue management. recv_worker() drains underlying_->recv() into this
+  // bounded queue so that recv() is a fast, non-blocking (subject to rcv_hwm)
+  // dequeue that the caller controls.
+  std::deque<QueuedMessage> recv_queue_;
+  std::mutex recv_mutex_;
+  std::condition_variable recv_cv_;
+  std::thread recv_thread_;
+  std::atomic<size_t> recv_bytes_{0};
+  std::atomic<size_t> recv_count_{0};
+  // Set by recv_worker when the underlying transport reports a terminal error
+  // (kClosed/kIoError). recv() surfaces it after draining queued messages.
+  std::atomic<bool> recv_errored_{false};
+  Status recv_error_;
 };
 
 }  // namespace duct
