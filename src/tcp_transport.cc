@@ -134,6 +134,17 @@ class TcpListener final : public Listener {
     if (cfd == wire::kInvalidSocket) {
       return Status::io_error("accept() failed");
     }
+    // Disable Nagle on the accepted socket so echo replies are not delayed by
+    // up to 40ms (delayed ACK + Nagle) on every small round-trip. The dial side
+    // already sets TCP_NODELAY; the accept side must match.
+    int one = 1;
+#if defined(_WIN32)
+    SOCKET sock = static_cast<SOCKET>(cfd);
+    (void)::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                       reinterpret_cast<const char*>(&one), static_cast<int>(sizeof(one)));
+#else
+    (void)::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
     auto hs = wire::handshake_server(cfd, /*server_capabilities=*/0);
     if (!hs.ok()) {
       close_socket(cfd);

@@ -74,3 +74,11 @@ if (DUCT_BUILD_TESTS)
   target_link_libraries(async_tests PRIVATE duct)
   add_test(NAME async_tests COMMAND async_tests)
 endif()
+
+option(DUCT_BUILD_BENCH "Build aello benchmarks" ON)
+if (DUCT_BUILD_BENCH AND NOT WIN32)
+  add_executable(aello_bench bench/aello_bench.cc)
+  target_link_libraries(aello_bench PRIVATE duct)
+  # Smoke-test the harness: small message count keeps CI fast.
+  add_test(NAME aello_bench COMMAND aello_bench 200 64)
+endif()
