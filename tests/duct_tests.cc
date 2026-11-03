@@ -1,5 +1,4 @@
 #include "duct/duct.h"
-#include "duct/logging.h"
 #include "duct/protocol.h"
 #include "duct/qos_pipe.h"
 #include "duct/pubsub.h"
@@ -853,28 +852,6 @@ static void test_uds_positive_connect_timeout_is_preserved() {
   for (auto& p : occupied) p->close();
   lis_r.value()->close();
 #endif
-}
-
-static void test_log_stream_survives_logger_replacement() {
-  auto old_logger = std::make_shared<duct::ConsoleLogger>();
-  duct::set_logger(old_logger);
-
-  // Build the stream while `old_logger` is installed, then replace it several
-  // times before the temporary stream destructor logs. The stream must retain
-  // shared ownership of the original logger rather than a dangling reference.
-  {
-    auto stream = DUCT_LOG_STREAM(kInfo);
-    stream << "stream after logger replacement";
-    for (int i = 0; i < 6; ++i) {
-      auto replacement = std::make_shared<duct::ConsoleLogger>();
-      duct::set_logger(replacement);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-  // The stream has been destroyed by the scope exit; the original logger was
-  // replaced six times, which would have been a use-after-free under the old
-  // bounded-retired-window design. Restore the default for subsequent tests.
-  duct::set_logger(std::make_shared<duct::ConsoleLogger>());
 }
 
 static void test_shm_dial_timeout_honored() {
@@ -2777,7 +2754,6 @@ int main() {
   test_uds_dial_rejects_negative_timeout();
   test_uds_listen_rejects_non_socket_path();
   test_uds_positive_connect_timeout_is_preserved();
-  test_log_stream_survives_logger_replacement();
   test_shm_dial_timeout_honored();
   test_dial_rejects_negative_timeout();
   test_wire_clears_send_timeout_for_blocking_write();

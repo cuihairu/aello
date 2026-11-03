@@ -63,7 +63,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## Cleanup (design audit delete/refactor list)
 
-- [ ] Delete or park async.h, utils.h, logging.h, queue.h, convenience.h, raii.h, socket_utils.h, duct_export.h (uncompiled; see docs/design/aello-audit-2026-10-16.md §3).
+- [x] Delete or park async.h, utils.h, logging.h, queue.h, convenience.h, raii.h, socket_utils.h, duct_export.h (uncompiled; see docs/design/aello-audit-2026-10-16.md §3). Evidence: deleted async.h(absent), utils.h, logging.h(+src/logging.cc), queue.h(+src/queue.cc), duct_export.h, examples/utils_example.cc; removed src/logging.cc from CMake; removed test_log_stream_survives_logger_replacement; kept raii.h/socket_utils.h (audit Keep), convenience.h left for Refactor; ctest 3/3 (build & build-asan).
 - [x] Resolve duplicate `QueuedMessage` definition (include/duct/queue.h:16 and include/duct/qos_pipe.h:18). Evidence: 3022436.
 - [x] Fix malformed `DUCT Experimental [[deprecated(...)]]` macro (include/duct/duct_export.h:30). Evidence: 3022436.
 - [ ] Make shm slot parameters configurable (currently hard-coded 64 slots x 64 KiB).

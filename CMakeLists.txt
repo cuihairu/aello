@@ -13,7 +13,6 @@ option(DUCT_BUILD_TESTS "Build duct tests" ON)
 add_library(duct
   src/address.cc
   src/duct.cc
-  src/logging.cc
   src/message.cc
   src/qos_pipe.cc
   src/reconnect_pipe.cc
