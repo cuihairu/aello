@@ -3,6 +3,7 @@
 #include "duct/wire.h"
 
 #include <algorithm>
+#include <iterator>
 
 namespace duct {
 
@@ -66,8 +67,14 @@ void QosPipe::send_worker() {
       // once it reaches snd_hwm_bytes (the worker is the only path that frees bytes).
       // Pop the head before sending so a concurrent send() (kDropOld) or close()
       // cannot race with an in-flight transport send.
-      msg_to_send = std::move(send_queue_.front());
-      send_queue_.pop_front();
+      // Drain by priority: pick the highest-priority message (stable FIFO for
+      // equal priorities). Linear scan keeps the queue small and deterministic.
+      auto best = send_queue_.begin();
+      for (auto it = std::next(send_queue_.begin()); it != send_queue_.end(); ++it) {
+        if (it->priority > best->priority) best = it;
+      }
+      msg_to_send = std::move(*best);
+      send_queue_.erase(best);
       send_bytes_ -= msg_to_send.message.size();
       send_count_ -= 1;
       // Wake a blocked kBlock sender: queue space was just freed.
@@ -176,7 +183,7 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
   }
 
   // Add message to send queue
-  send_queue_.emplace_back(msg);
+  send_queue_.emplace_back(msg, opt.priority, opt.channel_id);
   send_bytes_ += msg.size();
   send_count_ += 1;
 

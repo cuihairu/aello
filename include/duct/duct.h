@@ -79,11 +79,16 @@ struct QosOptions {
 struct SendOptions {
   // If non-zero, send will time out (where supported).
   std::chrono::milliseconds timeout{0};
-  // Reserved for future: priority/channel_id.
+  // Higher values drain first from the QoS send queue. Zero is the default.
+  int priority = 0;
+  // Multiplexing channel id; carried on the wire so the receiver can demux.
+  std::uint32_t channel_id = 0;
 };
 
 struct RecvOptions {
   std::chrono::milliseconds timeout{0};
+  // Demux channel id; zero means accept any channel.
+  std::uint32_t channel_id = 0;
 };
 
 class Pipe {

@@ -31,6 +31,14 @@ enum class FrameFlags : std::uint32_t {
   kFragFinal = 1u << 5,
 };
 
+inline constexpr std::uint32_t channel_id_to_flags(std::uint32_t channel_id) {
+  return (channel_id & 0xFFFFu) << 16;
+}
+
+inline constexpr std::uint32_t flags_to_channel_id(std::uint32_t flags) {
+  return (flags >> 16) & 0xFFFFu;
+}
+
 inline constexpr FrameFlags operator|(FrameFlags a, FrameFlags b) {
   return static_cast<FrameFlags>(static_cast<std::uint32_t>(a) | static_cast<std::uint32_t>(b));
 }

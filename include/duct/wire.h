@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "duct/message.h"
+#include "duct/protocol.h"
 #include "duct/status.h"
 
 namespace duct::wire {
@@ -45,6 +46,17 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
                          std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 Result<Message> read_frame(SocketHandle fd,
                            std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+
+// A frame together with its flags. Used by multiplexing/reliability layers to
+// inspect channel id and control bits without losing them.
+struct FrameMessage {
+  Message message;
+  std::uint32_t flags = 0;
+};
+
+Result<FrameMessage> read_frame_with_flags(
+    SocketHandle fd,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
 }  // namespace duct::wire
 

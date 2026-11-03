@@ -39,7 +39,7 @@ class UdsPipe final : public Pipe {
       if (!st.ok()) return st;
     }
 
-    return wire::write_frame(fd_, msg, /*flags=*/0, opt.timeout);
+    return wire::write_frame(fd_, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
@@ -51,7 +51,13 @@ class UdsPipe final : public Pipe {
       if (!st.ok()) return st.status();
     }
 
-    return wire::read_frame(fd_, opt.timeout);
+    auto r = wire::read_frame_with_flags(fd_, opt.timeout);
+    if (!r.ok()) return r.status();
+    if (opt.channel_id != 0 &&
+        flags_to_channel_id(r.value().flags) != opt.channel_id) {
+      return recv(opt);
+    }
+    return std::move(r.value().message);
   }
 
   void close() override {

@@ -1520,6 +1520,86 @@ static void test_shm_fragmentation_and_reassembly() {
 #endif
 }
 
+static void test_qos_priority_scheduling() {
+  auto owned = std::make_unique<RecordingPipe>();
+  RecordingPipe* transport = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 1024;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  // Queue low-priority first, then high-priority. The worker must drain
+  // high-priority first.
+  duct::SendOptions low;
+  low.priority = 0;
+  duct::SendOptions high;
+  high.priority = 10;
+
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("low-1"), low).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("low-2"), low).ok());
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("high-1"), high).ok());
+
+  EXPECT_TRUE(transport->wait_for_sent("high-1", std::chrono::milliseconds(1000)));
+  EXPECT_TRUE(transport->wait_for_sent("low-1", std::chrono::milliseconds(1000)));
+  EXPECT_TRUE(transport->wait_for_sent("low-2", std::chrono::milliseconds(1000)));
+  pipe.close();
+}
+
+static void test_tcp_channel_multiplexing() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    opt.channel_id = 7;
+    auto msg = p.value()->recv(opt);
+    if (!msg.ok()) return msg.status();
+    duct::SendOptions send_opt;
+    send_opt.channel_id = 7;
+    return p.value()->send(msg.value(), send_opt);
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(500);
+  send_opt.channel_id = 7;
+  auto st = c.value()->send(duct::Message::from_string("channel-7"), send_opt);
+  EXPECT_TRUE(st.ok());
+
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::milliseconds(500);
+  recv_opt.channel_id = 7;
+  auto echoed = c.value()->recv(recv_opt);
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    EXPECT_EQ(echoed.value().as_string_view(), "channel-7");
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
 }  // namespace
 
 int main() {
@@ -1558,6 +1638,8 @@ int main() {
   test_qos_linger_drains_before_close();
   test_wire_fragmentation_and_reassembly();
   test_shm_fragmentation_and_reassembly();
+  test_qos_priority_scheduling();
+  test_tcp_channel_multiplexing();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

@@ -319,10 +319,18 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
 }
 
 Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
+  auto r = read_frame_with_flags(fd, timeout);
+  if (!r.ok()) return r.status();
+  return std::move(r.value().message);
+}
+
+Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
+                                           std::chrono::milliseconds timeout) {
   auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
   if (!timeout_st.ok()) return timeout_st.status();
 
   std::vector<std::uint8_t> assembled;
+  std::uint32_t frame_flags = 0;
   bool first = true;
   for (;;) {
     std::uint8_t hdr[kHeaderLen];
@@ -335,6 +343,7 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
     const std::uint32_t payload_len = decoded.value().payload_len;
     const bool is_frag = (decoded.value().flags & to_u32(FrameFlags::kFrag)) != 0;
     const bool is_final = (decoded.value().flags & to_u32(FrameFlags::kFragFinal)) != 0;
+    frame_flags = decoded.value().flags;
 
     if (first) {
       if (!is_frag) {
@@ -345,7 +354,7 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
           st = read_exact(fd, buf.data(), buf.size(), &payload_started);
           if (!st.ok()) return st.status();
         }
-        return Message::from_bytes(buf.data(), buf.size());
+        return FrameMessage{Message::from_bytes(buf.data(), buf.size()), frame_flags};
       }
       assembled.resize(payload_len);
       if (payload_len != 0) {
@@ -354,7 +363,7 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
         if (!st.ok()) return st.status();
       }
       first = false;
-      if (is_final) return Message::from_bytes(assembled.data(), assembled.size());
+      if (is_final) return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()), frame_flags};
       continue;
     }
 
@@ -366,7 +375,7 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
       st = read_exact(fd, assembled.data() + old_size, payload_len, &payload_started);
       if (!st.ok()) return st.status();
     }
-    if (is_final) return Message::from_bytes(assembled.data(), assembled.size());
+    if (is_final) return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()), frame_flags};
   }
 }
 

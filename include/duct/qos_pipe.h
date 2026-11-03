@@ -18,9 +18,12 @@ namespace duct {
 struct QueuedMessage {
   Message message;
   std::chrono::steady_clock::time_point timestamp;
+  int priority = 0;
+  std::uint32_t channel_id = 0;
 
-  QueuedMessage(const Message& msg)
-    : message(msg), timestamp(std::chrono::steady_clock::now()) {}
+  QueuedMessage(const Message& msg, int prio = 0, std::uint32_t ch = 0)
+    : message(msg), timestamp(std::chrono::steady_clock::now()),
+      priority(prio), channel_id(ch) {}
 };
 
 class QosPipe : public Pipe {

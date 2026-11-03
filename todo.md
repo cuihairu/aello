@@ -31,8 +31,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Protocol
 
 - [x] Fragmentation and reassembly for payloads larger than 64 KiB. Evidence: 8c0b3ee; wire + shm multi-chunk round-trip tests green (36 duct cases, ctest 2/2).
-- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup.
-- [ ] Priority scheduling and channel_id multiplexing.
+- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.
+- [x] Priority scheduling and channel_id multiplexing. Evidence: <commit>; priority drains high-first and channel_id demux round-trip tests green (38 duct cases, ctest 2/2).
 - [ ] Rate limiting (token bucket) per pipe or per socket.
 - [ ] Capability / version negotiation in the handshake.
 
