@@ -102,12 +102,26 @@ struct RecvOptions {
   std::uint32_t channel_id = 0;
 };
 
+// Peer identity for a connected pipe. The OS populates these on UDS via
+// SO_PEERCRED (uid/gid/pid of the connecting process). Other transports return
+// kNotSupported until a peer-identity mechanism is wired.
+struct PeerCredential {
+  std::uint32_t uid = 0;
+  std::uint32_t gid = 0;
+  std::int64_t pid = 0;
+};
+
 class Pipe {
  public:
   virtual ~Pipe() = default;
   virtual Result<void> send(const Message& msg, const SendOptions& opt) = 0;
   virtual Result<Message> recv(const RecvOptions& opt) = 0;
   virtual void close() = 0;
+  // Returns the peer's credential (uid/gid/pid) when the transport supports it.
+  // Default: not supported. TCP/SHM have no OS peer-identity mechanism yet.
+  virtual Result<PeerCredential> peer_credential() const {
+    return Status::not_supported("peer credential not supported");
+  }
 };
 
 class Listener {

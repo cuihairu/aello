@@ -1328,6 +1328,67 @@ static void test_uds_multi_message_echo() {
 #endif
 }
 
+static void test_uds_peer_credential() {
+#if !defined(_WIN32) && defined(SO_PEERCRED)
+  std::string path = "/tmp/duct_uds_cred_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto cred = p.value()->peer_credential();
+    if (!cred.ok()) return cred.status();
+    // The client is our own process; uid/gid/pid must match getuid/getgid/getpid.
+    if (cred.value().uid != ::getuid() || cred.value().gid != ::getgid() ||
+        cred.value().pid != ::getpid()) {
+      return duct::Status::protocol_error("unexpected peer credential");
+    }
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds://" + path, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+  // Client side also exposes the server's credential (same process here).
+  auto cred = c.value()->peer_credential();
+  EXPECT_TRUE(cred.ok());
+  if (cred.ok()) {
+    EXPECT_EQ(cred.value().uid, ::getuid());
+    EXPECT_EQ(cred.value().gid, ::getgid());
+  }
+
+  auto st = c.value()->send(duct::Message::from_string("cred-ping"), {});
+  EXPECT_TRUE(st.ok());
+  if (st.ok()) {
+    auto echoed = c.value()->recv({});
+    EXPECT_TRUE(echoed.ok());
+    if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "cred-ping");
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+#endif
+}
+
 static void test_qos_close_under_full_ring() {
   // Fill the shm ring (server never reads) so the QoS send worker blocks on the
   // transport send. close() must still return promptly: previously it deadlocked on
@@ -2251,6 +2312,7 @@ int main() {
   test_shm_echo_one();
   test_uds_echo_one();
   test_uds_multi_message_echo();
+  test_uds_peer_credential();
   test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();

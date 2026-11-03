@@ -67,6 +67,25 @@ class UdsPipe final : public Pipe {
     }
   }
 
+  Result<PeerCredential> peer_credential() const override {
+    if (fd_ < 0) return Status::closed("pipe closed");
+#if defined(SO_PEERCRED)
+    struct ucred cred {};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(fd_, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+      return Status::io_error("getsockopt(SO_PEERCRED) failed: " +
+                              std::string(std::strerror(errno)));
+    }
+    PeerCredential pc;
+    pc.uid = cred.uid;
+    pc.gid = cred.gid;
+    pc.pid = static_cast<std::int64_t>(cred.pid);
+    return pc;
+#else
+    return Status::not_supported("SO_PEERCRED not available on this platform");
+#endif
+  }
+
  private:
   int fd_ = -1;
 };

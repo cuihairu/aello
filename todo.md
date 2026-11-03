@@ -56,7 +56,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] RPC request correlation, timeout, and cancellation. Evidence: ec2983b; include/duct/rpc.h adds a correlated Client (u32 id frame + dispatch thread), concurrent calls matched by id, kTimeout/kCancelled status; tests green (50 duct cases, ctest 3/3, 15x stress).
 - [x] Pub/sub with multiple subscribers. Evidence: 81b4490; include/duct/pubsub.h adds a topic-filter Broker with per-subscriber prefix filters and unsubscribe-on-destroy; multi-subscriber delivery + unsubscribe test green (51 duct cases, ctest 3/3, 12x stress).
 - [x] Async/event-loop API (async.h is on the design audit delete list; not part of the library). Evidence: d00e310; deleted async.h, tests/async_tests.cc, examples/async_example.cc and the async_tests build target per design audit (aello-audit §7: conflicts with v1 no-general-event-loop direction); remaining ctest 2/2.
-- [ ] TLS / mTLS for tcp, peer credential checks for uds.
+- [x] Peer credential checks for uds (SO_PEERCRED uid/gid/pid, wired via Pipe::peer_credential(), both ends verify own-process identity; test green, 12x stress). Evidence: commit.
+- [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).
 - [ ] Crash recovery for orphaned shm segments.
 - [ ] Install / packaging target (cmake templates unreferenced).
 
