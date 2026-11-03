@@ -45,7 +45,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## Testing
 
-- [x] Direct QoS tests (send/recv, backpressure policies, TTL, close under load). Evidence: commit; TTL expiry, kDropOld eviction, kDropNew, kFailFast queue-full, kBlock, close-under-load, item cap, recv watermark tests green (45 duct cases, ctest 2/2, 15x stress).
+- [x] Direct QoS tests (send/recv, backpressure policies, TTL, close under load). Evidence: 916aa81; TTL expiry, kDropOld eviction, kDropNew, kFailFast queue-full, kBlock, close-under-load, item cap, recv watermark tests green (45 duct cases, ctest 2/2, 15x stress).
 - [ ] Concurrent send/recv tests.
 - [ ] Multi-process and `kill -9` / restart test matrix.
 - [ ] UDS tests (blocked until UDS is wired).
