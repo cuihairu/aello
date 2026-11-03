@@ -25,16 +25,26 @@ namespace duct::pubsub {
 // is a separate dispatch-layer problem) and does not assume SPSC rings.
 class Broker {
  public:
+  ~Broker() {
+    // Invalidate subscriptions before destroying internal state so a
+    // Subscription outliving the Broker cannot call into freed memory.
+    *alive_ = false;
+  }
+
   // Subscriber handle. Destroying it unsubscribes.
   class Subscription {
    public:
-    Subscription(Broker* broker, std::uint64_t id) : broker_(broker), id_(id) {}
-    ~Subscription() { if (broker_) broker_->unsubscribe(id_); }
+    Subscription(Broker* broker, std::shared_ptr<bool> alive, std::uint64_t id)
+        : broker_(broker), alive_(std::move(alive)), id_(id) {}
+    ~Subscription() {
+      if (broker_ && *alive_) broker_->unsubscribe(id_);
+    }
     Subscription(const Subscription&) = delete;
     Subscription& operator=(const Subscription&) = delete;
     std::uint64_t id() const { return id_; }
    private:
     Broker* broker_;
+    std::shared_ptr<bool> alive_;
     std::uint64_t id_;
   };
 
@@ -45,7 +55,7 @@ class Broker {
     std::lock_guard<std::mutex> lock(mu_);
     const std::uint64_t id = next_id_++;
     subs_.push_back({id, std::move(filter), std::move(cb)});
-    return std::make_unique<Subscription>(this, id);
+    return std::make_unique<Subscription>(this, alive_, id);
   }
 
   // Publish a message to all subscribers whose filter is a prefix of `topic`.
@@ -79,6 +89,7 @@ class Broker {
   std::mutex mu_;
   std::vector<Sub> subs_;
   std::uint64_t next_id_ = 1;
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };
 
 }  // namespace duct::pubsub

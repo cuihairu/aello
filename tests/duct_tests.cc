@@ -2631,6 +2631,18 @@ static void test_pubsub_multiple_subscribers() {
   (void)s3;
 }
 
+// A Subscription may outlive its Broker (e.g. a scoped broker used to wire a
+// one-shot dispatch). Destroying the broker first must not leave the later
+// Subscription destructor calling into freed memory.
+static void test_pubsub_subscription_outlives_broker() {
+  std::unique_ptr<duct::pubsub::Broker::Subscription> sub;
+  {
+    duct::pubsub::Broker broker;
+    sub = broker.subscribe("x", [](const std::string&, const duct::Message&) {});
+  }
+  sub.reset();
+}
+
 }  // namespace
 
 int main() {
@@ -2691,6 +2703,7 @@ int main() {
   test_rpc_request_correlation();
   test_rpc_request_timeout();
   test_pubsub_multiple_subscribers();
+  test_pubsub_subscription_outlives_broker();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
