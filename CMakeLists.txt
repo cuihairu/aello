@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(duct LANGUAGES CXX)
+project(duct
+  VERSION 0.1.0
+  DESCRIPTION "Aello: a minimal local IPC messaging runtime"
+  LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 option(DUCT_BUILD_EXAMPLES "Build duct examples" ON)
 option(DUCT_BUILD_TESTS "Build duct tests" ON)
@@ -29,7 +35,15 @@ endif()
 target_compile_features(duct PUBLIC cxx_std_20)
 target_include_directories(duct PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_include_directories(duct PRIVATE
+  ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+
+# Generate the version header so consumers can query the library version.
+configure_file(cmake/duct_version.h.in generated/duct/version.h @ONLY)
+target_sources(duct PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/version.h)
 
 if (MSVC)
   target_compile_options(duct PRIVATE /W4)
@@ -77,3 +91,60 @@ if (DUCT_BUILD_BENCH AND NOT WIN32)
   # Smoke-test the harness: small message count keeps CI fast.
   add_test(NAME aello_bench COMMAND aello_bench 200 64)
 endif()
+
+# ---- Install / packaging ----
+set(DUCT_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/duct")
+
+install(TARGETS duct
+  EXPORT ductTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(DIRECTORY include/duct DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/version.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/duct)
+
+install(EXPORT ductTargets
+  FILE ductTargets.cmake
+  NAMESPACE duct::
+  DESTINATION ${DUCT_INSTALL_CMAKEDIR}
+)
+
+configure_package_config_file(
+  cmake/ductConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/ductConfig.cmake
+  INSTALL_DESTINATION ${DUCT_INSTALL_CMAKEDIR}
+)
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/ductConfigVersion.cmake
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion
+)
+install(FILES
+  ${CMAKE_CURRENT_BINARY_DIR}/ductConfig.cmake
+  ${CMAKE_CURRENT_BINARY_DIR}/ductConfigVersion.cmake
+  DESTINATION ${DUCT_INSTALL_CMAKEDIR}
+)
+
+# pkg-config for non-CMake consumers.
+configure_file(cmake/duct.pc.in ${CMAKE_CURRENT_BINARY_DIR}/duct.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/duct.pc
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Verify the install rules in CI: install to a temp prefix and confirm the
+# package config, version header, and pkg-config file are produced.
+if (DUCT_BUILD_TESTS)
+  add_test(NAME duct_install
+    COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR}
+            --prefix ${CMAKE_BINARY_DIR}/install_prefix)
+endif()
+
+# CPack packages.
+set(CPACK_PACKAGE_NAME "duct")
+set(CPACK_PACKAGE_VENDOR "aello")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_GENERATOR "TGZ")
+set(CPACK_PACKAGE_FILE_NAME "duct-${PROJECT_VERSION}")
+include(CPack)

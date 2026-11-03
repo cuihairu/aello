@@ -59,7 +59,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Peer credential checks for uds (SO_PEERCRED uid/gid/pid, wired via Pipe::peer_credential(), both ends verify own-process identity; test green, 12x stress). Evidence: 8fd33cb.
 - [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).
 - [x] Crash recovery for orphaned shm segments. Evidence: f90c944; shm header records owner PID+magic; shm_listen scans /dev/shm for dead-owner segments and unlinks them + their semaphores; fork/SIGKILL/orphan/reclaim test green (ctest 2/2, 12x stress, no leftover segments).
-- [ ] Install / packaging target (cmake templates unreferenced).
+- [x] Install / packaging target. Evidence: CMake install/export + generated version header + pkg-config + CPack TGZ; `ctest 3/3`; consumer `find_package(duct)` link/run green; external-prefix `pkg-config --cflags --libs duct` green.
 
 ## Cleanup (design audit delete/refactor list)
 
