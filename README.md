@@ -132,7 +132,7 @@ examples/         echo pair + manual transport tools
 docs/design/      analysis, audit, and adoption decisions
 ```
 
-A few headers under `include/duct/` (`async.h`, `utils.h`, `logging.h`, `queue.h`,
+A few headers under `include/duct/` (`utils.h`, `logging.h`, `queue.h`,
 `convenience.h`, `raii.h`, `socket_utils.h`, `duct_export.h`) are not part of the
 built library yet; they are on the design audit's delete/refactor list.
 

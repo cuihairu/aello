@@ -68,11 +68,6 @@ if (DUCT_BUILD_TESTS)
   target_link_libraries(duct_tests PRIVATE duct)
   add_test(NAME duct_tests COMMAND duct_tests)
 
-  add_executable(async_tests
-    tests/async_tests.cc
-  )
-  target_link_libraries(async_tests PRIVATE duct)
-  add_test(NAME async_tests COMMAND async_tests)
 endif()
 
 option(DUCT_BUILD_BENCH "Build aello benchmarks" ON)
