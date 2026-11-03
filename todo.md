@@ -39,9 +39,9 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## QoS and backpressure
 
 - [x] Reject messages above the transport limit synchronously instead of dropping them later. Evidence: 011e118, b0d4f9e.
-- [x] Item-count cap or per-slot charging (QosPipe limits bytes only, not entries). Evidence: commit; send_count cap + test.
-- [x] Distinct queue-full status code (currently borrows kTimeout / kIoError). Evidence: commit; kQueueFull + fail-fast/block test.
-- [x] Make the QoS wrap in dial() an explicit opt-in (currently implicit via non-zero default snd_hwm_bytes). Evidence: commit; QosOptions.enabled + dial test.
+- [x] Item-count cap or per-slot charging (QosPipe limits bytes only, not entries). Evidence: b96fe1d; snd_hwm_count gates enqueue, count cap + blocking test green (41 duct cases, ctest 2/2).
+- [x] Distinct queue-full status code (currently borrows kTimeout / kIoError). Evidence: b96fe1d; kQueueFull + fail-fast/block return test green (41 duct cases, ctest 2/2).
+- [x] Make the QoS wrap in dial() an explicit opt-in (currently implicit via non-zero default snd_hwm_bytes). Evidence: b96fe1d; QosOptions.enabled defaults false, dial returns raw transport test green (41 duct cases, ctest 2/2).
 
 ## Testing
 
