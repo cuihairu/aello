@@ -589,8 +589,9 @@ static void reclaim_orphaned_bus(const std::string& bus_name) {
     if (name.size() < prefix.size() + 8 || name.compare(0, prefix.size(), prefix) != 0) {
       continue;
     }
-    // Only consider shm segments (end with 'm' or the semaphore prefix). The
-    // segment is "<prefix><connid>m"; semaphores are "sem.<prefix><connid><a-d>".
+    // Only consider shm segments (end with 'm'). The segment is
+    // "<prefix><connid>m"; semaphores are "<prefix><connid><a-d>" (glibc
+    // renders POSIX semaphore names in /dev/shm with a "sem." prefix).
     if (name.compare(0, 4, "sem.") == 0) continue;
     if (name.back() != 'm') continue;
 
@@ -615,7 +616,9 @@ static void reclaim_orphaned_bus(const std::string& bus_name) {
     // Owner is gone: unlink the segment and its semaphores.
     ::shm_unlink(seg_name.c_str());
     const std::string conn = name.substr(prefix.size(), name.size() - prefix.size() - 1);
-    const std::string sem_prefix = "/sem.d" + hash8 + conn;
+    // The semaphore names created by make_names() are "/" + prefix + conn + [a-d];
+    // match them exactly instead of the old "/sem.d..." form which never hit.
+    const std::string sem_prefix = "/" + prefix + conn;
     ::sem_unlink((sem_prefix + "a").c_str());
     ::sem_unlink((sem_prefix + "b").c_str());
     ::sem_unlink((sem_prefix + "c").c_str());

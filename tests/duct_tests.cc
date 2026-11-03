@@ -26,6 +26,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1391,6 +1392,25 @@ static void test_uds_peer_credential() {
 
 static void test_shm_crash_recovery_reclaims_orphan() {
 #if !defined(_WIN32)
+  // POSIX semaphore objects appear in /dev/shm with a "sem." prefix; the
+  // shared-memory segment itself appears as "ddfb0e26d<conn>m".
+  const std::string prefix = "ddfb0e26d";
+  auto leftovers = [&prefix]() {
+    std::set<std::string> found;
+    DIR* dir = ::opendir("/dev/shm");
+    if (!dir) return found;
+    while (dirent* ent = ::readdir(dir)) {
+      std::string name = ent->d_name;
+      if (name.rfind(prefix, 0) == 0 || name.rfind("sem." + prefix, 0) == 0) {
+        found.insert("/dev/shm/" + name);
+      }
+    }
+    ::closedir(dir);
+    return found;
+  };
+
+  for (const auto& stale : leftovers()) (void)::unlink(stale.c_str());
+
   int pfd[2];
   EXPECT_TRUE(::pipe(pfd) == 0);
   pid_t listener = ::fork();
@@ -1431,11 +1451,15 @@ static void test_shm_crash_recovery_reclaims_orphan() {
   EXPECT_TRUE(::kill(listener, SIGKILL) == 0);
   EXPECT_TRUE(::waitpid(listener, nullptr, 0) == listener);
 
+  const std::set<std::string> orphaned = leftovers();
+  EXPECT_EQ(orphaned.size(), 5u);
+
   auto lis2 = duct::listen("shm://duct_crashbus");
   EXPECT_TRUE(lis2.ok());
   if (lis2.ok()) {
     lis2.value()->close();
   }
+  EXPECT_EQ(leftovers().size(), 0u);
 #endif
 }
 
