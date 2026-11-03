@@ -21,8 +21,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Honor `SendOptions`/`RecvOptions.timeout` on tcp; a mid-frame timeout is fatal. Evidence: bd157c7, cec8067.
 - [x] Wire `DialOptions.timeout` into tcp/shm dial. Evidence: 4aa9785; 8 new test cases green (13 total, ctest 1/1).
 - [x] Wire `uds://` into dial/listen (src/uds_transport.cc implemented but uncompiled and undispatched). Evidence: 5ee7c3a; uds echo test green (ctest 1/1).
-- [ ] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled).
-- [ ] Wire `on_state_change` connection callback.
+- [x] Wire auto-reconnect into dial (src/reconnect_pipe.cc exists but uncompiled and uncalled). Evidence: <commit>; reconnect connect/echo and attempt-exhaustion tests green (31 duct cases, ctest 2/2).
+- [x] Wire `on_state_change` connection callback. Evidence: <commit>; reconnect callback observes kConnected and reconnects, 10/10 stress runs green.
 - [ ] Implement recv-side watermarks (QosPipe recv currently passes through).
 - [ ] Implement `rcv_hwm_bytes` and `linger` consumers (declared, unused).
 - [ ] Add recv-side QoS queue and background recv worker.

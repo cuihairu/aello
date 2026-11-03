@@ -4,6 +4,8 @@
 
 #include "duct/qos_pipe.h"
 
+#include "reconnect_pipe.h"
+
 namespace duct {
 
 // Implemented in tcp_transport.cc.
@@ -47,7 +49,11 @@ Result<std::unique_ptr<Listener>> listen(const std::string& address, const Liste
   return Status::not_supported("listen scheme not supported yet: " + a.scheme_text);
 }
 
-Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions& opt) {
+namespace {
+
+// One dial attempt: parse, build the transport pipe, and apply the QoS wrapper.
+// Does not apply reconnect; dial() wraps this when reconnect is enabled.
+Result<std::unique_ptr<Pipe>> dial_impl(const std::string& address, const DialOptions& opt) {
   auto parsed = Address::parse(address);
   if (!parsed.ok()) {
     return parsed.status();
@@ -85,13 +91,31 @@ Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions
     return Status::not_supported("dial scheme not supported yet: " + a.scheme_text);
   }
 
-  // Apply QoS wrapper if any QoS options are configured
+  // Apply QoS wrapper if any QoS options are configured.
   if (opt.qos.snd_hwm_bytes != 0 || opt.qos.backpressure != BackpressurePolicy::kBlock) {
     auto qos_pipe = std::make_unique<QosPipe>(std::move(base_pipe), opt.qos);
     return std::unique_ptr<Pipe>(std::move(qos_pipe));
   }
 
   return base_pipe;
+}
+
+}  // namespace
+
+Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions& opt) {
+  auto parsed = Address::parse(address);
+  if (!parsed.ok()) {
+    return parsed.status();
+  }
+  if (opt.reconnect.enabled) {
+    DialOptions base = opt;
+    base.reconnect.enabled = false;  // Each attempt dials once, no nested reconnect.
+    auto dial_once = [address, base]() -> Result<std::unique_ptr<Pipe>> {
+      return dial_impl(address, base);
+    };
+    return make_reconnect_pipe(std::move(dial_once), opt.reconnect, opt.on_state_change);
+  }
+  return dial_impl(address, opt);
 }
 
 }  // namespace duct

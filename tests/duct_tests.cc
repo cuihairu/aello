@@ -1239,6 +1239,112 @@ static void test_qos_close_under_full_ring() {
   t.join();
 }
 
+// A reconnect-enabled dial must return immediately with a pipe that connects on
+// the first successful attempt and delivers an echo.
+static void test_reconnect_dial_connects_and_echoes() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(500);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.initial_delay = std::chrono::milliseconds(10);
+  dial_opt.reconnect.max_attempts = 10;
+
+  std::mutex state_mu;
+  std::vector<duct::ConnectionState> states;
+  dial_opt.on_state_change = [&](duct::ConnectionState s, const std::string&) {
+    std::lock_guard<std::mutex> lk(state_mu);
+    states.push_back(s);
+  };
+
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(500);
+  auto st = c.value()->send(duct::Message::from_string("reconnect-ping"), send_opt);
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) {
+    c.value()->close();
+    return;
+  }
+
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::milliseconds(500);
+  auto echoed = c.value()->recv(recv_opt);
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) {
+    std::string s(reinterpret_cast<const char*>(echoed.value().data()), echoed.value().size());
+    EXPECT_EQ(s, "reconnect-ping");
+  }
+
+  bool saw_connected = false;
+  {
+    std::lock_guard<std::mutex> lk(state_mu);
+    for (auto s : states) {
+      if (s == duct::ConnectionState::kConnected) saw_connected = true;
+    }
+  }
+  EXPECT_TRUE(saw_connected);
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
+// A reconnect-enabled dial to a non-existent server must return immediately
+// (the pipe connects in the background) and eventually report exhaustion.
+static void test_reconnect_dial_fails_after_attempts() {
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(200);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.initial_delay = std::chrono::milliseconds(5);
+  dial_opt.reconnect.max_delay = std::chrono::milliseconds(20);
+  dial_opt.reconnect.backoff_multiplier = 1.0;
+  dial_opt.reconnect.max_attempts = 3;
+
+  auto c = duct::dial("tcp://127.0.0.1:1", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  // The dial itself returns immediately; the first send blocks until the
+  // background worker exhausts all attempts.
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(5000);
+  auto st = c.value()->send(duct::Message::from_string("x"), send_opt);
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_TRUE(st.status().code() == duct::StatusCode::kIoError ||
+                st.status().code() == duct::StatusCode::kTimeout);
+  }
+  c.value()->close();
+}
+
 }  // namespace
 
 int main() {
@@ -1271,6 +1377,8 @@ int main() {
   test_qos_zero_hwm_is_unlimited();
   test_qos_delivery_under_hwm();
   test_qos_close_under_full_ring();
+  test_reconnect_dial_connects_and_echoes();
+  test_reconnect_dial_fails_after_attempts();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
