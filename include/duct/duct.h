@@ -160,6 +160,9 @@ struct ListenOptions {
   // Reserved: no listener implementation applies it yet.
   QosOptions qos{};
   int backlog = 128;
+  // Bound for transport-level handshake completion on accepted sockets.
+  // A silent peer is rejected after this interval instead of blocking accept().
+  std::chrono::milliseconds handshake_timeout{5000};
 };
 
 // Minimal entry points (pattern layer comes later).

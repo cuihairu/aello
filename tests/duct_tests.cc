@@ -27,6 +27,7 @@
 
 #if !defined(_WIN32)
 #include <dirent.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -2008,6 +2009,46 @@ static void test_tcp_handshake_negotiates_version() {
   lis_r.value()->close();
 }
 
+static void test_tcp_accept_rejects_silent_peer() {
+  // A client that connects but never sends the handshake must not hang accept()
+  // forever: the bounded handshake timeout rejects it and accept() returns.
+  duct::ListenOptions lis_opt;
+  lis_opt.handshake_timeout = std::chrono::milliseconds(200);
+  auto lis_r = duct::listen("tcp://127.0.0.1:0", lis_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto accept_fut = std::async(std::launch::async, [&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    return lis_r.value()->accept();
+  });
+
+  // Open a raw socket to the listener and send nothing.
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_TRUE(fd >= 0);
+  sockaddr_in sin{};
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(static_cast<std::uint16_t>(std::stoi(addr_r.value().substr(addr_r.value().rfind(':') + 1))));
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  EXPECT_TRUE(::connect(fd, reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) == 0);
+
+  auto st = accept_fut.wait_for(std::chrono::seconds(1));
+  EXPECT_TRUE(st == std::future_status::ready);
+  if (st == std::future_status::ready) {
+    auto r = accept_fut.get();
+    EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code(), duct::StatusCode::kTimeout);
+    }
+  } else {
+    EXPECT_TRUE(false);
+  }
+  ::close(fd);
+  lis_r.value()->close();
+}
+
 static void test_qos_item_count_cap() {
   auto owned = std::make_unique<SlowTimeoutPipe>();
   SlowTimeoutPipe* transport = owned.get();
@@ -2510,6 +2551,7 @@ int main() {
   test_qos_rate_limit_default_burst_drains();
   test_qos_channel_multiplexing();
   test_tcp_handshake_negotiates_version();
+  test_tcp_accept_rejects_silent_peer();
   test_qos_item_count_cap();
   test_qos_failfast_returns_queue_full();
   test_qos_dial_opt_in_disabled_by_default();

@@ -124,8 +124,9 @@ class TcpPipe final : public Pipe {
 
 class TcpListener final : public Listener {
  public:
-  TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port)
-      : fd_(fd), host_(std::move(host)), port_(port) {}
+  TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port,
+              std::chrono::milliseconds handshake_timeout)
+      : fd_(fd), host_(std::move(host)), port_(port), handshake_timeout_(handshake_timeout) {}
   ~TcpListener() override { close(); }
 
   Result<std::unique_ptr<Pipe>> accept() override {
@@ -149,7 +150,7 @@ class TcpListener final : public Listener {
 #else
     (void)::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #endif
-    auto hs = wire::handshake_server(cfd, /*server_capabilities=*/0);
+    auto hs = wire::handshake_server(cfd, /*server_capabilities=*/0, handshake_timeout_);
     if (!hs.ok()) {
       close_socket(cfd);
       return hs.status();
@@ -173,6 +174,7 @@ class TcpListener final : public Listener {
   wire::SocketHandle fd_ = wire::kInvalidSocket;
   std::string host_;
   std::uint16_t port_ = 0;
+  std::chrono::milliseconds handshake_timeout_{5000};
 };
 
 // Non-blocking connect bounded by `timeout`. Returns kTimeout on expiry.
@@ -382,7 +384,8 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
     }
   }
 
-  return std::unique_ptr<Listener>(new TcpListener(fd.value(), addr.host, effective_port));
+  return std::unique_ptr<Listener>(
+      new TcpListener(fd.value(), addr.host, effective_port, opt.handshake_timeout));
 }
 
 Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt) {
