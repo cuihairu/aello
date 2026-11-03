@@ -14,6 +14,7 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <string>
@@ -1857,6 +1858,87 @@ static void test_qos_drop_old_evicts_oldest_queued() {
   pipe.close();
 }
 
+static void test_concurrent_send_recv_channels() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // Echo server: concurrent client sends are serialized by TCP, but the server
+  // loop exercises interleaved recv/send traffic.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < 4; ++i) {
+      duct::RecvOptions ropt;
+      ropt.timeout = std::chrono::milliseconds(1000);
+      auto msg = p.value()->recv(ropt);
+      if (!msg.ok()) return msg.status();
+      duct::SendOptions sopt;
+      sopt.timeout = std::chrono::milliseconds(1000);
+      auto st = p.value()->send(msg.value(), sopt);
+      if (!st.ok()) return st;
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = true;
+  dial_opt.qos.snd_hwm_bytes = 64 * 1024;
+  dial_opt.qos.rcv_hwm_bytes = 64 * 1024;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // Four threads send and receive concurrently. The QoS wrapper serializes
+  // sends and recv, but the calls themselves overlap.
+  std::vector<std::thread> threads;
+  std::vector<std::atomic<bool>> ok(4);
+  std::mutex expected_mu;
+  std::set<std::string> expected = {"payload-0", "payload-1", "payload-2", "payload-3"};
+  for (int i = 0; i < 4; ++i) {
+    ok[i] = true;
+    threads.emplace_back([&, i] {
+      duct::SendOptions sopt;
+      sopt.timeout = std::chrono::milliseconds(1000);
+      const std::string payload = "payload-" + std::to_string(i);
+      if (!c.value()->send(duct::Message::from_string(payload), sopt).ok()) {
+        ok[i] = false;
+        return;
+      }
+      duct::RecvOptions ropt;
+      ropt.timeout = std::chrono::milliseconds(1000);
+      auto echoed = c.value()->recv(ropt);
+      // Because recv pops any queued echo, validate that each popped payload
+      // is one of the expected responses exactly once.
+      std::string got = echoed.ok() ? std::string(echoed.value().as_string_view()) : std::string();
+      std::lock_guard<std::mutex> lock(expected_mu);
+      if (got.empty() || expected.erase(got) != 1) ok[i] = false;
+    });
+  }
+  for (auto& t : threads) t.join();
+  for (int i = 0; i < 4; ++i) EXPECT_TRUE(ok[i].load());
+  {
+    std::lock_guard<std::mutex> lock(expected_mu);
+    EXPECT_TRUE(expected.empty());
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
 }  // namespace
 
 int main() {
@@ -1904,6 +1986,7 @@ int main() {
   test_qos_dial_opt_in_disabled_by_default();
   test_qos_ttl_expires_queued_message();
   test_qos_drop_old_evicts_oldest_queued();
+  test_concurrent_send_recv_channels();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
