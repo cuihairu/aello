@@ -47,7 +47,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 - [x] Direct QoS tests (send/recv, backpressure policies, TTL, close under load). Evidence: 916aa81; TTL expiry, kDropOld eviction, kDropNew, kFailFast queue-full, kBlock, close-under-load, item cap, recv watermark tests green (45 duct cases, ctest 2/2, 15x stress).
 - [x] Concurrent send/recv tests. Evidence: 2fe13c4; 4 send+4 recv threads over QoS-wrapped tcp, each response consumed exactly once (46 duct cases, ctest 2/2, 12x stress).
-- [ ] Multi-process and `kill -9` / restart test matrix.
+- [x] Multi-process and `kill -9` / restart test matrix. Evidence: commit; fork()ed echo server cross-process echo, SIGKILL server, restart and recovery green (47 duct cases, ctest 2/2, 10x stress, no orphans).
 - [ ] UDS tests (blocked until UDS is wired).
 - [ ] Benchmarks (aello-bench): shm round-trip latency and throughput vs UDS/TCP.
 

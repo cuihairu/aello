@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <winsock2.h>
@@ -1939,6 +1940,100 @@ static void test_concurrent_send_recv_channels() {
   lis_r.value()->close();
 }
 
+static void test_multi_process_kill9_restart() {
+#if !defined(_WIN32)
+  // Server child: listens on an ephemeral tcp port and echoes until killed.
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+  const std::string addr = addr_r.value();
+
+  pid_t child = ::fork();
+  if (child < 0) {
+    EXPECT_TRUE(false);
+    return;
+  }
+  if (child == 0) {
+    // Child: accept and echo forever. Never returns; killed by SIGKILL.
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) _exit(1);
+    for (;;) {
+      auto msg = p.value()->recv({});
+      if (!msg.ok()) _exit(1);
+      if (!p.value()->send(msg.value(), {}).ok()) _exit(1);
+    }
+  }
+
+  // Parent: dial and echo cross-process.
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (c.ok()) {
+    duct::SendOptions sopt;
+    sopt.timeout = std::chrono::milliseconds(500);
+    auto st = c.value()->send(duct::Message::from_string("ping-1"), sopt);
+    EXPECT_TRUE(st.ok());
+    if (st.ok()) {
+      auto echoed = c.value()->recv({});
+      EXPECT_TRUE(echoed.ok());
+      if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "ping-1");
+    }
+    c.value()->close();
+  }
+
+  // Kill the server with SIGKILL and reap it.
+  EXPECT_TRUE(::kill(child, SIGKILL) == 0);
+  int status = 0;
+  EXPECT_TRUE(::waitpid(child, &status, 0) == child);
+  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+
+  // A fresh dial after restart works: start a second child on a new port.
+  auto lis2_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis2_r.ok());
+  if (!lis2_r.ok()) return;
+  auto addr2_r = lis2_r.value()->local_address();
+  EXPECT_TRUE(addr2_r.ok());
+  if (!addr2_r.ok()) return;
+  const std::string addr2 = addr2_r.value();
+
+  pid_t child2 = ::fork();
+  if (child2 < 0) {
+    EXPECT_TRUE(false);
+    return;
+  }
+  if (child2 == 0) {
+    auto p = lis2_r.value()->accept();
+    if (!p.ok()) _exit(1);
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) _exit(1);
+    _exit(p.value()->send(msg.value(), {}).ok() ? 0 : 1);
+  }
+
+  auto c2 = duct::dial(addr2, dial_opt);
+  EXPECT_TRUE(c2.ok());
+  if (c2.ok()) {
+    duct::SendOptions sopt;
+    sopt.timeout = std::chrono::milliseconds(500);
+    auto st = c2.value()->send(duct::Message::from_string("ping-2"), sopt);
+    EXPECT_TRUE(st.ok());
+    if (st.ok()) {
+      auto echoed = c2.value()->recv({});
+      EXPECT_TRUE(echoed.ok());
+      if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "ping-2");
+    }
+    c2.value()->close();
+  }
+  EXPECT_TRUE(::kill(child2, SIGKILL) == 0);
+  EXPECT_TRUE(::waitpid(child2, &status, 0) == child2);
+  lis2_r.value()->close();
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -1987,6 +2082,7 @@ int main() {
   test_qos_ttl_expires_queued_message();
   test_qos_drop_old_evicts_oldest_queued();
   test_concurrent_send_recv_channels();
+  test_multi_process_kill9_restart();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
