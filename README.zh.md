@@ -22,20 +22,18 @@
   与 `pipe://`（Windows 命名管道）。
 - `shm://` 快路径：每方向一个有界、预分配的固定槽环（64 槽 × 64 KiB），
   信号量同步，复制发送语义。
-- 字节流传输使用 16 字节帧头；单条消息上限 64 KiB。
+- 字节流传输使用 16 字节帧头；单帧负载上限 64 KiB，更大的消息被分片并重组
+  （上限 64 MiB）。
 - QoS 层：发送/接收字节水位（`QosOptions::snd_hwm_bytes` / `rcv_hwm_bytes`）、
   背压策略、逐消息 TTL。
-- 自动重连：指数退避 + TCP keepalive（`DialOptions::reconnect`、
-  `src/reconnect_pipe.cc`）。
+- 自动重连：指数退避（`DialOptions::reconnect`、`src/reconnect_pipe.cc`）。
 - 管道之上的纯头文件层：关联请求/响应 RPC（`duct/rpc.h`）与主题发布订阅
   （`duct/pubsub.h`）。
-- ping-pong 基准工具（`bench/aello_bench.cc`，默认构建并注册为 CI 冒烟测试）。
+- ping-pong 基准工具（`bench/aello_bench.cc`，POSIX 上默认构建并注册为 CI 冒烟测试）。
 - 跨平台 CI（GCC / Clang / MSVC）运行测试套件。
 
 当前**没有**的——直说，免得你自己踩：
 
-- 没有分片：单条消息维持 64 KiB 上限（帧标志已规划、未实现——
-  `include/duct/protocol.h`）。
 - 管道本身没有异步/事件循环 API。注意：启用 QoS 时发送侧确有内部排空工作线程。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
