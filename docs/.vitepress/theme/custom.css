@@ -1,6 +1,6 @@
 /* fleet-wide docs readability: wrap long code lines, widen content, scroll tables */
 .vp-doc div[class*='language-'] pre,
-.vp-doc div[class*='language-'] pre code {
+.vp-doc [class*='language-'] pre code {
   white-space: pre-wrap;
   word-break: break-word;
 }
