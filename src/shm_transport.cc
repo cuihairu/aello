@@ -614,6 +614,9 @@ class ShmPipe final : public Pipe {
 
       if (first) {
         if (!is_first) return Status::protocol_error("shm fragment stream out of sync");
+        if (len > kMaxReassembledBytes) {
+          return Status::protocol_error("shm fragment stream too large");
+        }
         assembled.resize(len);
         if (len != 0) std::memcpy(assembled.data(), slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
         first = false;

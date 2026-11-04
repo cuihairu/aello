@@ -2148,6 +2148,59 @@ static void test_shm_reassembly_size_capped() {
 #endif
 }
 
+// The first chunk of a reassembled shm message must also respect the 64 MiB
+// cap. Previously only continuation chunks were checked, so a slot_bytes near
+// 2^30 let a single first chunk allocate ~1 GiB before the cap was enforced.
+static void test_shm_first_chunk_size_capped() {
+#if defined(_WIN32)
+  return;
+#else
+  // slot_bytes just under 2^30 is a valid geometry but far above the 64 MiB
+  // reassembly cap. A message that fits in one slot yet exceeds the cap must be
+  // rejected at the first-chunk check, not allocated (~1 GiB) and reassembled.
+  duct::ListenOptions listen_opt;
+  listen_opt.shm.slot_bytes = (1u << 30) - (1u << 20);  // ~1 GiB payload slot
+  listen_opt.shm.slot_count = 2;
+  auto lis_r = duct::listen("shm://duct_testfirstcap", listen_opt);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    // Fits in one ~1 GiB slot but is > 64 MiB: the receiver's first-chunk cap
+    // must fire before assembling the oversized message.
+    const std::string payload(64 * 1024 * 1024 + 64 * 1024, 'f');
+    auto st = p.value()->send(duct::Message::from_string(payload), {});
+    if (!st.ok()) return st.status();
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.shm.slot_bytes = (1u << 30) - (1u << 20);
+  dial_opt.shm.slot_count = 2;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testfirstcap", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  auto msg = c.value()->recv({});
+  EXPECT_TRUE(!msg.ok());
+  if (!msg.ok()) {
+    EXPECT_EQ(msg.status().code(), duct::StatusCode::kProtocolError);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) (void)server.get();
+#endif
+}
+
 static void test_shm_fragmentation_midway_timeout_keeps_stream_synced() {
 #if defined(_WIN32)
   return;
@@ -3260,6 +3313,106 @@ static void test_tcp_channel_recv_deadline_bounded() {
   if (sst == std::future_status::ready) (void)server.get();
 }
 
+// A sub-millisecond remaining deadline must not be truncated to a zero socket
+// timeout, which would turn recv() into an unbounded blocking read and hang far
+// past the caller's wall-clock deadline. This exercises the <1ms boundary the
+// 300ms-latency test above cannot reach.
+static void test_tcp_channel_recv_subms_deadline_bounded() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    // Do not send anything: the client's recv must time out on an empty socket.
+    // A sub-millisecond remaining deadline truncated to a zero socket timeout
+    // would block forever waiting for data that never arrives.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(1);
+  const auto begin = std::chrono::steady_clock::now();
+  // Watchdog: a zero socket timeout turns the read into an unbounded blocking
+  // recv(), so without the clamp this recv() never returns.
+  auto recv_fut = std::async(std::launch::async, [&]() { return c.value()->recv(r7); });
+  auto ready = recv_fut.wait_for(std::chrono::seconds(5));
+  EXPECT_TRUE(ready == std::future_status::ready);
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  if (ready == std::future_status::ready) {
+    auto m7 = recv_fut.get();
+    EXPECT_TRUE(!m7.ok());
+    EXPECT_EQ(m7.status().code(), duct::StatusCode::kTimeout);
+    EXPECT_TRUE(elapsed < std::chrono::seconds(5));
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(3));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+// Same sub-millisecond deadline guarantee for the UDS transport, which shares
+// the channel-filtered recv loop and the same duration_cast truncation bug.
+static void test_uds_channel_recv_subms_deadline_bounded() {
+#if !defined(_WIN32)
+  std::string path = "/tmp/duct_uds_subms_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds://" + path, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(1);
+  const auto begin = std::chrono::steady_clock::now();
+  auto recv_fut = std::async(std::launch::async, [&]() { return c.value()->recv(r7); });
+  auto ready = recv_fut.wait_for(std::chrono::seconds(5));
+  EXPECT_TRUE(ready == std::future_status::ready);
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  if (ready == std::future_status::ready) {
+    auto m7 = recv_fut.get();
+    EXPECT_TRUE(!m7.ok());
+    EXPECT_EQ(m7.status().code(), duct::StatusCode::kTimeout);
+    EXPECT_TRUE(elapsed < std::chrono::seconds(5));
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(3));
+  if (sst == std::future_status::ready) (void)server.get();
+#endif
+}
+
 // A reconnect-wrapped tcp pipe must preserve channel_id through the wire
 // flags, not collapse everything to channel 0.
 static void test_reconnect_channel_preserved() {
@@ -3504,10 +3657,19 @@ static void test_qos_shm_recv_midfragment_close_completes() {
 }  // namespace
 
 int main() {
+#if defined(SIGPIPE)
+  // The channel-flood tests keep a peer sending on another channel while the
+  // client times out and closes. A send racing that close can hit a broken
+  // pipe; on Linux the library only suppresses SIGPIPE on macOS, so ignore it
+  // here to keep the harness from dying mid-suite. Library send() semantics are
+  // unchanged; this only quiets the signal the write would otherwise raise.
+  std::signal(SIGPIPE, SIG_IGN);
+#endif
   test_address_parse();
   test_shm_echo_one();
   test_uds_echo_one();
   test_uds_multi_message_echo();
+  test_uds_channel_recv_subms_deadline_bounded();
   test_uds_concurrent_channel_recv();
   test_uds_peer_credential();
   test_shm_crash_recovery_reclaims_orphan();
@@ -3547,6 +3709,7 @@ int main() {
   test_wire_fragmentation_and_reassembly();
   test_shm_fragmentation_and_reassembly();
   test_shm_reassembly_size_capped();
+  test_shm_first_chunk_size_capped();
   test_shm_fragmentation_midway_timeout_keeps_stream_synced();
   test_shm_configurable_slot_geometry();
   test_shm_geometry_mismatch_rejected();
@@ -3557,6 +3720,7 @@ int main() {
   test_tcp_channel_pending_capped();
   test_shm_rejects_oversize_message();
   test_tcp_channel_recv_deadline_bounded();
+  test_tcp_channel_recv_subms_deadline_bounded();
   test_reconnect_channel_preserved();
   test_tcp_concurrent_channel_recv();
   test_qos_shm_recv_midfragment_close_completes();

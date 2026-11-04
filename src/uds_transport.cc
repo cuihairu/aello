@@ -76,6 +76,12 @@ class UdsPipe final : public Pipe {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) return Status::timeout("recv timed out");
         frame_opt.timeout = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        // duration_cast truncates a remaining sub-millisecond wait to 0, which
+        // would clear SO_RCVTIMEO and turn the read into an unbounded blocking
+        // recv(). Clamp to 1ms so the wall-clock deadline still bounds the wait.
+        if (frame_opt.timeout <= std::chrono::milliseconds::zero()) {
+          frame_opt.timeout = std::chrono::milliseconds(1);
+        }
       }
       auto r = recv_frame(frame_opt);
       if (!r.ok()) {
