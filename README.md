@@ -19,18 +19,26 @@ Formerly known as `duct`.
 Experimental, pre-release. What exists today:
 
 - Message model (`Message`) and `Result`/`Status` error handling — no exceptions required.
-- One `Pipe`/`Listener` API over three transports: `tcp://`, `shm://`, `pipe://` (Windows named pipes).
+- One `Pipe`/`Listener` API over four transports: `tcp://`, `shm://`, `uds://`
+  (POSIX) and `pipe://` (Windows named pipes).
 - The `shm://` fast path: a bounded, pre-allocated fixed-slot ring per direction
   (64 slots × 64 KiB), semaphore-synchronized, with copy-send semantics.
 - A 16-byte wire header for byte-stream transports; single messages are capped at 64 KiB.
+- A QoS layer with send/receive byte watermarks (`QosOptions::snd_hwm_bytes` /
+  `rcv_hwm_bytes`), backpressure policies, and per-message TTL.
+- Automatic reconnect with exponential backoff and TCP keepalive
+  (`DialOptions::reconnect`, `src/reconnect_pipe.cc`).
+- Header-only layers above the pipe: correlated request/response RPC
+  (`duct/rpc.h`) and a topic pub/sub broker (`duct/pubsub.h`).
+- A ping-pong benchmark harness (`bench/aello_bench.cc`, built by default and
+  registered as a CI smoke test).
 - Cross-platform CI (GCC / Clang / MSVC) running the test suite.
 
 What does **not** exist yet — stated plainly so nobody has to discover it:
 
-- No automatic reconnect (the option fields are currently ignored).
-- `uds://` addresses parse but are not wired into dial/listen.
-- No receive-side watermarks and no fragmentation. (Message TTL is enforced on the QoS send path when `QosOptions::ttl` is set; it defaults to off.)
-- No benchmarks, no RPC, no pub/sub, and no async/event-loop API (`async.h` is not part of the library). Note the send side does run an internal queue-drain worker when QoS is enabled.
+- No fragmentation: single messages stay capped at 64 KiB (frame flags for it
+  are planned, not implemented — `include/duct/protocol.h`).
+- No async/event-loop API on the pipe itself. Note the send side does run an internal queue-drain worker when QoS is enabled.
 
 Design audit and roadmap live in [`docs/design/`](docs/design/):
 
@@ -43,7 +51,8 @@ Design audit and roadmap live in [`docs/design/`](docs/design/):
 - **Low latency without sacrificing correctness.** Memory ordering and crash behavior are verified, not assumed.
 - **Transport and message semantics are separate.** Entering the transport backend is the only delivery promise; processing and durability belong to the application.
 - **One performance path first.** SPSC shared memory until measurements demand more.
-- **Performance claims come from reproducible benchmarks.** None exist yet, so none are made.
+- **Performance claims come from reproducible benchmarks** (`bench/aello_bench.cc`);
+  no published numbers yet, so none are made.
 
 ## Quick start
 
@@ -94,7 +103,7 @@ Every call returns a `Result<T>`; check `.ok()` and read `.status()` — no exce
 | `tcp://` | `tcp://host:port` (or bare `host:port`) | all | working |
 | `shm://` | `shm://name` | POSIX, Windows | working — the fast path |
 | `pipe://` | `pipe://name` | Windows named pipes | working |
-| `uds://` | `uds:///path/to/socket` | POSIX | parsed, **not wired yet** |
+| `uds://` | `uds:///path/to/socket` | POSIX | working |
 
 ## Semantics (current contract)
 

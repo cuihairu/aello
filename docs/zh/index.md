@@ -21,7 +21,7 @@ features:
   - title: 明确契约
     details: 传输成功、接收成功、处理完成与持久化完成是彼此独立的状态。
   - title: 可插拔传输
-    details: TCP、共享内存与 Windows 命名管道共用一套 Pipe/Listener 模型，UDS 接线正在进行。
+    details: TCP、共享内存、POSIX Unix 域套接字与 Windows 命名管道共用一套 Pipe/Listener 模型。
 ---
 
 ![Aello 消息运行时架构](/images/architecture-zh.svg)

@@ -21,7 +21,7 @@ features:
   - title: Explicit contracts
     details: Transport success, receive success, processing completion, and persistence are separate states.
   - title: Pluggable transports
-    details: TCP, shared memory, and Windows named pipes share one Pipe/Listener model, with UDS wiring in progress.
+    details: TCP, shared memory, POSIX Unix-domain sockets, and Windows named pipes share one Pipe/Listener model.
 ---
 
 ![Aello messaging runtime architecture](/images/architecture-en.svg)

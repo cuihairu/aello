@@ -18,18 +18,25 @@
 实验阶段，未发布。当前已有的：
 
 - 消息模型（`Message`）与 `Result`/`Status` 错误处理——不强制异常。
-- 一套 `Pipe`/`Listener` API 覆盖三种传输：`tcp://`、`shm://`、`pipe://`（Windows 命名管道）。
+- 一套 `Pipe`/`Listener` API 覆盖四种传输：`tcp://`、`shm://`、`uds://`（POSIX）
+  与 `pipe://`（Windows 命名管道）。
 - `shm://` 快路径：每方向一个有界、预分配的固定槽环（64 槽 × 64 KiB），
   信号量同步，复制发送语义。
 - 字节流传输使用 16 字节帧头；单条消息上限 64 KiB。
+- QoS 层：发送/接收字节水位（`QosOptions::snd_hwm_bytes` / `rcv_hwm_bytes`）、
+  背压策略、逐消息 TTL。
+- 自动重连：指数退避 + TCP keepalive（`DialOptions::reconnect`、
+  `src/reconnect_pipe.cc`）。
+- 管道之上的纯头文件层：关联请求/响应 RPC（`duct/rpc.h`）与主题发布订阅
+  （`duct/pubsub.h`）。
+- ping-pong 基准工具（`bench/aello_bench.cc`，默认构建并注册为 CI 冒烟测试）。
 - 跨平台 CI（GCC / Clang / MSVC）运行测试套件。
 
 当前**没有**的——直说，免得你自己踩：
 
-- 没有自动重连（选项字段目前被忽略）。
-- `uds://` 地址能解析，但尚未接入 dial/listen。
-- 没有接收侧水位与分片。（消息 TTL 在设置 `QosOptions::ttl` 后于 QoS 发送路径生效，默认关闭。）
-- 没有基准测试、RPC、发布订阅，也没有异步/事件循环 API（`async.h` 未编入库）。注意：启用 QoS 时发送侧确有内部排空工作线程。
+- 没有分片：单条消息维持 64 KiB 上限（帧标志已规划、未实现——
+  `include/duct/protocol.h`）。
+- 管道本身没有异步/事件循环 API。注意：启用 QoS 时发送侧确有内部排空工作线程。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
 
@@ -42,7 +49,7 @@
 - **低延迟但不牺牲正确性。** 内存序与崩溃行为靠验证，不靠假设。
 - **传输与消息语义分离。** 进入传输后端是唯一的送达承诺；处理与持久化属于应用层。
 - **先走通一条性能路径。** SPSC 共享内存，直到实测数据要求更多。
-- **性能结论来自可复现基准。** 目前没有基准，所以不做任何性能宣称。
+- **性能结论来自可复现基准**（`bench/aello_bench.cc`）；目前尚无发布数值，因此不做性能宣称。
 
 ## 快速开始
 
@@ -94,7 +101,7 @@ auto reply = pipe.value()->recv({});
 | `tcp://` | `tcp://host:port`（或裸 `host:port`） | 全部 | 可用 |
 | `shm://` | `shm://name` | POSIX、Windows | 可用——快路径 |
 | `pipe://` | `pipe://name` | Windows 命名管道 | 可用 |
-| `uds://` | `uds:///path/to/socket` | POSIX | 可解析，**尚未接线** |
+| `uds://` | `uds:///path/to/socket` | POSIX | 可用 |
 
 ## 语义（当前契约）
 
