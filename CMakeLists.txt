@@ -7,6 +7,11 @@ project(duct
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+# windows.h defines min/max macros that break std::min/std::max (MSVC C2589)
+if(MSVC)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 option(DUCT_BUILD_EXAMPLES "Build duct examples" ON)
 option(DUCT_BUILD_TESTS "Build duct tests" ON)
 
