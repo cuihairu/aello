@@ -1,5 +1,7 @@
 #include "reconnect_pipe.h"
 
+#include "duct/wire.h"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -57,6 +59,29 @@ class ReconnectPipe final : public Pipe {
       if (r.status().code() == StatusCode::kTimeout) return r;
       if (is_disconnect_error(r.status())) {
         mark_disconnected(inner_snapshot, "recv: " + r.status().message());
+        continue;
+      }
+      return r;
+    }
+  }
+
+  // Forward frame reads to the inner transport so channel_id multiplexing
+  // (tcp/uds wire flags) survives the reconnect wrapper. Without this, the base
+  // Pipe::recv_frame default delegates to recv() and returns flags==0, so a
+  // QosPipe-over-ReconnectPipe-over-tcp recv_worker always sees channel 0.
+  Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
+    for (;;) {
+      auto st = wait_connected(opt.timeout);
+      if (!st.ok()) return st.status();
+
+      std::shared_ptr<Pipe> inner_snapshot = snapshot_inner();
+      if (!inner_snapshot) continue;
+
+      auto r = inner_snapshot->recv_frame(opt);
+      if (r.ok()) return r;
+      if (r.status().code() == StatusCode::kTimeout) return r;
+      if (is_disconnect_error(r.status())) {
+        mark_disconnected(inner_snapshot, "recv_frame: " + r.status().message());
         continue;
       }
       return r;

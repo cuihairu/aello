@@ -14,6 +14,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <future>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -1418,6 +1419,93 @@ static void test_uds_multi_message_echo() {
 #endif
 }
 
+// Concurrent recv() calls on different UDS channels must not interleave raw
+// frame reads on the same fd (the tcp equivalent is test_tcp_concurrent_channel_recv).
+static void test_uds_concurrent_channel_recv() {
+#if defined(_WIN32)
+  return;
+#else
+  std::string path = "/tmp/duct_uds_conc_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+  auto lis_r = duct::listen("uds://" + path);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  std::atomic<bool> clients_done{false};
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < 60; ++i) {
+      duct::SendOptions s7, s8;
+      s7.channel_id = 7;
+      s8.channel_id = 8;
+      auto a = p.value()->send(duct::Message::from_string("a" + std::to_string(i)), s7);
+      if (!a.ok()) return a.status();
+      auto b = p.value()->send(duct::Message::from_string("b" + std::to_string(i)), s8);
+      if (!b.ok()) return b.status();
+    }
+    while (!clients_done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("uds://" + path, dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  std::atomic<int> ok7{0}, ok8{0};
+  auto r7 = std::async(std::launch::async, [&]() {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(10000);
+    opt.channel_id = 7;
+    for (int i = 0; i < 60; ++i) {
+      auto m = c.value()->recv(opt);
+      if (!m.ok()) {
+        std::cerr << "uds r7 failed at " << ok7.load() << "\n";
+        return;
+      }
+      if (m.value().as_string_view().rfind("a", 0) != 0) {
+        std::cerr << "uds r7 wrong payload\n";
+        return;
+      }
+      ++ok7;
+    }
+  });
+  auto r8 = std::async(std::launch::async, [&]() {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(10000);
+    opt.channel_id = 8;
+    for (int i = 0; i < 60; ++i) {
+      auto m = c.value()->recv(opt);
+      if (!m.ok()) {
+        std::cerr << "uds r8 failed at " << ok8.load() << "\n";
+        return;
+      }
+      if (m.value().as_string_view().rfind("b", 0) != 0) {
+        std::cerr << "uds r8 wrong payload\n";
+        return;
+      }
+      ++ok8;
+    }
+  });
+  r7.wait();
+  r8.wait();
+  clients_done.store(true);
+  EXPECT_EQ(ok7.load(), 60);
+  EXPECT_EQ(ok8.load(), 60);
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) (void)server.get();
+  ::unlink(path.c_str());
+#endif
+}
+
 static void test_uds_peer_credential() {
 #if !defined(_WIN32) && defined(SO_PEERCRED)
   std::string path = "/tmp/duct_uds_cred_" + std::to_string(::getpid()) + ".sock";
@@ -1549,6 +1637,103 @@ static void test_shm_crash_recovery_reclaims_orphan() {
     lis2.value()->close();
   }
   EXPECT_EQ(leftovers().size(), 0u);
+#endif
+}
+
+// Reclaim must also unlink segments left by a pre-geometry (pre-63a492e) binary.
+// Those segments carry owner_pid/magic at a fixed tail offset (~8 MiB), so the
+// new header read at offset 0-15 sees garbage and would previously skip them.
+// It must also tolerate an undersized hostile file without raising SIGBUS.
+static void test_shm_reclaims_legacy_orphan() {
+#if defined(_WIN32)
+  return;
+#else
+  // Reproduce src/shm_transport.cc's sanitize_name/fnv1a_32/hex8.
+  auto sanitize = [](std::string_view s) {
+    std::string out;
+    for (char c : s) {
+      if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_') {
+        out.push_back(c);
+      } else {
+        out.push_back('_');
+      }
+    }
+    if (out.empty()) out = "duct";
+    return out;
+  };
+  auto fnv1a = [](std::string_view s) {
+    std::uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 16777619u;
+    }
+    return h;
+  };
+  auto hex8 = [](std::uint32_t v) {
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%08x", v);
+    return std::string(buf);
+  };
+  const std::string bus = "duct_legacybus";
+  const std::string prefix = "d" + hex8(fnv1a(sanitize(bus)));
+  auto leftovers = [&prefix]() {
+    std::set<std::string> found;
+    DIR* dir = ::opendir("/dev/shm");
+    if (!dir) return found;
+    while (dirent* ent = ::readdir(dir)) {
+      std::string name = ent->d_name;
+      if (name.rfind(prefix, 0) == 0 || name.rfind("sem." + prefix, 0) == 0) {
+        found.insert("/dev/shm/" + name);
+      }
+    }
+    ::closedir(dir);
+    return found;
+  };
+  for (const auto& stale : leftovers()) (void)::unlink(stale.c_str());
+
+  // A dead PID that is safe to reuse as the recorded owner.
+  pid_t dead = ::fork();
+  EXPECT_TRUE(dead >= 0);
+  if (dead < 0) return;
+  if (dead == 0) _exit(0);
+  EXPECT_TRUE(::waitpid(dead, nullptr, 0) == dead);
+
+  const std::string conn = "c0ffee01";
+  const std::string seg = "/dev/shm/" + prefix + conn + "m";
+  constexpr std::size_t kLegacySize = 8389768;       // old ShmLayout size
+  constexpr std::size_t kOwnerOff = kLegacySize - 8; // owner_pid
+  constexpr std::size_t kMagicOff = kLegacySize - 4; // magic
+  constexpr std::uint32_t kMagic = 0x4D484353;       // 'SHCM'
+  int fd = ::open(seg.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+  EXPECT_TRUE(fd >= 0);
+  if (fd < 0) return;
+  EXPECT_TRUE(::ftruncate(fd, static_cast<off_t>(kLegacySize)) == 0);
+  EXPECT_TRUE(::pwrite(fd, &dead, sizeof(dead), kOwnerOff) ==
+              static_cast<ssize_t>(sizeof(dead)));
+  EXPECT_TRUE(::pwrite(fd, &kMagic, sizeof(kMagic), kMagicOff) ==
+              static_cast<ssize_t>(sizeof(kMagic)));
+  ::close(fd);
+
+  // An undersized hostile file matching the prefix must not raise SIGBUS.
+  const std::string tiny = "/dev/shm/" + prefix + conn + "t";
+  int tfd = ::open(tiny.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (tfd >= 0) {
+    EXPECT_TRUE(::write(tfd, "x", 1) == 1);
+    ::close(tfd);
+  }
+
+  EXPECT_TRUE(leftovers().size() >= 2u);
+  auto lis = duct::listen("shm://" + bus);
+  EXPECT_TRUE(lis.ok());
+  if (lis.ok()) lis.value()->close();
+  // Both the legacy segment and the tiny file are gone; the tiny file is
+  // skipped (not SIGBUS) because it ends in 't', while the legacy segment (ends
+  // in 'm') is reclaimed.
+  auto left = leftovers();
+  EXPECT_EQ(left.count(seg), 0u);
+  EXPECT_EQ(left.count(tiny), 1u);  // untouched by reclaim (not an 'm' file)
+  (void)::unlink(tiny.c_str());
 #endif
 }
 
@@ -1918,6 +2103,51 @@ static void test_shm_fragmentation_and_reassembly() {
 #endif
 }
 
+// The shm reassembly path must cap the accumulated fragment size like the wire
+// path, so a peer streaming chunks without a last-chunk marker cannot grow the
+// buffer without bound. Sending just over 64 MiB must be rejected.
+static void test_shm_reassembly_size_capped() {
+#if defined(_WIN32)
+  return;
+#else
+  auto lis_r = duct::listen("shm://duct_testreasm_cap");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Send > 64 MiB in the background; the sender may block once the receiver
+  // stops consuming after rejecting the oversize reassembly.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    const std::string payload(64 * 1024 * 1024 + 64 * 1024, 'r');
+    auto st = p.value()->send(duct::Message::from_string(payload), {});
+    if (!st.ok()) return st.status();
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testreasm_cap", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  auto msg = c.value()->recv({});
+  EXPECT_TRUE(!msg.ok());
+  if (!msg.ok()) {
+    EXPECT_EQ(msg.status().code(), duct::StatusCode::kProtocolError);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) (void)server.get();
+#endif
+}
+
 static void test_shm_fragmentation_midway_timeout_keeps_stream_synced() {
 #if defined(_WIN32)
   return;
@@ -2042,6 +2272,34 @@ static void test_shm_geometry_mismatch_rejected() {
     EXPECT_TRUE(!p.ok());
   }
   lis_r.value()->close();
+}
+
+// Boundary geometry must be rejected up front instead of corrupting the ring:
+// slot_bytes at the kLastChunkFlag boundary (2^30) collides with the last-chunk
+// flag and an oversized slot_bytes (>= 2^32) must be rejected before narrowing.
+// (A slot_count whose layout_size would overflow size_t cannot occur once
+// slot_bytes is capped below 2^30, so that path is not reachable here.)
+static void test_shm_rejects_invalid_geometry() {
+  duct::ListenOptions listen_opt;
+  listen_opt.shm.slot_bytes = (1u << 30);  // == kLastChunkFlag boundary
+  listen_opt.shm.slot_count = 2;
+  auto lis_r = duct::listen("shm://duct_testgeom_invalid", listen_opt);
+  EXPECT_TRUE(!lis_r.ok());
+  if (lis_r.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // slot_bytes > 4 GiB would be truncated by a narrowing cast before validation.
+  listen_opt.shm.slot_bytes = static_cast<std::size_t>(1) << 32;
+  listen_opt.shm.slot_count = 1;
+  lis_r = duct::listen("shm://duct_testgeom_invalid", listen_opt);
+  EXPECT_TRUE(!lis_r.ok());
+  if (lis_r.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
 }
 
 static void test_qos_priority_scheduling() {
@@ -2174,6 +2432,55 @@ static void test_tcp_channel_recv_does_not_drop_other_channel() {
     EXPECT_TRUE(false);
   }
   lis_r.value()->close();
+}
+
+// A channel-filtered recv must reject a stream of mismatched frames once the
+// per-channel pending buffer exceeds its cap, instead of buffering without
+// bound while the matching channel is never consumed.
+static void test_tcp_channel_pending_capped() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // Each frame may carry up to the wire payload limit, so >64 MiB of ch-8
+  // traffic fills the pending buffer even though ch-7 is never consumed.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::SendOptions s8;
+    s8.channel_id = 8;
+    s8.timeout = std::chrono::milliseconds(3000);
+    const std::string payload(64 * 1024 - 16, 'p');
+    for (int i = 0; i < 1100; ++i) {
+      auto st = p.value()->send(duct::Message::from_string(payload), s8);
+      if (!st.ok()) return st.status();
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(15000);
+  r7.channel_id = 7;
+  auto m7 = c.value()->recv(r7);
+  EXPECT_TRUE(!m7.ok());
+  if (!m7.ok()) {
+    EXPECT_EQ(m7.status().code(), duct::StatusCode::kQueueFull);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(5));
+  if (sst == std::future_status::ready) (void)server.get();
 }
 
 static void test_qos_rate_limit_paces_delivery() {
@@ -2846,6 +3153,354 @@ static void test_pubsub_subscription_outlives_broker() {
   sub.reset();
 }
 
+// Broker and Subscription destruction may race on different threads. The
+// shared atomic alive flag and state lifetime must prevent both the data race
+// on the old plain bool and any use-after-free when Subscription loses the
+// check-then-act race but outlives the Broker's members.
+static void test_pubsub_concurrent_broker_subscription_destruction() {
+  for (int attempt = 0; attempt < 200; ++attempt) {
+    auto broker = std::make_unique<duct::pubsub::Broker>();
+    auto sub = broker->subscribe("x", [](const std::string&, const duct::Message&) {});
+    auto broker_thread = std::async(std::launch::async, [&broker] { broker.reset(); });
+    auto subscription_thread = std::async(std::launch::async, [&sub] { sub.reset(); });
+    broker_thread.wait();
+    subscription_thread.wait();
+  }
+}
+
+// Oversize messages must be rejected synchronously instead of being written
+// past a slot (POSIX fragments, Windows has no fragmentation and returns
+// kInvalidArgument from send).
+static void test_shm_rejects_oversize_message() {
+  auto lis_r = duct::listen("shm://duct_oversize");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_oversize", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // 1 MiB is larger than the default 64 KiB slot but still fragmentable; a
+  // valid oversized message must be accepted and echo back intact on POSIX.
+  const std::string payload(1024 * 1024, 'o');
+  EXPECT_TRUE(c.value()->send(duct::Message::from_string(payload), {}).ok());
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) EXPECT_EQ(echoed.value().size(), payload.size());
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    EXPECT_TRUE(server.get().ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
+// A channel-filtered recv must honor the caller's timeout as a wall-clock
+// deadline, even when the peer keeps sending frames for other channels.
+static void test_tcp_channel_recv_deadline_bounded() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::SendOptions s8;
+    s8.channel_id = 8;
+    const std::string other(1024, 'x');
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
+      auto st = p.value()->send(duct::Message::from_string(other), s8);
+      if (!st.ok()) return st.status();
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(300);
+  r7.channel_id = 7;
+  const auto begin = std::chrono::steady_clock::now();
+  auto m7 = c.value()->recv(r7);
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  EXPECT_TRUE(!m7.ok());
+  EXPECT_EQ(m7.status().code(), duct::StatusCode::kTimeout);
+  // Must be bounded by roughly the requested timeout, not the peer's stream.
+  EXPECT_TRUE(elapsed < std::chrono::milliseconds(900));
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+// A reconnect-wrapped tcp pipe must preserve channel_id through the wire
+// flags, not collapse everything to channel 0.
+static void test_reconnect_channel_preserved() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(500);
+    auto msg = p.value()->recv(opt);
+    if (!msg.ok()) return msg.status();
+    duct::SendOptions send_opt;
+    send_opt.channel_id = 7;
+    return p.value()->send(msg.value(), send_opt);
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.initial_delay = std::chrono::milliseconds(10);
+  dial_opt.reconnect.backoff_multiplier = 1.0;
+  dial_opt.reconnect.max_delay = std::chrono::milliseconds(50);
+  dial_opt.reconnect.max_attempts = 5;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(500);
+  send_opt.channel_id = 7;
+  EXPECT_TRUE(c.value()->send(duct::Message::from_string("reconnect-ch7"), send_opt).ok());
+
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::milliseconds(500);
+  recv_opt.channel_id = 7;
+  auto echoed = c.value()->recv(recv_opt);
+  EXPECT_TRUE(echoed.ok());
+  if (echoed.ok()) EXPECT_EQ(echoed.value().as_string_view(), "reconnect-ch7");
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    EXPECT_TRUE(server.get().ok());
+  } else {
+    EXPECT_TRUE(false);
+  }
+  lis_r.value()->close();
+}
+
+// Concurrent recv() calls on different channels must not interleave raw frame
+// reads on the same socket.
+static void test_tcp_concurrent_channel_recv() {
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  std::atomic<bool> clients_done{false};
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    for (int i = 0; i < 200; ++i) {
+      duct::SendOptions s7, s8;
+      s7.channel_id = 7;
+      s8.channel_id = 8;
+      auto a = p.value()->send(duct::Message::from_string("a" + std::to_string(i)), s7);
+      if (!a.ok()) return a.status();
+      auto b = p.value()->send(duct::Message::from_string("b" + std::to_string(i)), s8);
+      if (!b.ok()) return b.status();
+    }
+    // Keep the connection open until both consumers have drained all frames so
+    // the recv side never sees a premature kClosed.
+    while (!clients_done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  std::atomic<int> ok7{0}, ok8{0};
+  auto r7 = std::async(std::launch::async, [&]() {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(10000);
+    opt.channel_id = 7;
+    for (int i = 0; i < 200; ++i) {
+      auto m = c.value()->recv(opt);
+      if (!m.ok()) {
+        std::cerr << "r7 recv failed at " << ok7.load() << ": " << to_string(m.status().code()) << "\n";
+        return;
+      }
+      if (m.value().as_string_view().rfind("a", 0) != 0) {
+        std::cerr << "r7 got wrong payload: " << m.value().as_string_view().substr(0, 10) << "\n";
+        return;
+      }
+      ++ok7;
+    }
+  });
+  auto r8 = std::async(std::launch::async, [&]() {
+    duct::RecvOptions opt;
+    opt.timeout = std::chrono::milliseconds(10000);
+    opt.channel_id = 8;
+    for (int i = 0; i < 200; ++i) {
+      auto m = c.value()->recv(opt);
+      if (!m.ok()) {
+        std::cerr << "r8 recv failed at " << ok8.load() << ": " << to_string(m.status().code()) << "\n";
+        return;
+      }
+      if (m.value().as_string_view().rfind("b", 0) != 0) {
+        std::cerr << "r8 got wrong payload: " << m.value().as_string_view().substr(0, 10) << "\n";
+        return;
+      }
+      ++ok8;
+    }
+  });
+  r7.wait();
+  r8.wait();
+  clients_done.store(true);
+  std::cerr << "concurrent done ok7=" << ok7.load() << " ok8=" << ok8.load() << "\n";
+  EXPECT_EQ(ok7.load(), 200);
+  EXPECT_EQ(ok8.load(), 200);
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+// A QoS-wrapped shm recv worker must not block forever on the second chunk of a
+// fragmented message when the sender dies after committing the first chunk.
+// Fill the ring with 64 single-chunk messages, then send a 2-chunk message whose
+// first chunk needs the only remaining space. The server consumes one message to
+// make the dialer commit that first chunk, then SIGKILLs the dialer before the
+// second chunk can be written. close() must still join the recv worker.
+static void test_qos_shm_recv_midfragment_close_completes() {
+#if defined(_WIN32)
+  return;
+#else
+  const std::string bus = "duct_testqos_recv_midfrag_" + std::to_string(::getpid());
+  auto lis_r = duct::listen("shm://" + bus);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  int syncfd[2];
+  EXPECT_TRUE(::pipe(syncfd) == 0);
+  pid_t dialer = ::fork();
+  EXPECT_TRUE(dialer >= 0);
+  if (dialer < 0) {
+    lis_r.value()->close();
+    return;
+  }
+  if (dialer == 0) {
+    ::close(syncfd[0]);
+    auto p = duct::dial("shm://" + bus);
+    if (!p.ok()) _exit(1);
+    const std::string one_chunk(64 * 1024, 'a');
+    for (int i = 0; i < 64; ++i) {
+      if (!p.value()->send(duct::Message::from_string(one_chunk), {}).ok()) _exit(2);
+    }
+    const std::string two_chunks(64 * 1024 + 1, 'b');
+    // Blocks after the first chunk is committed because the ring is full.
+    (void)p.value()->send(duct::Message::from_string(two_chunks), {});
+    _exit(0);
+  }
+  ::close(syncfd[1]);
+  ::close(syncfd[0]);
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto accepted_fut = accepted.get_future();
+  std::thread accept_thread([&] { accepted.set_value(lis_r.value()->accept()); });
+  auto af = accepted_fut.wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(af == std::future_status::ready);
+  if (af != std::future_status::ready) {
+    ::kill(dialer, SIGKILL);
+    ::waitpid(dialer, nullptr, 0);
+    lis_r.value()->close();
+    accept_thread.join();
+    return;
+  }
+  auto accepted_r = accepted_fut.get();
+  EXPECT_TRUE(accepted_r.ok());
+  if (!accepted_r.ok()) {
+    ::kill(dialer, SIGKILL);
+    ::waitpid(dialer, nullptr, 0);
+    lis_r.value()->close();
+    accept_thread.join();
+    return;
+  }
+
+  // Consume one complete message so the dialer can commit the first chunk of
+  // the fragmented message. The second chunk still has no free slot.
+  auto first = accepted_r.value()->recv({std::chrono::milliseconds(1000)});
+  EXPECT_TRUE(first.ok());
+  if (!first.ok()) {
+    ::kill(dialer, SIGKILL);
+    ::waitpid(dialer, nullptr, 0);
+    lis_r.value()->close();
+    return;
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_TRUE(::kill(dialer, SIGKILL) == 0);
+  EXPECT_TRUE(::waitpid(dialer, nullptr, 0) == dialer);
+
+  duct::QosOptions qos;
+  qos.rcv_hwm_bytes = 16 * 1024 * 1024;
+  duct::QosPipe pipe(std::move(accepted_r.value()), qos);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  auto closed = std::promise<void>();
+  auto closed_fut = closed.get_future();
+  std::thread closer([&] {
+    pipe.close();
+    closed.set_value();
+  });
+  auto cf = closed_fut.wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(cf == std::future_status::ready);
+  if (cf != std::future_status::ready) {
+    closer.detach();
+  } else {
+    closer.join();
+  }
+
+  lis_r.value()->close();
+  accept_thread.join();
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -2853,8 +3508,10 @@ int main() {
   test_shm_echo_one();
   test_uds_echo_one();
   test_uds_multi_message_echo();
+  test_uds_concurrent_channel_recv();
   test_uds_peer_credential();
   test_shm_crash_recovery_reclaims_orphan();
+  test_shm_reclaims_legacy_orphan();
   test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();
@@ -2889,12 +3546,20 @@ int main() {
   test_qos_linger_drains_before_close();
   test_wire_fragmentation_and_reassembly();
   test_shm_fragmentation_and_reassembly();
+  test_shm_reassembly_size_capped();
   test_shm_fragmentation_midway_timeout_keeps_stream_synced();
   test_shm_configurable_slot_geometry();
   test_shm_geometry_mismatch_rejected();
+  test_shm_rejects_invalid_geometry();
   test_qos_priority_scheduling();
   test_tcp_channel_multiplexing();
   test_tcp_channel_recv_does_not_drop_other_channel();
+  test_tcp_channel_pending_capped();
+  test_shm_rejects_oversize_message();
+  test_tcp_channel_recv_deadline_bounded();
+  test_reconnect_channel_preserved();
+  test_tcp_concurrent_channel_recv();
+  test_qos_shm_recv_midfragment_close_completes();
   test_qos_rate_limit_paces_delivery();
   test_qos_rate_limit_default_burst_drains();
   test_qos_channel_multiplexing();
@@ -2912,6 +3577,7 @@ int main() {
   test_rpc_close_joins_without_transport_wakeup();
   test_pubsub_multiple_subscribers();
   test_pubsub_subscription_outlives_broker();
+  test_pubsub_concurrent_broker_subscription_destruction();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

@@ -23,6 +23,7 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <limits>
 #include <memory>
 #include <random>
 #include <signal.h>
@@ -45,6 +46,7 @@ namespace {
 
 constexpr std::uint32_t kFirstChunkFlag = 1u << 31;
 constexpr std::uint32_t kLastChunkFlag = 1u << 30;
+static constexpr std::size_t kMaxReassembledBytes = 64 * 1024 * 1024;  // 64 MiB
 
 static std::string sanitize_name(std::string_view s) {
   std::string out;
@@ -166,12 +168,19 @@ struct ShmLayout {
 
 static constexpr std::uint32_t kShmMagic = 0x4D484353;  // 'SHCM' little-endian marker
 
-// Total mapped size for a validated geometry.
+// Total mapped size for a validated geometry. Uses checked arithmetic so an
+// oversized slot_count cannot wrap the mapped size below the data offsets.
 static std::size_t layout_size(std::uint32_t slot_bytes, std::uint32_t slot_count) {
   // Each slot is 8 bytes of header (u32 len + u32 pad) followed by the payload,
   // rounded up to 8-byte alignment so the stride is stable across peers.
   const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
-  return sizeof(ShmLayout) + 2u * static_cast<std::size_t>(slot_count) * slot_stride;
+  constexpr std::size_t kRings = 2u;
+  if (slot_stride != 0 &&
+      slot_count > (std::numeric_limits<std::size_t>::max() - sizeof(ShmLayout)) /
+                       (kRings * slot_stride)) {
+    return 0;
+  }
+  return sizeof(ShmLayout) + kRings * static_cast<std::size_t>(slot_count) * slot_stride;
 }
 
 struct Slot {
@@ -204,8 +213,21 @@ static RingMeta* ring_meta(ShmLayout* l, bool c2s) {
 }
 
 static bool geometry_valid(std::uint32_t slot_bytes, std::uint32_t slot_count) {
-  // slot_bytes must leave the top two bits of the 32-bit length word free.
-  return slot_bytes != 0 && slot_bytes <= (kFirstChunkFlag - 1u) && slot_count != 0;
+  // slot_bytes must leave the top two bits of the 32-bit length word free so the
+  // first/last chunk flags do not collide with the length.
+  return slot_bytes != 0 && slot_bytes < kLastChunkFlag && slot_count != 0;
+}
+
+// Validate ShmOptions.slot_bytes (a size_t) before narrowing to uint32_t so an
+// oversized value (e.g. 4GiB+16) is rejected instead of silently truncated.
+static bool options_geometry_valid(std::size_t slot_bytes, std::uint32_t slot_count) {
+  if (slot_bytes > std::numeric_limits<std::uint32_t>::max()) return false;
+  const std::uint32_t bytes = static_cast<std::uint32_t>(slot_bytes);
+  if (!geometry_valid(bytes, slot_count)) return false;
+  // layout_size() returns 0 when the mapped size would overflow size_t; a
+  // caller must reject that geometry instead of creating a tiny segment whose
+  // slot offsets fall outside the mapping.
+  return layout_size(bytes, slot_count) != 0;
 }
 
 struct ShmNames {
@@ -392,7 +414,7 @@ static void close_handles(ShmHandles* h) {
 
 static Result<ShmHandles> create_resources(const ShmNames& n, const ShmOptions& opt) {
   ShmHandles h;
-  if (!geometry_valid(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count)) {
+  if (!options_geometry_valid(opt.slot_bytes, opt.slot_count)) {
     return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
   }
   const std::size_t size = layout_size(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count);
@@ -459,12 +481,12 @@ static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& ex
     ::close(h.shm_fd);
     return Status::io_error("fstat(shm) failed" + errno_suffix());
   }
-  const std::uint32_t slot_bytes = static_cast<std::uint32_t>(expected.slot_bytes);
-  const std::uint32_t slot_count = expected.slot_count;
-  if (!geometry_valid(slot_bytes, slot_count)) {
+  if (!options_geometry_valid(expected.slot_bytes, expected.slot_count)) {
     ::close(h.shm_fd);
     return Status::invalid_argument("invalid expected shm geometry");
   }
+  const std::uint32_t slot_bytes = static_cast<std::uint32_t>(expected.slot_bytes);
+  const std::uint32_t slot_count = expected.slot_count;
   const std::size_t size = layout_size(slot_bytes, slot_count);
   if (static_cast<std::size_t>(st.st_size) < size) {
     ::close(h.shm_fd);
@@ -472,7 +494,6 @@ static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& ex
   }
   void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, h.shm_fd, 0);
   if (p == MAP_FAILED) {
-    ::close(h.shm_fd);
     close_handles(&h);
     return Status::io_error("mmap(shm) failed" + errno_suffix());
   }
@@ -538,7 +559,9 @@ class ShmPipe final : public Pipe {
       // Waits for subsequent chunks use the blocking form so a mid-message
       // timeout does not leave a partially written stream that corrupts the
       // peer's reassembly. The first chunk still honors the caller timeout.
-      auto st = sem_wait_opt(spaces, first ? opt.timeout : std::chrono::milliseconds(0));
+      // Keep waits after the first chunk bounded so a stopped reader cannot hold
+      // QosPipe::close() open or race close() with an in-flight semaphore wait.
+      auto st = sem_wait_opt(spaces, first ? opt.timeout : std::chrono::milliseconds(100));
       if (!st.ok()) return st;
 
       std::uint32_t head = tx->head.load(std::memory_order_relaxed);
@@ -571,9 +594,12 @@ class ShmPipe final : public Pipe {
     std::vector<std::uint8_t> assembled;
     bool first = true;
     for (;;) {
-      // Likewise once reassembly has started we must consume the whole message;
-      // a timeout mid-fragment would strand the receiver out of sync.
-      auto st = sem_wait_opt(items, first ? opt.timeout : std::chrono::milliseconds(0));
+      // Once reassembly has started we must consume the whole message to keep the
+      // stream synchronized. The first chunk honors the caller timeout; later
+      // chunks use a bounded wait so a stopped sender cannot wedge the worker
+      // (and thus QosPipe::close()) forever. A timeout mid-fragment leaves the
+      // stream out of sync, which the next read reports as a protocol error.
+      auto st = sem_wait_opt(items, first ? opt.timeout : std::chrono::milliseconds(100));
       if (!st.ok()) return st.status();
 
       std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
@@ -598,6 +624,9 @@ class ShmPipe final : public Pipe {
       }
 
       const std::size_t old = assembled.size();
+      if (old > kMaxReassembledBytes || len > kMaxReassembledBytes - old) {
+        return Status::protocol_error("shm fragment stream too large");
+      }
       assembled.resize(old + len);
       if (len != 0) std::memcpy(assembled.data() + old, slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
       rx->tail.store(tail + 1, std::memory_order_release);
@@ -666,6 +695,12 @@ class ShmListener final : public Listener {
 }  // namespace duct
 
 #if !defined(_WIN32)
+// Pre-63a492e shm segments used a fixed 64-slot / 64KiB layout. Their
+// owner_pid/magic live at the end of an ~8 MiB struct, so the new header read
+// (offset 0-15) cannot identify them. Keep the legacy magic offset so upgraded
+// builds can still reclaim orphans left by an older binary.
+constexpr std::size_t kLegacyMagicOffset = 8389764;  // owner_pid|magic tail
+
 // Reclaim orphaned shm resources for a bus. A connection's owner records its
 // PID in the segment header. If the owner died without running close() (e.g.
 // SIGKILL), the segment and its four semaphores are left behind. Scan /dev/shm
@@ -691,25 +726,71 @@ static void reclaim_orphaned_bus(const std::string& bus_name) {
     const std::string seg_name = "/" + name;
     int fd = ::shm_open(seg_name.c_str(), O_RDWR, 0600);
     if (fd < 0) continue;
+    // Reject undersized files before mapping: mapping a file shorter than the
+    // header and reading past its last page raises SIGBUS (local DoS via a
+    // hostile /dev/shm file). fstat gives the real size.
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(ShmLayout))) {
+      ::close(fd);
+      continue;
+    }
     // Read the header to get geometry. We cannot know the size without it, so
     // map just the fixed header then the full size.
     void* p = ::mmap(nullptr, sizeof(ShmLayout), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (p == MAP_FAILED) continue;
+    if (p == MAP_FAILED) {
+      ::close(fd);
+      continue;
+    }
 
     const auto* layout = static_cast<const ShmLayout*>(p);
-    const std::uint32_t owner = layout->owner_pid.load(std::memory_order_acquire);
+    std::uint32_t owner = layout->owner_pid.load(std::memory_order_acquire);
     const std::uint32_t magic = layout->magic.load(std::memory_order_acquire);
-    const std::uint32_t slot_bytes = layout->slot_bytes;
-    const std::uint32_t slot_count = layout->slot_count;
+    std::uint32_t slot_bytes = layout->slot_bytes;
+    std::uint32_t slot_count = layout->slot_count;
     ::munmap(p, sizeof(ShmLayout));
 
-    if (magic != kShmMagic) continue;  // not a live aello segment
-    if (!geometry_valid(slot_bytes, slot_count)) continue;
-    if (owner == 0) continue;
+    bool legacy = false;
+    if (magic != kShmMagic) {
+      // Maybe a pre-geometry segment. Read its magic from the legacy tail
+      // offset without mapping (pread cannot SIGBUS). If it matches, it is a
+      // valid legacy aello segment whose owner_pid/magic are at that offset.
+      if (st.st_size >= static_cast<off_t>(kLegacyMagicOffset + 4u)) {
+        std::uint32_t tail_owner = 0;
+        std::uint32_t tail_magic = 0;
+        if (::pread(fd, &tail_owner, sizeof(tail_owner), kLegacyMagicOffset - 4u) ==
+                static_cast<ssize_t>(sizeof(tail_owner)) &&
+            ::pread(fd, &tail_magic, sizeof(tail_magic), kLegacyMagicOffset) ==
+                static_cast<ssize_t>(sizeof(tail_magic))) {
+          legacy = (tail_magic == kShmMagic);
+          if (legacy) {
+            owner = tail_owner;
+            // Legacy segments used a fixed 64-slot / 64 KiB layout whose
+            // slot_bytes/slot_count live at offset 0 (the old RingMeta head/tail
+            // fields), so the new header read above yields zero. Substitute the
+            // fixed geometry so geometry_valid() below accepts them.
+            slot_bytes = 64 * 1024;
+            slot_count = 64;
+          }
+        }
+      }
+      if (!legacy) {
+        ::close(fd);
+        continue;  // not a live aello segment
+      }
+    }
+    if (!geometry_valid(slot_bytes, slot_count)) {
+      ::close(fd);
+      continue;
+    }
+    if (owner == 0) {
+      ::close(fd);
+      continue;
+    }
     if (::kill(static_cast<pid_t>(owner), 0) == 0 || errno == EPERM) {
+      ::close(fd);
       continue;  // owner still alive
     }
+    ::close(fd);
 
     // Owner is gone: unlink the segment and its semaphores.
     ::shm_unlink(seg_name.c_str());
@@ -731,7 +812,7 @@ Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const List
 #if !defined(_WIN32)
   reclaim_orphaned_bus(name);
 #endif
-  if (!geometry_valid(static_cast<std::uint32_t>(opt.shm.slot_bytes), opt.shm.slot_count)) {
+  if (!options_geometry_valid(opt.shm.slot_bytes, opt.shm.slot_count)) {
     return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
   }
   ShmNames n = make_names(name, "0000000000000000");

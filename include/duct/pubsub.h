@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -25,26 +26,50 @@ namespace duct::pubsub {
 // is a separate dispatch-layer problem) and does not assume SPSC rings.
 class Broker {
  public:
+  struct Sub {
+    std::uint64_t id;
+    std::string filter;
+    std::function<void(std::string, Message)> cb;
+  };
+
+  // Shared, reference-counted state. Both the Broker and every Subscription
+  // hold a reference, so the mutex/subs live as long as any Subscription does
+  // and a destructor racing the broker cannot touch freed memory.
+  struct State {
+    std::mutex mu;
+    std::vector<Sub> subs;
+    std::uint64_t next_id = 1;
+    std::atomic<bool> alive{true};
+  };
+
   ~Broker() {
     // Invalidate subscriptions before destroying internal state so a
     // Subscription outliving the Broker cannot call into freed memory.
-    *alive_ = false;
+    state_->alive.store(false, std::memory_order_release);
   }
 
   // Subscriber handle. Destroying it unsubscribes.
   class Subscription {
    public:
-    Subscription(Broker* broker, std::shared_ptr<bool> alive, std::uint64_t id)
-        : broker_(broker), alive_(std::move(alive)), id_(id) {}
+    Subscription(std::shared_ptr<State> state, std::uint64_t id)
+        : state_(std::move(state)), id_(id) {}
     ~Subscription() {
-      if (broker_ && *alive_) broker_->unsubscribe(id_);
+      // Check-then-act: the broker may be concurrently destroyed. The shared
+      // State outlives the broker (we hold a reference), so the unsubscribe
+      // below locks a live mutex even if ~Broker already ran.
+      if (state_->alive.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(state_->mu);
+        state_->subs.erase(
+            std::remove_if(state_->subs.begin(), state_->subs.end(),
+                           [&](const Sub& s) { return s.id == id_; }),
+            state_->subs.end());
+      }
     }
     Subscription(const Subscription&) = delete;
     Subscription& operator=(const Subscription&) = delete;
     std::uint64_t id() const { return id_; }
    private:
-    Broker* broker_;
-    std::shared_ptr<bool> alive_;
+    std::shared_ptr<State> state_;
     std::uint64_t id_;
   };
 
@@ -52,18 +77,18 @@ class Broker {
   // "foo" both match "foo/bar"). The callback runs on the publisher's thread.
   std::unique_ptr<Subscription> subscribe(std::string filter,
                                           std::function<void(std::string, Message)> cb) {
-    std::lock_guard<std::mutex> lock(mu_);
-    const std::uint64_t id = next_id_++;
-    subs_.push_back({id, std::move(filter), std::move(cb)});
-    return std::make_unique<Subscription>(this, alive_, id);
+    std::lock_guard<std::mutex> lock(state_->mu);
+    const std::uint64_t id = state_->next_id++;
+    state_->subs.push_back({id, std::move(filter), std::move(cb)});
+    return std::make_unique<Subscription>(state_, id);
   }
 
   // Publish a message to all subscribers whose filter is a prefix of `topic`.
   void publish(const std::string& topic, const Message& msg) {
     std::vector<std::function<void(std::string, Message)>> cbs;
     {
-      std::lock_guard<std::mutex> lock(mu_);
-      for (const auto& s : subs_) {
+      std::lock_guard<std::mutex> lock(state_->mu);
+      for (const auto& s : state_->subs) {
         if (topic.compare(0, s.filter.size(), s.filter) == 0) {
           cbs.push_back(s.cb);
         }
@@ -73,23 +98,7 @@ class Broker {
   }
 
  private:
-  struct Sub {
-    std::uint64_t id;
-    std::string filter;
-    std::function<void(std::string, Message)> cb;
-  };
-
-  void unsubscribe(std::uint64_t id) {
-    std::lock_guard<std::mutex> lock(mu_);
-    subs_.erase(std::remove_if(subs_.begin(), subs_.end(),
-                               [&](const Sub& s) { return s.id == id; }),
-                subs_.end());
-  }
-
-  std::mutex mu_;
-  std::vector<Sub> subs_;
-  std::uint64_t next_id_ = 1;
-  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+  std::shared_ptr<State> state_ = std::make_shared<State>();
 };
 
 }  // namespace duct::pubsub

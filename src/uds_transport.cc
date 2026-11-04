@@ -47,6 +47,9 @@ class UdsPipe final : public Pipe {
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
     if (fd_ < 0) return Status::closed("pipe closed");
+    // Serialize socket reads: concurrent recv() calls for different channels
+    // must not interleave their raw frame reads on the same fd.
+    std::lock_guard<std::mutex> lock(read_mu_);
     if (opt.timeout.count() > 0) {
       auto st = socket_utils::wait_readable(fd_, opt.timeout);
       if (!st.ok()) return st.status();
@@ -55,6 +58,8 @@ class UdsPipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
+    const bool has_deadline = opt.timeout.count() > 0;
+    const auto deadline = std::chrono::steady_clock::now() + opt.timeout;
     for (;;) {
       {
         std::lock_guard<std::mutex> lock(ch_mu_);
@@ -66,15 +71,41 @@ class UdsPipe final : public Pipe {
           return msg;
         }
       }
-      auto r = recv_frame(opt);
-      if (!r.ok()) return r.status();
+      RecvOptions frame_opt = opt;
+      if (has_deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return Status::timeout("recv timed out");
+        frame_opt.timeout = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      }
+      auto r = recv_frame(frame_opt);
+      if (!r.ok()) {
+        // Another thread may have buffered a matching frame for this channel
+        // while we were blocked in recv_frame (e.g. the peer kept sending on
+        // other channels). Serve it before surfacing the timeout/error.
+        std::lock_guard<std::mutex> lock(ch_mu_);
+        auto it = pending_.find(opt.channel_id);
+        if (it != pending_.end() && !it->second.empty()) {
+          auto msg = std::move(it->second.front().message);
+          it->second.erase(it->second.begin());
+          if (it->second.empty()) pending_.erase(it);
+          return msg;
+        }
+        return r.status();
+      }
       if (opt.channel_id == 0 ||
           flags_to_channel_id(r.value().flags) == opt.channel_id) {
         return std::move(r.value().message);
       }
       {
         std::lock_guard<std::mutex> lock(ch_mu_);
-        pending_[flags_to_channel_id(r.value().flags)].push_back(std::move(r.value()));
+        static constexpr std::size_t kMaxPendingBytes = 64 * 1024 * 1024;
+        auto& pending = pending_[flags_to_channel_id(r.value().flags)];
+        std::size_t bytes = r.value().message.size();
+        for (const auto& f : pending) bytes += f.message.size();
+        if (bytes > kMaxPendingBytes) {
+          return Status::queue_full("channel recv buffer full");
+        }
+        pending.push_back(std::move(r.value()));
       }
     }
   }
@@ -108,6 +139,7 @@ class UdsPipe final : public Pipe {
  private:
   int fd_ = -1;
   std::mutex ch_mu_;
+  std::mutex read_mu_;
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
 };
 

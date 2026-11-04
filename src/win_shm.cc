@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <new>
 #include <random>
@@ -81,7 +82,33 @@ struct ShmLayout {
 };
 
 static bool geometry_valid(std::uint32_t slot_bytes, std::uint32_t slot_count) {
-  return slot_bytes != 0 && slot_bytes <= (1u << 30) && slot_count != 0;
+  // Match the POSIX bound (src/shm_transport.cc): slot_bytes must be below the
+  // kLastChunkFlag bit so the 32-bit length word never collides with a chunk
+  // flag. A slot is also limited to a signed LONG for the CreateSemaphore
+  // max-count and DWORD sizing, so stay well under 2^31.
+  return slot_bytes != 0 && slot_bytes < (1u << 30) && slot_count != 0;
+}
+
+// Checked total mapped size; returns 0 on overflow so callers reject the
+// geometry instead of creating a tiny mapping whose slot offsets fall outside.
+static std::size_t layout_size_checked(std::uint32_t slot_bytes, std::uint32_t slot_count) {
+  const std::size_t slot_stride = (static_cast<std::size_t>(slot_bytes) + 8u + 7u) & ~std::size_t(7u);
+  constexpr std::size_t kRings = 2u;
+  if (slot_stride != 0 &&
+      slot_count > (std::numeric_limits<std::size_t>::max() - sizeof(ShmLayout)) /
+                       (kRings * slot_stride)) {
+    return 0;
+  }
+  return sizeof(ShmLayout) + kRings * static_cast<std::size_t>(slot_count) * slot_stride;
+}
+
+// Validate ShmOptions.slot_bytes (a size_t) before narrowing to uint32_t so an
+// oversized value is rejected instead of silently truncated.
+static bool options_geometry_valid(std::size_t slot_bytes, std::uint32_t slot_count) {
+  if (slot_bytes > std::numeric_limits<std::uint32_t>::max()) return false;
+  const std::uint32_t bytes = static_cast<std::uint32_t>(slot_bytes);
+  if (!geometry_valid(bytes, slot_count)) return false;
+  return layout_size_checked(bytes, slot_count) != 0;
 }
 
 static std::size_t layout_size(std::uint32_t slot_bytes, std::uint32_t slot_count) {
@@ -224,7 +251,7 @@ static Result<void> wait_handle_opt(HANDLE handle, std::chrono::milliseconds tim
 
 static Result<ShmHandles> create_resources(const ShmNames& n, const ShmOptions& opt) {
   ShmHandles h;
-  if (!geometry_valid(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count)) {
+  if (!options_geometry_valid(opt.slot_bytes, opt.slot_count)) {
     return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
   }
   const std::size_t size = layout_size(static_cast<std::uint32_t>(opt.slot_bytes), opt.slot_count);
@@ -288,6 +315,12 @@ static Result<ShmHandles> create_resources(const ShmNames& n, const ShmOptions& 
 static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& expected) {
   ShmHandles h;
 
+  if (!options_geometry_valid(expected.slot_bytes, expected.slot_count)) {
+    return Status::invalid_argument("invalid expected shm geometry");
+  }
+  const std::size_t size = layout_size_checked(
+      static_cast<std::uint32_t>(expected.slot_bytes), expected.slot_count);
+
   // Open shared memory
   h.shm_handle = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, n.shm.c_str());
   if (h.shm_handle == NULL) {
@@ -299,7 +332,7 @@ static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& ex
     h.shm_handle,
     FILE_MAP_ALL_ACCESS,
     0, 0,
-    layout_size(static_cast<std::uint32_t>(expected.slot_bytes), expected.slot_count)
+    size
   ));
   if (h.mem == nullptr) {
     close_handles(&h);
@@ -368,6 +401,13 @@ class ShmPipe final : public Pipe {
     RingMeta* tx = ring_meta(h_.mem, tx_ring);
     const std::uint32_t slot_bytes = h_.slot_bytes;
     const std::uint32_t slot_count = h_.slot_count;
+
+    // A single slot cannot carry more than slot_bytes (Windows has no
+    // fragmentation). Reject oversize messages before writing so the shared
+    // mapping is never overrun, mirroring the POSIX per-chunk bound.
+    if (msg.size() > slot_bytes) {
+      return Status::invalid_argument("message larger than shm slot");
+    }
 
     auto st = wait_handle_opt(spaces, opt.timeout);
     if (!st.ok()) return st;
@@ -506,7 +546,7 @@ class ShmListener final : public Listener {
 }  // namespace
 
 Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const ListenOptions& opt) {
-  if (!geometry_valid(static_cast<std::uint32_t>(opt.shm.slot_bytes), opt.shm.slot_count)) {
+  if (!options_geometry_valid(opt.shm.slot_bytes, opt.shm.slot_count)) {
     return Status::invalid_argument("invalid shm geometry (slot_bytes/slot_count)");
   }
   ShmNames n = make_names(name, "0000000000000000");

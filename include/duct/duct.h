@@ -158,13 +158,14 @@ class Listener {
 
 struct DialOptions {
   // Bound for the overall connection attempt. A zero timeout uses the transport's
-  // default behavior. Reconnect-enabled dials are not wired yet.
+  // default behavior.
   std::chrono::milliseconds timeout{0};
   QosOptions qos{};
   ShmOptions shm{};
-  // Reserved: not yet honored by dial() (see src/duct.cc).
+  // When enabled, dial() wraps the transport in a ReconnectPipe that redials on
+  // disconnect (see src/duct.cc).
   ReconnectPolicy reconnect{};
-  // Reserved: not yet honored by dial() (see src/duct.cc).
+  // Called on each connection-state transition of a reconnect-enabled dial.
   ConnectionCallback on_state_change{};
 };
 
