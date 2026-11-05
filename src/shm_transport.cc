@@ -48,6 +48,17 @@ constexpr std::uint32_t kFirstChunkFlag = 1u << 31;
 constexpr std::uint32_t kLastChunkFlag = 1u << 30;
 static constexpr std::size_t kMaxReassembledBytes = 64 * 1024 * 1024;  // 64 MiB
 
+// Bound for waits between fragments of a multi-slot message (send and recv).
+// The first fragment honors the caller timeout; continuation fragments use this
+// bounded wait so a peer that stopped mid-message cannot wedge the transport
+// worker (and thus QosPipe::close()) forever. It is intentionally generous: a
+// large message streams many fragments and the peer thread may be descheduled
+// between them, so a tight wait would false-timeout a live peer under load.
+// Must stay below the crash-recovery close() deadline (tests expect a worker
+// blocked on a dead sender to unblock within ~3s) while comfortably exceeding
+// any realistic scheduling gap between two 64 KiB fragments.
+static constexpr std::chrono::milliseconds kMidFragmentWait(2000);
+
 static std::string sanitize_name(std::string_view s) {
   std::string out;
   out.reserve(s.size());
@@ -561,7 +572,10 @@ class ShmPipe final : public Pipe {
       // peer's reassembly. The first chunk still honors the caller timeout.
       // Keep waits after the first chunk bounded so a stopped reader cannot hold
       // QosPipe::close() open or race close() with an in-flight semaphore wait.
-      auto st = sem_wait_opt(spaces, first ? opt.timeout : std::chrono::milliseconds(100));
+      // The bound is generous: a large message streams many fragments and the
+      // reader thread may be descheduled between them, so a tight wait would
+      // false-timeout a live peer under load (kTimeout mid-reassembly).
+      auto st = sem_wait_opt(spaces, first ? opt.timeout : kMidFragmentWait);
       if (!st.ok()) return st;
 
       std::uint32_t head = tx->head.load(std::memory_order_relaxed);
@@ -599,7 +613,10 @@ class ShmPipe final : public Pipe {
       // chunks use a bounded wait so a stopped sender cannot wedge the worker
       // (and thus QosPipe::close()) forever. A timeout mid-fragment leaves the
       // stream out of sync, which the next read reports as a protocol error.
-      auto st = sem_wait_opt(items, first ? opt.timeout : std::chrono::milliseconds(100));
+      // The bound is generous: a 64 MiB message arrives in many fragments and
+      // the sender thread may be descheduled between them, so a tight wait
+      // would false-timeout a live peer under load (kTimeout mid-reassembly).
+      auto st = sem_wait_opt(items, first ? opt.timeout : kMidFragmentWait);
       if (!st.ok()) return st.status();
 
       std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
