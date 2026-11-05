@@ -23,8 +23,9 @@ Experimental, pre-release. What exists today:
   (POSIX) and `pipe://` (Windows named pipes).
 - The `shm://` fast path: a bounded, pre-allocated fixed-slot ring per direction
   (64 slots × 64 KiB), semaphore-synchronized, with copy-send semantics.
-- A 16-byte wire header for byte-stream transports; per-frame payloads are capped at
-  64 KiB, and larger messages are fragmented and reassembled (up to a 64 MiB limit).
+- A 16-byte wire header for the socket byte-stream transports (`tcp://`, `uds://`);
+  per-frame payloads are capped at 64 KiB, and larger messages are fragmented and
+  reassembled (up to a 64 MiB limit).
 - A QoS layer with send/receive byte watermarks (`QosOptions::snd_hwm_bytes` /
   `rcv_hwm_bytes`), backpressure policies, and per-message TTL.
 - Automatic reconnect with exponential backoff (`DialOptions::reconnect`,
@@ -108,8 +109,11 @@ Every call returns a `Result<T>`; check `.ok()` and read `.status()` — no exce
 
 - **Copy send.** Payloads are copied into the transport (ring slot or framed
   stream). Zero-copy claim/commit is a deferred capability, not a current one.
-- **Single messages up to 64 KiB.** Larger payloads are rejected until
-  fragmentation exists.
+- **Per-frame 64 KiB cap on socket byte-stream transports (`tcp://`, `uds://`).**
+  Larger messages are fragmented and reassembled, up to a 64 MiB limit. The POSIX
+  `shm://` transport reassembles across ring slots up to the same limit. `pipe://`
+  and Windows `shm://` do not fragment and reject messages over their per-frame or
+  per-slot limit.
 - **Full queue behavior on `shm://`:** send blocks until space or timeout
   (`SendOptions::timeout`), then returns `kTimeout`. This is the transport-level
   behavior (with QoS disabled); with QoS enabled the in-memory send queue's
