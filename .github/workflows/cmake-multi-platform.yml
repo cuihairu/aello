@@ -70,6 +70,15 @@ jobs:
 
     - name: Test
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
-      # Execute tests defined by the CMake configuration. Note that --build-config is needed because the default Windows generator is a multi-config generator (Visual Studio generator).
-      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
-      run: ctest --build-config ${{ matrix.build_type }} --output-on-failure
+      shell: bash
+      # Run the test binary directly (not via ctest) so its [RUN]/[DONE]
+      # progress markers stream to the workflow log in real time. ctest buffers
+      # a test's output until it exits, so a test that hangs (e.g. a Windows
+      # named-pipe accept blocked forever) would show no output and hide where
+      # it stopped; the last [RUN] line here pinpoints the hang.
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          ./Release/duct_tests.exe
+        else
+          ctest --build-config ${{ matrix.build_type }} --output-on-failure
+        fi
