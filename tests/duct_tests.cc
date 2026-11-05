@@ -19,8 +19,6 @@
 #include <map>
 #include <mutex>
 #include <set>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -29,6 +27,7 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <netinet/in.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
