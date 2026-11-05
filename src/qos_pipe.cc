@@ -362,6 +362,10 @@ void QosPipe::recv_worker() {
   }
 }
 
+std::size_t QosPipe::max_message_bytes() const {
+  return std::min(qos_.max_message_bytes, underlying_->max_message_bytes());
+}
+
 void QosPipe::close() {
   // Linger: allow queued outbound messages to drain for up to qos_.linger
   // before force-closing. Zero means best-effort immediate close.

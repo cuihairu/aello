@@ -33,6 +33,7 @@ class QosPipe : public Pipe {
 
   Result<void> send(const Message& msg, const SendOptions& opt) override;
   Result<Message> recv(const RecvOptions& opt) override;
+  std::size_t max_message_bytes() const override;
   void close() override;
 
  private:

@@ -265,6 +265,24 @@ class SourcePipe final : public duct::Pipe {
   bool closed_ = false;
 };
 
+// Test double with a fixed send-side bound (like pipe:// or Windows shm://).
+class BoundedPipe final : public duct::Pipe {
+ public:
+  explicit BoundedPipe(std::size_t cap) : cap_(cap) {}
+
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    return {};
+  }
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    return duct::Status::timeout("no inbound data");
+  }
+  std::size_t max_message_bytes() const override { return cap_; }
+  void close() override {}
+
+ private:
+  std::size_t cap_;
+};
+
 static void test_address_parse() {
   {
     auto a = duct::Address::parse("127.0.0.1:1234");
@@ -553,6 +571,52 @@ static void test_pipe_dial_failure_unblocks_accept() {
   }
 #endif
 }
+
+// Several threads may call accept() concurrently. close() must cancel and close
+// *every* pending accept, not just the most recently registered one, so no
+// accept thread stays blocked in ConnectNamedPipe forever. All accept calls
+// must return promptly with kClosed when the listener is closed.
+static void test_pipe_concurrent_accepts_unblock_on_close() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_concurrent_accept");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_concurrent_accept");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  constexpr int kAcceptors = 4;
+  std::vector<std::future<duct::Result<void>>> acceptors;
+  for (int i = 0; i < kAcceptors; ++i) {
+    acceptors.push_back(std::async(std::launch::async, [&]() -> duct::Result<void> {
+      auto p = lis_r.value()->accept();
+      if (!p.ok()) return p.status();
+      return {};
+    }));
+  }
+
+  // Let every accept thread reach ConnectNamedPipe, then close the listener.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  lis_r.value()->close();
+
+  for (auto& fut : acceptors) {
+    auto sst = fut.wait_for(std::chrono::seconds(3));
+    EXPECT_TRUE(sst == std::future_status::ready);
+    if (sst == std::future_status::ready) {
+      auto sr = fut.get();
+      EXPECT_TRUE(!sr.ok());
+      if (!sr.ok()) {
+        EXPECT_EQ(sr.status().code(), duct::StatusCode::kClosed);
+      }
+    }
+  }
+#endif
+}
+
 static void test_shm_backpressure_timeout() {
   auto lis_r = duct::listen("shm://duct_testbp");
   EXPECT_TRUE(lis_r.ok());
@@ -2673,6 +2737,52 @@ static void test_qos_rate_limit_default_burst_drains() {
   pipe.close();
 }
 
+// QoS must publish the smaller of its configured cap and the underlying
+// transport's non-fragmenting bound. When reconnect wraps QoS, ReconnectPipe
+// must still see that bound instead of the base-class "unlimited" default.
+static void test_qos_and_reconnect_forward_max_message_bytes() {
+  constexpr std::size_t kTransportCap = 1024;
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 0;
+  qos.rcv_hwm_bytes = 0;
+  auto qosed_bounded = std::make_unique<duct::QosPipe>(
+      std::make_unique<BoundedPipe>(kTransportCap), qos);
+  EXPECT_TRUE(qosed_bounded->max_message_bytes() == kTransportCap);
+
+  duct::QosOptions limited_qos;
+  limited_qos.snd_hwm_bytes = 0;
+  limited_qos.rcv_hwm_bytes = 0;
+  limited_qos.max_message_bytes = kTransportCap / 2;
+  auto qosed_limited = std::make_unique<duct::QosPipe>(
+      std::make_unique<BoundedPipe>(kTransportCap), limited_qos);
+  EXPECT_TRUE(qosed_limited->max_message_bytes() == kTransportCap / 2);
+
+  duct::ReconnectPolicy policy;
+  policy.initial_delay = std::chrono::milliseconds(5);
+  policy.max_delay = std::chrono::milliseconds(20);
+  policy.backoff_multiplier = 1.0;
+  policy.max_attempts = 1;
+
+  auto dial_once = [&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    duct::QosOptions inner_qos;
+    inner_qos.snd_hwm_bytes = 0;
+    inner_qos.rcv_hwm_bytes = 0;
+    auto qosed = std::make_unique<duct::QosPipe>(
+        std::make_unique<BoundedPipe>(kTransportCap), inner_qos);
+    return std::unique_ptr<duct::Pipe>(std::move(qosed));
+  };
+
+  auto reconnect = duct::make_reconnect_pipe(
+      std::move(dial_once), policy, nullptr);
+  constexpr std::size_t kUnlimited = std::numeric_limits<std::size_t>::max();
+  for (int i = 0; i < 100 && reconnect->max_message_bytes() == kUnlimited; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(reconnect->max_message_bytes() == kTransportCap);
+  reconnect->close();
+}
+
 static void test_qos_channel_multiplexing() {
   // A QoS-wrapped tcp pipe must preserve channel_id end-to-end, matching the
   // direct tcp/uds behavior: send on a channel, receive on that same channel,
@@ -3811,6 +3921,7 @@ int main() {
   test_pipe_echo_one();
   test_pipe_rejects_oversize_message();
   test_pipe_dial_failure_unblocks_accept();
+  test_pipe_concurrent_accepts_unblock_on_close();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
@@ -3862,6 +3973,7 @@ int main() {
   test_qos_shm_recv_midfragment_close_completes();
   test_qos_rate_limit_paces_delivery();
   test_qos_rate_limit_default_burst_drains();
+  test_qos_and_reconnect_forward_max_message_bytes();
   test_qos_channel_multiplexing();
   test_tcp_handshake_negotiates_version();
   test_tcp_accept_rejects_silent_peer();
