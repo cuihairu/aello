@@ -22,8 +22,9 @@
   与 `pipe://`（Windows 命名管道）。
 - `shm://` 快路径：每方向一个有界、预分配的固定槽环（64 槽 × 64 KiB），
   信号量同步，复制发送语义。
-- 套接字字节流传输（`tcp://`、`uds://`）使用 16 字节帧头；单帧负载上限 64 KiB，
-  更大的消息被分片并重组（上限 64 MiB）。
+- 字节流传输（`tcp://`、`uds://`、`pipe://`）使用 16 字节帧头。套接字字节流
+  传输（`tcp://`、`uds://`）单帧负载上限 64 KiB，更大的消息被分片并重组（上限
+  64 MiB）。
 - QoS 层：发送/接收字节水位（`QosOptions::snd_hwm_bytes` / `rcv_hwm_bytes`）、
   背压策略、逐消息 TTL。
 - 自动重连：指数退避（`DialOptions::reconnect`、`src/reconnect_pipe.cc`）。
@@ -107,7 +108,7 @@ auto reply = pipe.value()->recv({});
   延后能力，不是现状。
 - **套接字字节流传输（`tcp://`、`uds://`）单帧上限 64 KiB。** 更大的消息被分片
   并重组，上限 64 MiB。POSIX `shm://` 跨环形槽重组至同一上限。`pipe://` 与 Windows
-  `shm://` 不分片，超过各自帧/槽上限的消息会被拒绝。
+  `shm://` 不分片，超过各自帧/槽上限的消息会在发送端被拒绝（`kInvalidArgument`）。
 - **`shm://` 队列满行为：** send 阻塞至有空间或超时（`SendOptions::timeout`），
   超时返回 `kTimeout`。这是传输层（关闭 QoS 时）的行为；启用 QoS 时先由
   内存发送队列的 `snd_hwm_bytes` 高水位约束。

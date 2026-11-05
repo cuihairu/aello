@@ -81,6 +81,15 @@ class NamedPipePipe final : public Pipe {
       return Status::closed("pipe closed");
     }
 
+    // A single named-pipe frame cannot carry more than kMaxFramePayload bytes:
+    // pipe:// has no fragmentation, so an oversize message can never be
+    // reassembled by the peer. Reject it synchronously (mirroring the Windows
+    // shm bound) instead of writing a frame the peer will discard, which would
+    // leave the payload bytes in the pipe to desynchronize the next frame.
+    if (msg.size() > kMaxFramePayload) {
+      return Status::invalid_argument("message larger than pipe frame");
+    }
+
     // Frame the message using duct wire protocol
     FrameHeader h;
     h.magic = kProtocolMagic;

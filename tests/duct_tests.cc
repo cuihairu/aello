@@ -3,6 +3,7 @@
 #include "duct/qos_pipe.h"
 #include "duct/pubsub.h"
 #include "duct/rpc.h"
+#include "duct/socket_utils.h"
 #include "duct/wire.h"
 #include "../src/reconnect_pipe.h"
 
@@ -444,6 +445,57 @@ static void test_pipe_echo_one() {
   if (sst == std::future_status::ready) {
     auto sr = server.get();
     EXPECT_TRUE(sr.ok());
+  }
+
+  lis_r.value()->close();
+#endif
+}
+
+static void test_pipe_rejects_oversize_message() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_oversize");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_oversize");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("pipe://duct_testpipe_oversize", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  const std::string payload(duct::wire::kMaxFramePayload + 1, 'x');
+  auto st = c.value()->send(duct::Message::from_string(payload), {});
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(!sr.ok());
+    if (!sr.ok()) {
+      EXPECT_EQ(sr.status().code(), duct::StatusCode::kClosed);
+    }
   }
 
   lis_r.value()->close();
@@ -2703,13 +2755,26 @@ static void test_tcp_accept_rejects_silent_peer() {
   });
 
   // Open a raw socket to the listener and send nothing.
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  EXPECT_TRUE(fd >= 0);
+  auto net = duct::socket_utils::ensure_networking();
+  EXPECT_TRUE(net.ok());
+  if (!net.ok()) return;
+  duct::wire::SocketHandle fd =
+      static_cast<duct::wire::SocketHandle>(::socket(AF_INET, SOCK_STREAM, 0));
+  EXPECT_TRUE(fd != duct::wire::kInvalidSocket);
+  if (fd == duct::wire::kInvalidSocket) {
+    lis_r.value()->close();
+    return;
+  }
   sockaddr_in sin{};
   sin.sin_family = AF_INET;
   sin.sin_port = htons(static_cast<std::uint16_t>(std::stoi(addr_r.value().substr(addr_r.value().rfind(':') + 1))));
   sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#if defined(_WIN32)
+  EXPECT_TRUE(::connect(static_cast<SOCKET>(fd),
+                        reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) == 0);
+#else
   EXPECT_TRUE(::connect(fd, reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) == 0);
+#endif
 
   auto st = accept_fut.wait_for(std::chrono::seconds(1));
   EXPECT_TRUE(st == std::future_status::ready);
@@ -2722,7 +2787,7 @@ static void test_tcp_accept_rejects_silent_peer() {
   } else {
     EXPECT_TRUE(false);
   }
-  ::close(fd);
+  duct::socket_utils::close_socket(fd);
   lis_r.value()->close();
 }
 
@@ -3674,6 +3739,7 @@ int main() {
   test_shm_crash_recovery_reclaims_orphan();
   test_shm_reclaims_legacy_orphan();
   test_pipe_echo_one();
+  test_pipe_rejects_oversize_message();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
