@@ -474,12 +474,25 @@ static void test_pipe_rejects_oversize_message() {
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+  // QoS enabled (default): an oversize pipe message must be rejected
+  // synchronously by QosPipe::send() rather than enqueued and silently dropped
+  // by the drain worker after the transport rejects it.
   duct::DialOptions dial_opt;
-  dial_opt.qos.snd_hwm_bytes = 0;
-  dial_opt.qos.rcv_hwm_bytes = 0;
+  dial_opt.qos.enabled = true;
+  dial_opt.qos.snd_hwm_bytes = 4 * 1024 * 1024;
   auto c = duct::dial("pipe://duct_testpipe_oversize", dial_opt);
   EXPECT_TRUE(c.ok());
-  if (!c.ok()) return;
+  if (!c.ok()) {
+    // The dial failed; the accept thread may still be blocked in
+    // ConnectNamedPipe. Close the listener to cancel it so the async future's
+    // destructor does not join a permanently blocked accept thread (which would
+    // hang the whole test process instead of reporting the failure).
+    lis_r.value()->close();
+    if (server.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+      server.get();
+    }
+    return;
+  }
 
   const std::string payload(duct::wire::kMaxFramePayload + 1, 'x');
   auto st = c.value()->send(duct::Message::from_string(payload), {});
@@ -502,6 +515,44 @@ static void test_pipe_rejects_oversize_message() {
 #endif
 }
 
+// A dial that fails (no server listening) must not leave a thread blocked in
+// ConnectNamedPipe whose std::async future destructor joins forever: closing
+// the listener cancels the pending accept.
+static void test_pipe_dial_failure_unblocks_accept() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_noserver");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_noserver");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    return {};
+  });
+
+  // Wait until the accept thread is blocked in ConnectNamedPipe, then close the
+  // listener. The accept must return kClosed promptly instead of hanging.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  lis_r.value()->close();
+
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  EXPECT_TRUE(sst == std::future_status::ready);
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(!sr.ok());
+    if (!sr.ok()) {
+      EXPECT_EQ(sr.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+#endif
+}
 static void test_shm_backpressure_timeout() {
   auto lis_r = duct::listen("shm://duct_testbp");
   EXPECT_TRUE(lis_r.ok());
@@ -3311,9 +3362,27 @@ static void test_shm_rejects_oversize_message() {
     return;
   }
 
-  // 1 MiB is larger than the default 64 KiB slot but still fragmentable; a
-  // valid oversized message must be accepted and echo back intact on POSIX.
+  // 1 MiB is larger than the default 64 KiB slot. POSIX shm fragments across
+  // slots and reassembles, so it accepts and echoes the payload intact; Windows
+  // shm has no fragmentation and rejects it synchronously.
   const std::string payload(1024 * 1024, 'o');
+#if defined(_WIN32)
+  auto st = c.value()->send(duct::Message::from_string(payload), {});
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+  c.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(2));
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(!sr.ok());
+    if (!sr.ok()) {
+      const auto code = sr.status().code();
+      EXPECT_TRUE(code == duct::StatusCode::kClosed || code == duct::StatusCode::kIoError);
+    }
+  }
+#else
   EXPECT_TRUE(c.value()->send(duct::Message::from_string(payload), {}).ok());
   auto echoed = c.value()->recv({});
   EXPECT_TRUE(echoed.ok());
@@ -3326,6 +3395,7 @@ static void test_shm_rejects_oversize_message() {
   } else {
     EXPECT_TRUE(false);
   }
+#endif
   lis_r.value()->close();
 }
 
@@ -3740,6 +3810,7 @@ int main() {
   test_shm_reclaims_legacy_orphan();
   test_pipe_echo_one();
   test_pipe_rejects_oversize_message();
+  test_pipe_dial_failure_unblocks_accept();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();

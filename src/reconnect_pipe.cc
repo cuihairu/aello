@@ -88,6 +88,16 @@ class ReconnectPipe final : public Pipe {
     }
   }
 
+  // Forward the transport's non-fragmenting send bound so a QosPipe wrapping a
+  // reconnect pipe still rejects oversize messages synchronously (otherwise the
+  // default unlimited cap lets the drain worker enqueue a message the inner
+  // transport will permanently reject, silently dropping it).
+  std::size_t max_message_bytes() const override {
+    std::shared_ptr<Pipe> inner_snapshot = snapshot_inner();
+    if (!inner_snapshot) return Pipe::max_message_bytes();
+    return inner_snapshot->max_message_bytes();
+  }
+
   void close() override {
     std::shared_ptr<Pipe> inner_to_close;
     {
@@ -119,7 +129,7 @@ class ReconnectPipe final : public Pipe {
     if (cb) cb(next, reason);
   }
 
-  std::shared_ptr<Pipe> snapshot_inner() {
+  std::shared_ptr<Pipe> snapshot_inner() const {
     std::lock_guard<std::mutex> lk(mu_);
     return inner_;
   }

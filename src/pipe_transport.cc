@@ -192,6 +192,8 @@ class NamedPipePipe final : public Pipe {
     }
   }
 
+  std::size_t max_message_bytes() const override { return kMaxFramePayload; }
+
  private:
   HANDLE handle_;
   bool is_server_;
@@ -215,24 +217,57 @@ class NamedPipeListener final : public Listener {
       kDefaultTimeoutMs,         // Default timeout
       get_pipe_security_attributes()
     );
-
     if (pipe == INVALID_HANDLE_VALUE) {
       DWORD error = GetLastError();
       return Status::io_error("CreateNamedPipe failed with error: " + std::to_string(error));
     }
 
-    // Wait for client connection
-    BOOL connected = ConnectNamedPipe(pipe, NULL);
-    if (!connected) {
-      DWORD error = GetLastError();
-      if (error != ERROR_PIPE_CONNECTED) {
+    // Record the accepting thread with a real handle so close() can cancel the
+    // blocking ConnectNamedPipe from another thread via CancelSynchronousIo.
+    HANDLE accept_thread = OpenThread(THREAD_TERMINATE | THREAD_QUERY_INFORMATION,
+                                      FALSE, GetCurrentThreadId());
+    {
+      std::lock_guard<std::mutex> lock(accept_mutex_);
+      if (closing_) {
         CloseHandle(pipe);
-        return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(error));
+        if (accept_thread != NULL) CloseHandle(accept_thread);
+        return Status::closed("listener closed");
+      }
+      accepting_pipe_ = pipe;
+      accepting_thread_ = accept_thread;
+    }
+
+    BOOL connected = ConnectNamedPipe(pipe, NULL);
+    DWORD connect_error = connected ? ERROR_SUCCESS : GetLastError();
+
+    // Atomic with close(): decide whether close() already took ownership of the
+    // pipe (and closed it). If so, do not touch the handle again.
+    bool closed_by_listener;
+    {
+      std::lock_guard<std::mutex> lock(accept_mutex_);
+      closed_by_listener = closing_;
+      accepting_pipe_ = INVALID_HANDLE_VALUE;
+      if (accepting_thread_ != NULL) {
+        CloseHandle(accepting_thread_);
+        accepting_thread_ = NULL;
+      }
+    }
+    if (closed_by_listener) {
+      return Status::closed("listener closed during accept");
+    }
+
+    if (!connected) {
+      CloseHandle(pipe);
+      if (connect_error == ERROR_OPERATION_ABORTED) {
+        return Status::closed("listener closed during accept");
+      }
+      if (connect_error != ERROR_PIPE_CONNECTED) {
+        return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(connect_error));
       }
     }
 
     auto pipe_ptr = std::make_unique<NamedPipePipe>(pipe, true);
-  return std::unique_ptr<Pipe>(std::move(pipe_ptr));
+    return std::unique_ptr<Pipe>(std::move(pipe_ptr));
   }
 
   Result<std::string> local_address() const override {
@@ -245,12 +280,30 @@ class NamedPipeListener final : public Listener {
   }
 
   void close() override {
-    // Named pipes are automatically cleaned up when all handles are closed
+    std::lock_guard<std::mutex> lock(accept_mutex_);
+    if (closing_) return;
+    closing_ = true;
+    if (accepting_pipe_ != INVALID_HANDLE_VALUE) {
+      // Cancel a blocked synchronous ConnectNamedPipe in accept(). The accept
+      // thread returns ERROR_OPERATION_ABORTED and unwinds, so a consumer or
+      // test that destroys the listener never hangs on a stuck accept. We close
+      // the handle here; accept() sees closing_ under the lock and does not
+      // close it again.
+      if (accepting_thread_ != NULL) {
+        CancelSynchronousIo(accepting_thread_);
+      }
+      CloseHandle(accepting_pipe_);
+      accepting_pipe_ = INVALID_HANDLE_VALUE;
+    }
   }
 
  private:
   std::string pipe_path_;
   int backlog_;
+  std::mutex accept_mutex_;
+  bool closing_ = false;
+  HANDLE accepting_pipe_ = INVALID_HANDLE_VALUE;
+  HANDLE accepting_thread_ = NULL;
 };
 
 }  // namespace

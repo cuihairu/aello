@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <functional>
 #include <memory>
 #include <string>
@@ -136,6 +137,12 @@ class Pipe {
     if (!r.ok()) return r.status();
     return wire::FrameMessage{std::move(r.value()), 0};
   }
+  // Largest message the transport accepts in one send() call. The default is
+  // unlimited; byte-stream transports use fragmentation and ignore this cap,
+  // while non-fragmenting transports expose their exact send-side bound so QoS
+  // can reject oversize messages before enqueueing them.
+  virtual std::size_t max_message_bytes() const { return std::numeric_limits<std::size_t>::max(); }
+
   virtual void close() = 0;
   // Returns the peer's credential (uid/gid/pid) when the transport supports it.
   // Default: not supported. TCP/SHM have no OS peer-identity mechanism yet.

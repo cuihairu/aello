@@ -467,6 +467,8 @@ class ShmPipe final : public Pipe {
     }
   }
 
+  std::size_t max_message_bytes() const override { return h_.slot_bytes; }
+
  private:
   ShmHandles h_{};
   ShmNames names_{};

@@ -171,10 +171,11 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
   }
 
   // Check message size against an explicit caller-provided cap (defaults to
-  // unlimited; the transport fragments large payloads). snd_hwm_bytes == 0
-  // means "unlimited".
+  // unlimited; the transport fragments large payloads) and the underlying
+  // transport's non-fragmenting bound. snd_hwm_bytes == 0 means "unlimited".
   const std::size_t max_message_bytes = qos_.max_message_bytes;
-  if (msg.size() > max_message_bytes) {
+  const std::size_t transport_max = underlying_->max_message_bytes();
+  if (msg.size() > max_message_bytes || msg.size() > transport_max) {
     return Status::invalid_argument("message too large for the transport");
   }
   if (qos_.snd_hwm_bytes != 0 && msg.size() > qos_.snd_hwm_bytes) {
