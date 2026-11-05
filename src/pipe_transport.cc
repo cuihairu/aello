@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,36 @@ static std::string sanitize_name(std::string_view s) {
   return &sa;
 }
 
+// Create a manual-reset event for overlapped I/O waits.
+static HANDLE make_io_event() {
+  return CreateEventA(nullptr, TRUE, FALSE, nullptr);
+}
+
+enum class IoResult { kDone, kTimeout, kError };
+
+// Run an overlapped I/O operation started on `ov` to completion, bounded by
+// `timeout_ms` (0 = wait indefinitely). On timeout the pending operation is
+// cancelled (CancelIoEx + GetOverlappedResult with bWait) so the handle can be
+// reused or closed without a blocking CloseHandle.
+static IoResult run_overlapped_io(HANDLE h, OVERLAPPED& ov, DWORD& bytes, DWORD timeout_ms) {
+  DWORD wait_ms = (timeout_ms == 0) ? INFINITE : timeout_ms;
+  DWORD w = WaitForSingleObject(ov.hEvent, wait_ms);
+  if (w == WAIT_OBJECT_0) {
+    if (!GetOverlappedResult(h, &ov, &bytes, FALSE)) {
+      return IoResult::kError;
+    }
+    return IoResult::kDone;
+  }
+  if (w == WAIT_TIMEOUT) {
+    // Cancel the in-flight operation and wait for it to unwind before the
+    // caller reuses or closes the handle.
+    CancelIoEx(h, &ov);
+    GetOverlappedResult(h, &ov, &bytes, TRUE);
+    return IoResult::kTimeout;
+  }
+  return IoResult::kError;
+}
+
 class NamedPipePipe final : public Pipe {
  public:
   explicit NamedPipePipe(HANDLE handle, bool is_server)
@@ -78,7 +109,6 @@ class NamedPipePipe final : public Pipe {
   ~NamedPipePipe() override { close(); }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
-    (void)opt;
     if (handle_ == INVALID_HANDLE_VALUE) {
       return Status::closed("pipe closed");
     }
@@ -100,61 +130,94 @@ class NamedPipePipe final : public Pipe {
     h.payload_len = static_cast<std::uint32_t>(msg.size());
     h.flags = 0;
 
-    // Encode header
     std::uint8_t hdr[kHeaderLen];
     encode_header(h, hdr);
 
-    // Write header and payload
-    DWORD bytes_written;
+    DWORD timeout_ms = static_cast<DWORD>(opt.timeout.count());
 
-    // Write header
-    BOOL result = WriteFile(handle_, hdr, kHeaderLen, &bytes_written, NULL);
-    if (!result || bytes_written != kHeaderLen) {
-      DWORD error = GetLastError();
-      if (error == ERROR_BROKEN_PIPE) {
-        return Status::closed("pipe closed");
+    // Write header.
+    {
+      OVERLAPPED ov{};
+      ov.hEvent = make_io_event();
+      if (!ov.hEvent) return Status::io_error("CreateEvent failed");
+      DWORD n = 0;
+      BOOL ok = WriteFile(handle_, hdr, kHeaderLen, &n, &ov);
+      DWORD werr = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && werr != ERROR_IO_PENDING) {
+        CloseHandle(ov.hEvent);
+        if (werr == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("WriteFile header failed with error: " + std::to_string(werr));
       }
-      return Status::io_error("WriteFile header failed with error: " + std::to_string(error));
+      IoResult r = run_overlapped_io(handle_, ov, n, timeout_ms);
+      CloseHandle(ov.hEvent);
+      if (r == IoResult::kTimeout) return Status::timeout("write timed out");
+      if (r == IoResult::kError) {
+        DWORD e = GetLastError();
+        if (e == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("WriteFile header failed with error: " + std::to_string(e));
+      }
+      if (n != kHeaderLen) return Status::io_error("short header write");
     }
 
-    // Write payload
+    // Write payload.
     if (msg.size() > 0) {
-      result = WriteFile(handle_, msg.data(), static_cast<DWORD>(msg.size()), &bytes_written, NULL);
-      if (!result || bytes_written != static_cast<DWORD>(msg.size())) {
-        DWORD error = GetLastError();
-        if (error == ERROR_BROKEN_PIPE) {
-          return Status::closed("pipe closed");
-        }
-        return Status::io_error("WriteFile payload failed with error: " + std::to_string(error));
+      OVERLAPPED ov{};
+      ov.hEvent = make_io_event();
+      if (!ov.hEvent) return Status::io_error("CreateEvent failed");
+      DWORD n = 0;
+      BOOL ok = WriteFile(handle_, msg.data(), static_cast<DWORD>(msg.size()), &n, &ov);
+      DWORD werr = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && werr != ERROR_IO_PENDING) {
+        CloseHandle(ov.hEvent);
+        if (werr == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("WriteFile payload failed with error: " + std::to_string(werr));
       }
+      IoResult r = run_overlapped_io(handle_, ov, n, timeout_ms);
+      CloseHandle(ov.hEvent);
+      if (r == IoResult::kTimeout) return Status::timeout("write timed out");
+      if (r == IoResult::kError) {
+        DWORD e = GetLastError();
+        if (e == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("WriteFile payload failed with error: " + std::to_string(e));
+      }
+      if (n != static_cast<DWORD>(msg.size())) return Status::io_error("short payload write");
     }
 
     return {};
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
-    (void)opt;
     if (handle_ == INVALID_HANDLE_VALUE) {
       return Status::closed("pipe closed");
     }
 
-    // Read header
+    DWORD timeout_ms = static_cast<DWORD>(opt.timeout.count());
+
+    // Read header.
     std::uint8_t hdr[kHeaderLen];
-    DWORD bytes_read;
-    BOOL result = ReadFile(handle_, hdr, kHeaderLen, &bytes_read, NULL);
-    if (!result) {
-      DWORD error = GetLastError();
-      if (error == ERROR_BROKEN_PIPE) {
-        return Status::closed("pipe closed");
+    {
+      OVERLAPPED ov{};
+      ov.hEvent = make_io_event();
+      if (!ov.hEvent) return Status::io_error("CreateEvent failed");
+      DWORD n = 0;
+      BOOL ok = ReadFile(handle_, hdr, kHeaderLen, &n, &ov);
+      DWORD werr = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && werr != ERROR_IO_PENDING) {
+        CloseHandle(ov.hEvent);
+        if (werr == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("ReadFile header failed with error: " + std::to_string(werr));
       }
-      return Status::io_error("ReadFile header failed with error: " + std::to_string(error));
+      IoResult r = run_overlapped_io(handle_, ov, n, timeout_ms);
+      CloseHandle(ov.hEvent);
+      if (r == IoResult::kTimeout) return Status::timeout("read timed out");
+      if (r == IoResult::kError) {
+        DWORD e = GetLastError();
+        if (e == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("ReadFile header failed with error: " + std::to_string(e));
+      }
+      if (n != kHeaderLen) return Status::io_error("incomplete header read");
     }
 
-    if (bytes_read != kHeaderLen) {
-      return Status::io_error("incomplete header read: " + std::to_string(bytes_read) + " bytes");
-    }
-
-    // Decode header
     auto decoded = decode_header(hdr);
     if (!decoded.ok()) {
       return decoded.status();
@@ -162,26 +225,33 @@ class NamedPipePipe final : public Pipe {
 
     FrameHeader header = decoded.value();
 
-    // Validate payload size
     if (header.payload_len > kMaxFramePayload) {
       return Status::protocol_error("payload too large: " + std::to_string(header.payload_len) + " bytes");
     }
 
-    // Read payload
+    // Read payload.
     std::vector<std::uint8_t> buffer(header.payload_len);
     if (header.payload_len > 0) {
-      result = ReadFile(handle_, buffer.data(), header.payload_len, &bytes_read, NULL);
-      if (!result) {
-        DWORD error = GetLastError();
-        if (error == ERROR_BROKEN_PIPE) {
-          return Status::closed("pipe closed");
-        }
-        return Status::io_error("ReadFile payload failed with error: " + std::to_string(error));
+      OVERLAPPED ov{};
+      ov.hEvent = make_io_event();
+      if (!ov.hEvent) return Status::io_error("CreateEvent failed");
+      DWORD n = 0;
+      BOOL ok = ReadFile(handle_, buffer.data(), header.payload_len, &n, &ov);
+      DWORD werr = ok ? ERROR_SUCCESS : GetLastError();
+      if (!ok && werr != ERROR_IO_PENDING) {
+        CloseHandle(ov.hEvent);
+        if (werr == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("ReadFile payload failed with error: " + std::to_string(werr));
       }
-
-      if (bytes_read != header.payload_len) {
-        return Status::io_error("incomplete payload read: " + std::to_string(bytes_read) + " / " + std::to_string(header.payload_len) + " bytes");
+      IoResult r = run_overlapped_io(handle_, ov, n, timeout_ms);
+      CloseHandle(ov.hEvent);
+      if (r == IoResult::kTimeout) return Status::timeout("read timed out");
+      if (r == IoResult::kError) {
+        DWORD e = GetLastError();
+        if (e == ERROR_BROKEN_PIPE) return Status::closed("pipe closed");
+        return Status::io_error("ReadFile payload failed with error: " + std::to_string(e));
       }
+      if (n != header.payload_len) return Status::io_error("incomplete payload read");
     }
 
     return Message::from_bytes(buffer.data(), buffer.size());
@@ -204,14 +274,25 @@ class NamedPipePipe final : public Pipe {
 class NamedPipeListener final : public Listener {
  public:
   explicit NamedPipeListener(const std::string& pipe_path, int backlog)
-    : pipe_path_(pipe_path), backlog_(backlog) {}
+    : pipe_path_(pipe_path), backlog_(backlog) {
+    stop_event_ = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  }
 
-  ~NamedPipeListener() override { close(); }
+  ~NamedPipeListener() override {
+    close();
+    // Wait for in-flight accept() calls to unwind (they observe the stop
+    // event) before releasing the stop event handle they wait on.
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait_for(lock, std::chrono::seconds(2), [&] { return active_accepts_ == 0; });
+    if (stop_event_ != NULL) CloseHandle(stop_event_);
+  }
 
   Result<std::unique_ptr<Pipe>> accept() override {
+    if (closing_) return Status::closed("listener closed");
+
     HANDLE pipe = CreateNamedPipeA(
       pipe_path_.c_str(),
-      PIPE_ACCESS_DUPLEX,
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
       PIPE_UNLIMITED_INSTANCES,  // Allow unlimited instances
       kPipeBufferSize,           // Output buffer size
@@ -224,96 +305,68 @@ class NamedPipeListener final : public Listener {
       return Status::io_error("CreateNamedPipe failed with error: " + std::to_string(error));
     }
 
-    // Record this accept (pipe + thread) so close() can cancel a blocking
-    // ConnectNamedPipe from another thread via CancelSynchronousIo. A registry
-    // is used instead of a single shared slot because several threads may call
-    // accept() concurrently: a single slot would let close() cancel only the
-    // most recently registered accept, leaving earlier ones blocked forever.
-    HANDLE accept_thread = OpenThread(THREAD_TERMINATE | THREAD_QUERY_INFORMATION,
-                                      FALSE, GetCurrentThreadId());
-    std::size_t id;
+    HANDLE ev = make_io_event();
+    if (!ev) {
+      CloseHandle(pipe);
+      return Status::io_error("CreateEvent failed");
+    }
+
+    // Register this accept so the destructor waits for it to unwind.
     {
-      std::lock_guard<std::mutex> lock(accept_mutex_);
+      std::lock_guard<std::mutex> lock(mu_);
       if (closing_) {
+        CloseHandle(ev);
         CloseHandle(pipe);
-        if (accept_thread != NULL) CloseHandle(accept_thread);
         return Status::closed("listener closed");
       }
-      id = next_id_++;
-      pending_.push_back(PendingAccept{id, pipe, accept_thread});
+      ++active_accepts_;
     }
 
-    // Re-check closing_ under the lock immediately before ConnectNamedPipe. If a
-    // close() ran after registration it has either already closed our handle
-    // (our entry is gone) or is waiting to process it (entry still present), so
-    // we must not pass the handle to ConnectNamedPipe. We own the entry when it
-    // is present, so close it ourselves; otherwise close() owns it.
-    {
-      std::lock_guard<std::mutex> lock(accept_mutex_);
-      auto it = std::find_if(pending_.begin(), pending_.end(),
-                             [&](const PendingAccept& p) { return p.id == id; });
-      if (it == pending_.end()) {
-        // close() already closed our pipe and removed our entry.
-        if (accept_thread != NULL) CloseHandle(accept_thread);
-        return Status::closed("listener closed during accept");
-      }
-      if (closing_) {
-        pending_.erase(it);
-        CloseHandle(pipe);
-        if (accept_thread != NULL) CloseHandle(accept_thread);
-        return Status::closed("listener closed during accept");
-      }
-    }
-
-    BOOL connected = ConnectNamedPipe(pipe, NULL);
+    OVERLAPPED ov{};
+    ov.hEvent = ev;
+    BOOL connected = ConnectNamedPipe(pipe, &ov);
     DWORD connect_error = connected ? ERROR_SUCCESS : GetLastError();
 
-    // Re-acquire the lock. If close() already took ownership of our pipe (it
-    // cancelled and closed the handle, removing our entry) we must not touch the
-    // handle again. Otherwise we own it and close it on error.
-    bool close_took_pipe;
-    {
-      std::lock_guard<std::mutex> lock(accept_mutex_);
-      auto it = std::find_if(pending_.begin(), pending_.end(),
-                             [&](const PendingAccept& p) { return p.id == id; });
-      if (it == pending_.end()) {
-        close_took_pipe = true;  // close() closed our pipe.
-      } else {
-        close_took_pipe = false;
-        pending_.erase(it);
-        if (closing_) {
-          // close() set closing_ but is waiting for the lock after us; we own
-          // the pipe here, so close it and the thread, then return.
-          CloseHandle(pipe);
-          if (accept_thread != NULL) CloseHandle(accept_thread);
-          return Status::closed("listener closed during accept");
-        }
-      }
-    }
-    if (close_took_pipe) {
-      if (accept_thread != NULL) CloseHandle(accept_thread);
-      return Status::closed("listener closed during accept");
+    if (connected || connect_error == ERROR_PIPE_CONNECTED) {
+      // Client connected before or during our ConnectNamedPipe.
+      CloseHandle(ev);
+      --active_accepts_;
+      return std::unique_ptr<Pipe>(new NamedPipePipe(pipe, true));
     }
 
-    if (!connected) {
-      if (connect_error == ERROR_OPERATION_ABORTED) {
-        CloseHandle(pipe);
-        if (accept_thread != NULL) CloseHandle(accept_thread);
-        return Status::closed("listener closed during accept");
-      }
-      if (connect_error != ERROR_PIPE_CONNECTED) {
-        CloseHandle(pipe);
-        if (accept_thread != NULL) CloseHandle(accept_thread);
-        return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(connect_error));
-      }
-      // ERROR_PIPE_CONNECTED: the client connected before our ConnectNamedPipe
-      // call. The handle is valid and connected; keep it open and hand it to the
-      // caller (closing it here would hand back a dead accepted pipe).
+    if (connect_error != ERROR_IO_PENDING) {
+      CloseHandle(ev);
+      CloseHandle(pipe);
+      --active_accepts_;
+      return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(connect_error));
     }
 
-    if (accept_thread != NULL) CloseHandle(accept_thread);
-    auto pipe_ptr = std::make_unique<NamedPipePipe>(pipe, true);
-    return std::unique_ptr<Pipe>(std::move(pipe_ptr));
+    // Wait for the connection to complete or the listener to close.
+    HANDLE waits[2] = { ev, stop_event_ };
+    DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+    if (w == WAIT_OBJECT_0) {
+      DWORD n = 0;
+      if (!GetOverlappedResult(pipe, &ov, &n, FALSE)) {
+        DWORD e = GetLastError();
+        CloseHandle(ev);
+        CloseHandle(pipe);
+        --active_accepts_;
+        return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(e));
+      }
+      CloseHandle(ev);
+      --active_accepts_;
+      return std::unique_ptr<Pipe>(new NamedPipePipe(pipe, true));
+    }
+
+    // stop_event_ signaled: the listener is closing. Cancel the pending connect
+    // and wait for it to unwind before releasing the handle.
+    CancelIoEx(pipe, &ov);
+    DWORD n = 0;
+    GetOverlappedResult(pipe, &ov, &n, TRUE);
+    CloseHandle(ev);
+    CloseHandle(pipe);
+    --active_accepts_;
+    return Status::closed("listener closed during accept");
   }
 
   Result<std::string> local_address() const override {
@@ -326,33 +379,22 @@ class NamedPipeListener final : public Listener {
   }
 
   void close() override {
-    std::lock_guard<std::mutex> lock(accept_mutex_);
+    std::lock_guard<std::mutex> lock(mu_);
     if (closing_) return;
     closing_ = true;
-    // Cancel every registered accept: a blocked synchronous ConnectNamedPipe
-    // returns ERROR_OPERATION_ABORTED and unwinds, so a consumer or test that
-    // destroys the listener never hangs on a stuck accept. We close each handle
-    // here; accept() sees its entry removed and does not close it again.
-    for (PendingAccept& p : pending_) {
-      if (p.thread != NULL) CancelSynchronousIo(p.thread);
-      if (p.pipe != INVALID_HANDLE_VALUE) CloseHandle(p.pipe);
-    }
-    pending_.clear();
+    // Wake every accept() blocked in WaitForMultipleObjects so it cancels its
+    // pending ConnectNamedPipe and returns kClosed promptly instead of hanging.
+    if (stop_event_ != NULL) SetEvent(stop_event_);
   }
 
  private:
-  struct PendingAccept {
-    std::size_t id;
-    HANDLE pipe;
-    HANDLE thread;
-  };
-
   std::string pipe_path_;
   int backlog_;
-  std::mutex accept_mutex_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  HANDLE stop_event_ = NULL;
   bool closing_ = false;
-  std::size_t next_id_ = 0;
-  std::vector<PendingAccept> pending_;
+  int active_accepts_ = 0;
 };
 
 }  // namespace
@@ -387,14 +429,15 @@ Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptio
     return Status::io_error("WaitNamedPipe failed with error: " + std::to_string(error));
   }
 
-  // Connect to the named pipe
+  // Connect to the named pipe. FILE_FLAG_OVERLAPPED is required so the pipe
+  // handle matches the overlapped ReadFile/WriteFile used by NamedPipePipe.
   HANDLE pipe = CreateFileA(
     pipe_path.c_str(),
     GENERIC_READ | GENERIC_WRITE,
     0,
     NULL,
     OPEN_EXISTING,
-    FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
     NULL
   );
 

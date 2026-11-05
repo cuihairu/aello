@@ -15,14 +15,18 @@
 #include <chrono>
 #include <fcntl.h>
 #include <future>
+#include <functional>
 #include <limits>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -47,6 +51,17 @@ void fail(const char* file, int line, const std::string& msg) {
   std::cerr << file << ":" << line << ": " << msg << "\n";
   ++g_failures;
 }
+
+// Run one test with a progress marker on stderr so a hang (or slow test) is
+// visible in CI logs as the last "[RUN] ..." line.
+#define RUN_TEST(fn)                 \
+  do {                               \
+    std::cerr << "[RUN] " #fn "\n";  \
+    std::cerr.flush();               \
+    fn();                            \
+    std::cerr << "[DONE] " #fn "\n"; \
+    std::cerr.flush();               \
+  } while (0)
 
 #define EXPECT_TRUE(x)                            \
   do {                                            \
@@ -451,7 +466,9 @@ static void test_pipe_echo_one() {
   EXPECT_TRUE(st.ok());
   if (!st.ok()) return;
 
-  auto echoed = c.value()->recv({});
+  duct::RecvOptions recv_opt;
+  recv_opt.timeout = std::chrono::seconds(5);
+  auto echoed = c.value()->recv(recv_opt);
   EXPECT_TRUE(echoed.ok());
   if (!echoed.ok()) return;
 
@@ -3909,87 +3926,87 @@ int main() {
   // unchanged; this only quiets the signal the write would otherwise raise.
   std::signal(SIGPIPE, SIG_IGN);
 #endif
-  test_address_parse();
-  test_shm_echo_one();
-  test_uds_echo_one();
-  test_uds_multi_message_echo();
-  test_uds_channel_recv_subms_deadline_bounded();
-  test_uds_concurrent_channel_recv();
-  test_uds_peer_credential();
-  test_shm_crash_recovery_reclaims_orphan();
-  test_shm_reclaims_legacy_orphan();
-  test_pipe_echo_one();
-  test_pipe_rejects_oversize_message();
-  test_pipe_dial_failure_unblocks_accept();
-  test_pipe_concurrent_accepts_unblock_on_close();
-  test_shm_backpressure_timeout();
-  test_shm_burst_without_receiver();
-  test_wire_decode_rejects_bad_magic();
-  test_wire_socketpair_frames();
-  test_wire_fragment_stream_size_capped();
-  test_wire_read_timeout();
-  test_wire_write_timeout();
-  test_wire_partial_frame_timeout();
-  test_tcp_recv_timeout_honored();
-  test_tcp_dial_timeout_happy_path();
-  test_tcp_dial_timeout_honored();
-  test_tcp_connect_refused_is_io_error();
-  test_uds_dial_rejects_negative_timeout();
-  test_uds_listen_rejects_non_socket_path();
-  test_uds_positive_connect_timeout_is_preserved();
-  test_shm_dial_timeout_honored();
-  test_shm_dial_positive_timeout_path();
-  test_dial_rejects_negative_timeout();
-  test_wire_clears_send_timeout_for_blocking_write();
-  test_wire_write_no_sigpipe_on_macos();
-  test_qos_block_zero_timeout_blocks();
-  test_qos_permanent_send_error_does_not_wedge();
-  test_qos_oversized_message_rejected();
-  test_qos_zero_hwm_is_unlimited();
-  test_qos_delivery_under_hwm();
-  test_qos_close_under_full_ring();
-  test_reconnect_dial_connects_and_echoes();
-  test_reconnect_dial_fails_after_attempts();
-  test_reconnect_callback_ops_pipe();
-  test_qos_recv_watermark_and_worker();
-  test_qos_linger_drains_before_close();
-  test_wire_fragmentation_and_reassembly();
-  test_shm_fragmentation_and_reassembly();
-  test_shm_reassembly_size_capped();
-  test_shm_first_chunk_size_capped();
-  test_shm_fragmentation_midway_timeout_keeps_stream_synced();
-  test_shm_configurable_slot_geometry();
-  test_shm_geometry_mismatch_rejected();
-  test_shm_rejects_invalid_geometry();
-  test_qos_priority_scheduling();
-  test_tcp_channel_multiplexing();
-  test_tcp_channel_recv_does_not_drop_other_channel();
-  test_tcp_channel_pending_capped();
-  test_shm_rejects_oversize_message();
-  test_tcp_channel_recv_deadline_bounded();
-  test_tcp_channel_recv_subms_deadline_bounded();
-  test_reconnect_channel_preserved();
-  test_tcp_concurrent_channel_recv();
-  test_qos_shm_recv_midfragment_close_completes();
-  test_qos_rate_limit_paces_delivery();
-  test_qos_rate_limit_default_burst_drains();
-  test_qos_and_reconnect_forward_max_message_bytes();
-  test_qos_channel_multiplexing();
-  test_tcp_handshake_negotiates_version();
-  test_tcp_accept_rejects_silent_peer();
-  test_qos_item_count_cap();
-  test_qos_failfast_returns_queue_full();
-  test_qos_dial_opt_in_disabled_by_default();
-  test_qos_ttl_expires_queued_message();
-  test_qos_drop_old_evicts_oldest_queued();
-  test_concurrent_send_recv_channels();
-  test_multi_process_kill9_restart();
-  test_rpc_request_correlation();
-  test_rpc_request_timeout();
-  test_rpc_close_joins_without_transport_wakeup();
-  test_pubsub_multiple_subscribers();
-  test_pubsub_subscription_outlives_broker();
-  test_pubsub_concurrent_broker_subscription_destruction();
+  RUN_TEST(test_address_parse);
+  RUN_TEST(test_shm_echo_one);
+  RUN_TEST(test_uds_echo_one);
+  RUN_TEST(test_uds_multi_message_echo);
+  RUN_TEST(test_uds_channel_recv_subms_deadline_bounded);
+  RUN_TEST(test_uds_concurrent_channel_recv);
+  RUN_TEST(test_uds_peer_credential);
+  RUN_TEST(test_shm_crash_recovery_reclaims_orphan);
+  RUN_TEST(test_shm_reclaims_legacy_orphan);
+  RUN_TEST(test_pipe_echo_one);
+  RUN_TEST(test_pipe_rejects_oversize_message);
+  RUN_TEST(test_pipe_dial_failure_unblocks_accept);
+  RUN_TEST(test_pipe_concurrent_accepts_unblock_on_close);
+  RUN_TEST(test_shm_backpressure_timeout);
+  RUN_TEST(test_shm_burst_without_receiver);
+  RUN_TEST(test_wire_decode_rejects_bad_magic);
+  RUN_TEST(test_wire_socketpair_frames);
+  RUN_TEST(test_wire_fragment_stream_size_capped);
+  RUN_TEST(test_wire_read_timeout);
+  RUN_TEST(test_wire_write_timeout);
+  RUN_TEST(test_wire_partial_frame_timeout);
+  RUN_TEST(test_tcp_recv_timeout_honored);
+  RUN_TEST(test_tcp_dial_timeout_happy_path);
+  RUN_TEST(test_tcp_dial_timeout_honored);
+  RUN_TEST(test_tcp_connect_refused_is_io_error);
+  RUN_TEST(test_uds_dial_rejects_negative_timeout);
+  RUN_TEST(test_uds_listen_rejects_non_socket_path);
+  RUN_TEST(test_uds_positive_connect_timeout_is_preserved);
+  RUN_TEST(test_shm_dial_timeout_honored);
+  RUN_TEST(test_shm_dial_positive_timeout_path);
+  RUN_TEST(test_dial_rejects_negative_timeout);
+  RUN_TEST(test_wire_clears_send_timeout_for_blocking_write);
+  RUN_TEST(test_wire_write_no_sigpipe_on_macos);
+  RUN_TEST(test_qos_block_zero_timeout_blocks);
+  RUN_TEST(test_qos_permanent_send_error_does_not_wedge);
+  RUN_TEST(test_qos_oversized_message_rejected);
+  RUN_TEST(test_qos_zero_hwm_is_unlimited);
+  RUN_TEST(test_qos_delivery_under_hwm);
+  RUN_TEST(test_qos_close_under_full_ring);
+  RUN_TEST(test_reconnect_dial_connects_and_echoes);
+  RUN_TEST(test_reconnect_dial_fails_after_attempts);
+  RUN_TEST(test_reconnect_callback_ops_pipe);
+  RUN_TEST(test_qos_recv_watermark_and_worker);
+  RUN_TEST(test_qos_linger_drains_before_close);
+  RUN_TEST(test_wire_fragmentation_and_reassembly);
+  RUN_TEST(test_shm_fragmentation_and_reassembly);
+  RUN_TEST(test_shm_reassembly_size_capped);
+  RUN_TEST(test_shm_first_chunk_size_capped);
+  RUN_TEST(test_shm_fragmentation_midway_timeout_keeps_stream_synced);
+  RUN_TEST(test_shm_configurable_slot_geometry);
+  RUN_TEST(test_shm_geometry_mismatch_rejected);
+  RUN_TEST(test_shm_rejects_invalid_geometry);
+  RUN_TEST(test_qos_priority_scheduling);
+  RUN_TEST(test_tcp_channel_multiplexing);
+  RUN_TEST(test_tcp_channel_recv_does_not_drop_other_channel);
+  RUN_TEST(test_tcp_channel_pending_capped);
+  RUN_TEST(test_shm_rejects_oversize_message);
+  RUN_TEST(test_tcp_channel_recv_deadline_bounded);
+  RUN_TEST(test_tcp_channel_recv_subms_deadline_bounded);
+  RUN_TEST(test_reconnect_channel_preserved);
+  RUN_TEST(test_tcp_concurrent_channel_recv);
+  RUN_TEST(test_qos_shm_recv_midfragment_close_completes);
+  RUN_TEST(test_qos_rate_limit_paces_delivery);
+  RUN_TEST(test_qos_rate_limit_default_burst_drains);
+  RUN_TEST(test_qos_and_reconnect_forward_max_message_bytes);
+  RUN_TEST(test_qos_channel_multiplexing);
+  RUN_TEST(test_tcp_handshake_negotiates_version);
+  RUN_TEST(test_tcp_accept_rejects_silent_peer);
+  RUN_TEST(test_qos_item_count_cap);
+  RUN_TEST(test_qos_failfast_returns_queue_full);
+  RUN_TEST(test_qos_dial_opt_in_disabled_by_default);
+  RUN_TEST(test_qos_ttl_expires_queued_message);
+  RUN_TEST(test_qos_drop_old_evicts_oldest_queued);
+  RUN_TEST(test_concurrent_send_recv_channels);
+  RUN_TEST(test_multi_process_kill9_restart);
+  RUN_TEST(test_rpc_request_correlation);
+  RUN_TEST(test_rpc_request_timeout);
+  RUN_TEST(test_rpc_close_joins_without_transport_wakeup);
+  RUN_TEST(test_pubsub_multiple_subscribers);
+  RUN_TEST(test_pubsub_subscription_outlives_broker);
+  RUN_TEST(test_pubsub_concurrent_broker_subscription_destruction);
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
