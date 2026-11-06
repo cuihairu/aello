@@ -76,6 +76,12 @@ struct alignas(64) RingMeta {
 struct ShmLayout {
   std::uint32_t slot_bytes = 0;
   std::uint32_t slot_count = 0;
+  // Set (with release ordering) by whichever endpoint closes first, so a peer
+  // blocked in recv()/send() on a semaphore can observe the close and return
+  // kClosed instead of waiting forever on a peer that never signals. The flag
+  // lives in the shared mapping because closing one side's handles does not
+  // signal the other side's semaphore objects.
+  std::atomic_uint32_t closed{0};
   RingMeta c2s_meta;
   RingMeta s2c_meta;
   // Slot data follows, same layout as the POSIX implementation.
@@ -409,8 +415,19 @@ class ShmPipe final : public Pipe {
       return Status::invalid_argument("message larger than shm slot");
     }
 
+    // A peer close() marks the flag and posts a wake-up token so a blocked
+    // send() returns kClosed instead of waiting forever.
+    auto peer_closed = [&] {
+      return h_.mem->closed.load(std::memory_order_acquire) != 0;
+    };
+    if (peer_closed()) return Status::closed("shm peer closed");
+
     auto st = wait_handle_opt(spaces, opt.timeout);
     if (!st.ok()) return st;
+    // Woken from the wait: if that wake-up came from a peer close() (or the
+    // close landed while we waited), report closed rather than writing into a
+    // ring whose peer is gone.
+    if (peer_closed()) return Status::closed("shm peer closed");
 
     std::uint32_t head = tx->head.load(std::memory_order_relaxed);
     std::uint32_t idx = head % slot_count;
@@ -437,8 +454,24 @@ class ShmPipe final : public Pipe {
     const std::uint32_t slot_bytes = h_.slot_bytes;
     const std::uint32_t slot_count = h_.slot_count;
 
+    // A peer close() marks the flag and posts a wake-up token so a blocked
+    // recv() returns kClosed instead of waiting forever. Pending items are
+    // still delivered first: a peer that sent data and then closed must not
+    // lose that data, so the closed condition only fires once the ring has
+    // drained (head == tail).
+    auto peer_closed_and_drained = [&] {
+      return h_.mem->closed.load(std::memory_order_acquire) != 0 &&
+             rx->head.load(std::memory_order_acquire) ==
+                 rx->tail.load(std::memory_order_relaxed);
+    };
+    if (peer_closed_and_drained()) return Status::closed("shm peer closed");
+
     auto st = wait_handle_opt(items, opt.timeout);
     if (!st.ok()) return st.status();
+    // Woken from the wait: if the wake-up was the close signal (or the close
+    // landed while we waited) and no item is pending, report closed instead of
+    // consuming a phantom token as a slot.
+    if (peer_closed_and_drained()) return Status::closed("shm peer closed");
 
     std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
     std::uint32_t idx = tail % slot_count;
@@ -459,6 +492,22 @@ class ShmPipe final : public Pipe {
 
   void close() override {
     if (!h_.mem && h_.shm_handle == INVALID_HANDLE_VALUE) return;
+
+    if (h_.mem) {
+      // Signal a peer blocked in recv() or send(). Our outgoing items semaphore
+      // is what the peer's recv() waits on; our incoming spaces semaphore is
+      // what the peer's send() waits on. Post the close flag (in shared memory)
+      // with release ordering before releasing either token, so a woken peer
+      // observes the flag and returns kClosed rather than treating the token as
+      // a real slot/space. The flag is set by whichever endpoint closes first;
+      // a second close() just re-posts wake-up tokens into a dying connection.
+      h_.mem->closed.store(1, std::memory_order_release);
+      HANDLE tx_items = is_client_ ? h_.c2s_items : h_.s2c_items;
+      HANDLE rx_spaces = is_client_ ? h_.s2c_spaces : h_.c2s_spaces;
+      ReleaseSemaphore(tx_items, /*lReleaseCount=*/1, NULL);
+      ReleaseSemaphore(rx_spaces, /*lReleaseCount=*/1, NULL);
+    }
+
     close_handles(&h_);
 
     if (owner_) {
