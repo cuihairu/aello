@@ -168,3 +168,11 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：NamedPipeListener 用 vector<PendingAccept> 为每个并发 accept 记录独立 id/pipe/thread，close 遍历全部条目调用 CancelSynchronousIo 并关闭句柄，不再覆盖共享槽位。Evidence: src/pipe_transport.cc:226-243, 327-340; 4 个并发 accept 全部在 3 秒内返回 kClosed 的回归测试 tests/duct_tests.cc:572-617; wine duct_tests.exe exit 0 ("OK"); ctest 3/3 green。
 - [x] 审核发现：启用重连与 QoS 时内层 QosPipe 未转发 max_message_bytes，ReconnectPipe 因而返回无限值而非底层 pipe 或 Windows shm 的实际发送上限，违反新增接口契约（src/reconnect_pipe.cc:98）。
   属实（已修复）：QosPipe 新增 max_message_bytes() override，返回 qos cap 与 underlying cap 的较小值；ReconnectPipe 转发 inner->max_message_bytes()，因此 dial(reconnect+qos) 形成的 ReconnectPipe-over-QosPipe 暴露真实上限。Evidence: include/duct/qos_pipe.h:36, src/qos_pipe.cc:365-367, src/reconnect_pipe.cc:95-99, tests/duct_tests.cc:2743-2789 (transport 1024 / QoS 512 / reconnect 1024); ctest 3/3 green。
+- [x] 审核发现：accept 在重检后释放锁至调用 ConnectNamedPipe 之间仍可能被 close 取消并关闭句柄，随后对已关闭或复用的句柄发起连接，导致错误或阻塞，原竞态未修复（src/pipe_transport.cc:267）。
+  属实（已修复）：accept 改用 overlapped I/O（b0265fe），close() 不再触碰 accept 的管道句柄（只置位 stop_event_），故“close 取消并关闭句柄后 accept 复用”的竞态被结构性消除；b7cc651 将 active_accepts_ 改为原子并在每次递减时 notify，析构仅在所有 accept 退场后才关闭 stop_event_（否则泄漏句柄而非 use-after-close）。Evidence: src/pipe_transport.cc:281-310, 320-390, 395-410; b0265fe, b7cc651; wine duct_tests_static.exe exit 0; CI 3 腿全绿（run 42144176879）。
+- [x] 审核发现：QosPipe 返回的最大消息大小未计入非零 snd_hwm_bytes，外层 QoS 可能接受超过内层队列限制的消息并在后台被内层拒绝而丢弃（src/qos_pipe.cc:366）。
+  属实（已修复）：QosPipe::max_message_bytes() 现在以非零 snd_hwm_bytes 为上限封顶（69868b3），与 send() 在入队前同步执行的 snd_hwm 校验一致，调用方按访问器尺寸定消息不再被后台拒绝。Evidence: src/qos_pipe.cc:365-374; tests/duct_tests.cc test_qos_and_reconnect_forward_max_message_bytes（snd_hwm=256 时访问器返回 256）; ctest 3/3; CI 3 腿全绿。
+- [x] 审核发现：并发 accept 测试在 future 等待超时后仍会在析构时等待未结束的异步任务，故被测线程卡住时测试进程会挂起而非及时报告失败（tests/duct_tests.cc:607）。
+  属实（已修复）：test_pipe_concurrent_accepts_unblock_on_close 改用裸线程 + 每线程 done 标志（882409a），错过 3 秒截止的线程被 detach 而不再 join，测试以失败而非挂起收场；且 accept() 经 b0265fe 保证可退出，正常路径仍断言全部返回 kClosed。Evidence: tests/duct_tests.cc:596-660; 882409a; wine exit 0; CI 3 腿全绿。
+- [x] 审核发现：本轮 diff 未见问题（4322e421..HEAD）。
+  已复核：该范围实际含需修复问题（Windows shm close 不唤醒阻塞 recv、accept 关闭竞态、QoS 上限不一致），均已修复并验证（de0c4df/69868b3/b7cc651/882409a），未发现其他问题。
