@@ -606,29 +606,47 @@ static void test_pipe_concurrent_accepts_unblock_on_close() {
   EXPECT_TRUE(lis_r.ok());
   if (!lis_r.ok()) return;
 
+  // Raw threads (not std::async): a std::async future's destructor joins its
+  // task, so a stuck accept thread would hang the whole test binary instead of
+  // reporting a failure. A thread that misses the deadline is detached and the
+  // missed deadline itself is the reported failure.
   constexpr int kAcceptors = 4;
-  std::vector<std::future<duct::Result<void>>> acceptors;
+  std::atomic<bool> thread_done[kAcceptors];
+  duct::StatusCode codes[kAcceptors];
+  std::thread acceptors[kAcceptors];
   for (int i = 0; i < kAcceptors; ++i) {
-    acceptors.push_back(std::async(std::launch::async, [&]() -> duct::Result<void> {
+    thread_done[i].store(false, std::memory_order_relaxed);
+    acceptors[i] = std::thread([&, i] {
       auto p = lis_r.value()->accept();
-      if (!p.ok()) return p.status();
-      return {};
-    }));
+      codes[i] = p.ok() ? duct::StatusCode::kOk : p.status().code();
+      thread_done[i].store(true, std::memory_order_release);
+    });
   }
 
   // Let every accept thread reach ConnectNamedPipe, then close the listener.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   lis_r.value()->close();
 
-  for (auto& fut : acceptors) {
-    auto sst = fut.wait_for(std::chrono::seconds(3));
-    EXPECT_TRUE(sst == std::future_status::ready);
-    if (sst == std::future_status::ready) {
-      auto sr = fut.get();
-      EXPECT_TRUE(!sr.ok());
-      if (!sr.ok()) {
-        EXPECT_EQ(sr.status().code(), duct::StatusCode::kClosed);
-      }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  int finished = 0;
+  for (int i = 0; i < kAcceptors; ++i) {
+    while (!thread_done[i].load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (thread_done[i].load(std::memory_order_acquire)) {
+      ++finished;
+    }
+  }
+  EXPECT_TRUE(finished == kAcceptors);
+  for (int i = 0; i < kAcceptors; ++i) {
+    if (thread_done[i].load(std::memory_order_acquire)) {
+      acceptors[i].join();
+      EXPECT_TRUE(codes[i] == duct::StatusCode::kClosed);
+    } else {
+      // Stuck past the deadline: detach instead of joining so the process
+      // reports the failure rather than hanging on the join.
+      acceptors[i].detach();
     }
   }
 #endif
