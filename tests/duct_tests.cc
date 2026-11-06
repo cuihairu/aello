@@ -2775,6 +2775,16 @@ static void test_qos_and_reconnect_forward_max_message_bytes() {
       std::make_unique<BoundedPipe>(kTransportCap), limited_qos);
   EXPECT_TRUE(qosed_limited->max_message_bytes() == kTransportCap / 2);
 
+  // A nonzero snd_hwm_bytes is also a synchronous per-message bound in
+  // QosPipe::send(), so the accessor must report it: a caller sizing messages
+  // against max_message_bytes() would otherwise get a rejected send.
+  duct::QosOptions hwm_qos;
+  hwm_qos.snd_hwm_bytes = kTransportCap / 4;
+  hwm_qos.rcv_hwm_bytes = 0;
+  auto qosed_hwm = std::make_unique<duct::QosPipe>(
+      std::make_unique<BoundedPipe>(kTransportCap), hwm_qos);
+  EXPECT_TRUE(qosed_hwm->max_message_bytes() == kTransportCap / 4);
+
   duct::ReconnectPolicy policy;
   policy.initial_delay = std::chrono::milliseconds(5);
   policy.max_delay = std::chrono::milliseconds(20);

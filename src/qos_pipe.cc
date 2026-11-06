@@ -363,7 +363,14 @@ void QosPipe::recv_worker() {
 }
 
 std::size_t QosPipe::max_message_bytes() const {
-  return std::min(qos_.max_message_bytes, underlying_->max_message_bytes());
+  // Mirror every bound send() enforces synchronously (qos cap, transport cap,
+  // queue byte watermark) so a caller sizing messages against this value is
+  // never rejected by a limit the accessor failed to report.
+  std::size_t cap = std::min(qos_.max_message_bytes, underlying_->max_message_bytes());
+  if (qos_.snd_hwm_bytes != 0) {
+    cap = std::min(cap, qos_.snd_hwm_bytes);
+  }
+  return cap;
 }
 
 void QosPipe::close() {
