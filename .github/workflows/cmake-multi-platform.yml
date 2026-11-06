@@ -79,6 +79,9 @@ jobs:
       run: |
         if [ "$RUNNER_OS" = "Windows" ]; then
           ./Release/duct_tests.exe
+          # duct_tests.exe above deliberately bypasses ctest for live progress;
+          # still run the registered install test that ctest would have covered.
+          ctest --build-config ${{ matrix.build_type }} -R '^duct_install$' --output-on-failure
         else
           ctest --build-config ${{ matrix.build_type }} --output-on-failure
         fi

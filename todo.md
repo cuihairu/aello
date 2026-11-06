@@ -176,3 +176,13 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：test_pipe_concurrent_accepts_unblock_on_close 改用裸线程 + 每线程 done 标志（882409a），错过 3 秒截止的线程被 detach 而不再 join，测试以失败而非挂起收场；且 accept() 经 b0265fe 保证可退出，正常路径仍断言全部返回 kClosed。Evidence: tests/duct_tests.cc:596-660; 882409a; wine exit 0; CI 3 腿全绿。
 - [x] 审核发现：本轮 diff 未见问题（4322e421..HEAD）。
   已复核：该范围实际含需修复问题（Windows shm close 不唤醒阻塞 recv、accept 关闭竞态、QoS 上限不一致），均已修复并验证（de0c4df/69868b3/b7cc651/882409a），未发现其他问题。
+- [x] 审核发现：Windows 命名管道写入帧头后若载荷写入超时，或读取帧头后若载荷读取超时，直接返回并继续复用连接会丢失帧边界，后续消息被当作载荷或帧头而损坏（src/pipe_transport.cc:176）。
+  属实（已修复）：NamedPipePipe 增加 broken_ 原子标志，send/recv 在写入/读取帧头后若载荷超时、出错或短读写，调用 frame_error() 将连接标记为不可用并返回 kIoError/kClosed；后续调用直接在入口返回 kClosed，不再复用已失步的连接。Evidence: src/pipe_transport.cc:114-127, 155-200, 206-281; tests/duct_tests.cc test_pipe_midframe_timeout_poisons_connection; wine exit 0; ctest 3/3 green。
+- [x] 审核发现：异步 I/O 等待超时后未检查取消竞态中的最终完成结果，操作可能已经成功传输数据却仍返回超时，导致消息重复或帧失步（src/pipe_transport.cc:98）。
+  属实（已修复）：run_overlapped_io 在 WAIT_TIMEOUT 后 CancelIoEx 并调用 GetOverlappedResult(..., TRUE)；若操作在取消竞态中实际已完成（返回 TRUE）则报告 kDone，仅当被取消（ERROR_OPERATION_ABORTED）才报告 kTimeout，避免已完成的数据被当作超时而重复/丢帧。Evidence: src/pipe_transport.cc:94-104; tests/duct_tests.cc test_pipe_timeout_completion_preserves_message; wine exit 0; ctest 3/3 green。
+- [x] 审核发现：监听器析构最多等待两秒且 accept 在登记前和计数递减后仍访问监听器成员，析构可能先销毁互斥量、条件变量或对象而使并发 accept 发生悬空访问（src/pipe_transport.cc:287）。
+  属实（已修复）：NamedPipeListener 将互斥量/条件变量/stop_event/pipe_path/closing/active_accepts 提取到 shared_ptr<NamedPipeListenerState>；accept() 先拷贝 state 再访问成员，析构仅在 active_accepts 归零后才释放共享状态，stop_event 由共享状态持有直至最后一个 accept 退场，消除析构先于并发 accept 的悬空访问。Evidence: src/pipe_transport.cc:287-335, 362-441; tests/duct_tests.cc test_pipe_concurrent_accepts_unblock_on_close; wine exit 0; ctest 3/3 green。
+- [x] 审核发现：并发 accept 测试超时后分离的线程仍引用栈上的监听器、状态数组和完成标志，测试函数返回后可能访问已销毁对象并崩溃或产生未定义行为（tests/duct_tests.cc:649）。
+  属实（已修复）：test_pipe_concurrent_accepts_unblock_on_close 用 shared_ptr 持有 listener 和 AcceptState（含每线程 done 标志与状态码），分离线程按值捕获这两个 shared_ptr，测试函数返回后对象仍存活，不再访问已销毁的栈对象。Evidence: tests/duct_tests.cc:609-660; wine exit 0; ctest 3/3 green。
+- [x] 审核发现：Windows CI 改为直接运行 duct_tests.exe 后不再执行已注册的 duct_install 测试，Windows 安装规则回归无法被该流水线发现（.github/workflows/cmake-multi-platform.yml:81）。
+  属实（已修复）：Windows 分支在直接运行 duct_tests.exe 后追加 ctest -R '^duct_install$'（.github/workflows/cmake-multi-platform.yml:82-85），CMakeLists.txt 为 add_test 传入 --config $<CONFIG> 以支持多配置生成器（CMakeLists.txt:142-145）；本地验证 ctest --test-dir build-mingw -R duct_install 通过（1/1）。Evidence: .github/workflows/cmake-multi-platform.yml:79-86; CMakeLists.txt:142-145; build-mingw/Testing/Temporary/LastTest.log duct_install Passed; wine exit 0。

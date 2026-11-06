@@ -609,46 +609,208 @@ static void test_pipe_concurrent_accepts_unblock_on_close() {
   // Raw threads (not std::async): a std::async future's destructor joins its
   // task, so a stuck accept thread would hang the whole test binary instead of
   // reporting a failure. A thread that misses the deadline is detached and the
-  // missed deadline itself is the reported failure.
+  // missed deadline itself is the reported failure. The listener and the
+  // per-thread state are shared-owned so a detached thread cannot outlive the
+  // stack objects it still references.
   constexpr int kAcceptors = 4;
-  std::atomic<bool> thread_done[kAcceptors];
-  duct::StatusCode codes[kAcceptors];
+  struct AcceptState {
+    std::atomic<bool> done[kAcceptors];
+    duct::StatusCode codes[kAcceptors];
+  };
+  auto state = std::make_shared<AcceptState>();
+  auto listener = std::shared_ptr<duct::Listener>(std::move(lis_r.value()));
   std::thread acceptors[kAcceptors];
   for (int i = 0; i < kAcceptors; ++i) {
-    thread_done[i].store(false, std::memory_order_relaxed);
-    acceptors[i] = std::thread([&, i] {
-      auto p = lis_r.value()->accept();
-      codes[i] = p.ok() ? duct::StatusCode::kOk : p.status().code();
-      thread_done[i].store(true, std::memory_order_release);
+    state->done[i].store(false, std::memory_order_relaxed);
+    acceptors[i] = std::thread([listener, state, i] {
+      auto p = listener->accept();
+      state->codes[i] = p.ok() ? duct::StatusCode::kOk : p.status().code();
+      state->done[i].store(true, std::memory_order_release);
     });
   }
 
   // Let every accept thread reach ConnectNamedPipe, then close the listener.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  lis_r.value()->close();
+  listener->close();
 
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   int finished = 0;
   for (int i = 0; i < kAcceptors; ++i) {
-    while (!thread_done[i].load(std::memory_order_acquire) &&
+    while (!state->done[i].load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    if (thread_done[i].load(std::memory_order_acquire)) {
+    if (state->done[i].load(std::memory_order_acquire)) {
       ++finished;
     }
   }
   EXPECT_TRUE(finished == kAcceptors);
   for (int i = 0; i < kAcceptors; ++i) {
-    if (thread_done[i].load(std::memory_order_acquire)) {
+    if (state->done[i].load(std::memory_order_acquire)) {
       acceptors[i].join();
-      EXPECT_TRUE(codes[i] == duct::StatusCode::kClosed);
+      EXPECT_TRUE(state->codes[i] == duct::StatusCode::kClosed);
     } else {
       // Stuck past the deadline: detach instead of joining so the process
       // reports the failure rather than hanging on the join.
       acceptors[i].detach();
     }
   }
+#endif
+}
+
+// A timeout that races with successful completion must not discard an
+// already-completed read. If recv() reports a timeout, the frame must still be
+// available to the next recv(); otherwise the header was consumed and the
+// stream is desynchronized.
+static void test_pipe_timeout_completion_preserves_message() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_timeout_race");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_timeout_race");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto accepted_fut = accepted.get_future();
+  std::thread server([&] { accepted.set_value(lis_r.value()->accept()); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = false;
+  dial_opt.timeout = std::chrono::seconds(2);
+  auto client = duct::dial("pipe://duct_testpipe_timeout_race", dial_opt);
+  EXPECT_TRUE(client.ok());
+  if (!client.ok()) {
+    lis_r.value()->close();
+    server.join();
+    return;
+  }
+  auto server_pipe = accepted_fut.get();
+  EXPECT_TRUE(server_pipe.ok());
+  if (!server_pipe.ok()) {
+    client.value()->close();
+    lis_r.value()->close();
+    server.join();
+    return;
+  }
+
+  // Sample the completion-vs-timeout boundary. When recv() times out, the
+  // message must remain readable; a timed-out operation that actually completed
+  // would consume the header and turn the next read into a protocol error.
+  // The sender delay is swept across the timeout so some iterations complete
+  // the read and some time it out. The timeout is orders of magnitude larger
+  // than the microsecond gap between the server's header and payload writes,
+  // so a successful header read never leads to a spurious payload timeout
+  // (which would legitimately poison the connection, not preserve the message).
+  constexpr int kTimeoutMs = 500;
+  for (int i = 0; i < 12; ++i) {
+    const int delay_ms = i * 80;  // 0..880 ms, spread across the boundary
+    std::thread sender([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+      auto sr = server_pipe.value()->send(duct::Message::from_string("x"), {});
+      EXPECT_TRUE(sr.ok());
+    });
+
+    duct::RecvOptions recv_opt;
+    recv_opt.timeout = std::chrono::milliseconds(kTimeoutMs);
+    auto first = client.value()->recv(recv_opt);
+    sender.join();
+
+    if (!first.ok()) {
+      EXPECT_EQ(first.status().code(), duct::StatusCode::kTimeout);
+      duct::RecvOptions retry_opt;
+      retry_opt.timeout = std::chrono::seconds(2);
+      auto retry = client.value()->recv(retry_opt);
+      EXPECT_TRUE(retry.ok());
+      if (retry.ok()) {
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(retry.value().data()),
+                              retry.value().size()), "x");
+      }
+    } else {
+      EXPECT_EQ(std::string(reinterpret_cast<const char*>(first.value().data()),
+                            first.value().size()), "x");
+    }
+  }
+
+  client.value()->close();
+  server_pipe.value()->close();
+  lis_r.value()->close();
+  server.join();
+#endif
+}
+
+// Once the header of a frame has been written or read, a payload timeout leaves
+// the pipe with a partial frame. The transport must poison the connection rather
+// than letting the next message be interpreted as payload/header bytes.
+static void test_pipe_midframe_timeout_poisons_connection() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_midframe_timeout");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_midframe_timeout");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto accepted_fut = accepted.get_future();
+  std::thread server([&] { accepted.set_value(lis_r.value()->accept()); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  duct::DialOptions dial_opt;
+  dial_opt.qos.enabled = false;
+  dial_opt.timeout = std::chrono::seconds(2);
+  auto client = duct::dial("pipe://duct_testpipe_midframe_timeout", dial_opt);
+  EXPECT_TRUE(client.ok());
+  if (!client.ok()) {
+    lis_r.value()->close();
+    server.join();
+    return;
+  }
+  auto server_pipe = accepted_fut.get();
+  EXPECT_TRUE(server_pipe.ok());
+  if (!server_pipe.ok()) {
+    client.value()->close();
+    lis_r.value()->close();
+    server.join();
+    return;
+  }
+
+  // The server never reads. A 64 KiB payload plus the 16-byte header exceeds
+  // the 64 KiB pipe buffer, so a write eventually times out after the header
+  // has already been accepted.
+  const std::string payload(duct::wire::kMaxFramePayload, 'x');
+  duct::SendOptions send_opt;
+  send_opt.timeout = std::chrono::milliseconds(100);
+  bool saw_midframe_timeout = false;
+  for (int i = 0; i < 8; ++i) {
+    auto sent = client.value()->send(duct::Message::from_string(payload), send_opt);
+    if (!sent.ok()) {
+      EXPECT_EQ(sent.status().code(), duct::StatusCode::kIoError);
+      saw_midframe_timeout = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(saw_midframe_timeout);
+
+  auto after = client.value()->send(duct::Message::from_string("after"), {});
+  EXPECT_TRUE(!after.ok());
+  if (!after.ok()) {
+    EXPECT_EQ(after.status().code(), duct::StatusCode::kClosed);
+  }
+
+  client.value()->close();
+  server_pipe.value()->close();
+  lis_r.value()->close();
+  server.join();
 #endif
 }
 
@@ -3967,6 +4129,8 @@ int main() {
   RUN_TEST(test_pipe_rejects_oversize_message);
   RUN_TEST(test_pipe_dial_failure_unblocks_accept);
   RUN_TEST(test_pipe_concurrent_accepts_unblock_on_close);
+  RUN_TEST(test_pipe_timeout_completion_preserves_message);
+  RUN_TEST(test_pipe_midframe_timeout_poisons_connection);
   RUN_TEST(test_shm_backpressure_timeout);
   RUN_TEST(test_shm_burst_without_receiver);
   RUN_TEST(test_wire_decode_rejects_bad_magic);

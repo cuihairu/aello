@@ -142,6 +142,7 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/duct.pc
 if (DUCT_BUILD_TESTS)
   add_test(NAME duct_install
     COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR}
+            --config $<CONFIG>
             --prefix ${CMAKE_BINARY_DIR}/install_prefix)
 endif()
 
