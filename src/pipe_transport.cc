@@ -3,6 +3,7 @@
 #include "duct/wire.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -283,12 +284,25 @@ class NamedPipeListener final : public Listener {
     // Wait for in-flight accept() calls to unwind (they observe the stop
     // event) before releasing the stop event handle they wait on.
     std::unique_lock<std::mutex> lock(mu_);
-    cv_.wait_for(lock, std::chrono::seconds(2), [&] { return active_accepts_ == 0; });
-    if (stop_event_ != NULL) CloseHandle(stop_event_);
+    cv_.wait_for(lock, std::chrono::seconds(2), [&] { return active_accepts_.load() == 0; });
+    // Only close the stop event once no accept can still reference it. If an
+    // accept is still unwinding (pathological), leak the handle rather than
+    // letting a late WaitForMultipleObjects use a closed one (use-after-close).
+    if (active_accepts_.load() == 0 && stop_event_ != NULL) {
+      CloseHandle(stop_event_);
+      stop_event_ = NULL;
+    }
+  }
+
+  // Decrement the in-flight accept count and wake the destructor's wait. Every
+  // accept() return path calls this exactly once after the increment.
+  void finish_accept() {
+    active_accepts_.fetch_sub(1, std::memory_order_release);
+    cv_.notify_all();
   }
 
   Result<std::unique_ptr<Pipe>> accept() override {
-    if (closing_) return Status::closed("listener closed");
+    if (closing_.load(std::memory_order_acquire)) return Status::closed("listener closed");
 
     HANDLE pipe = CreateNamedPipeA(
       pipe_path_.c_str(),
@@ -314,12 +328,12 @@ class NamedPipeListener final : public Listener {
     // Register this accept so the destructor waits for it to unwind.
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (closing_) {
+      if (closing_.load(std::memory_order_relaxed)) {
         CloseHandle(ev);
         CloseHandle(pipe);
         return Status::closed("listener closed");
       }
-      ++active_accepts_;
+      active_accepts_.fetch_add(1, std::memory_order_relaxed);
     }
 
     OVERLAPPED ov{};
@@ -330,14 +344,14 @@ class NamedPipeListener final : public Listener {
     if (connected || connect_error == ERROR_PIPE_CONNECTED) {
       // Client connected before or during our ConnectNamedPipe.
       CloseHandle(ev);
-      --active_accepts_;
+      finish_accept();
       return std::unique_ptr<Pipe>(new NamedPipePipe(pipe, true));
     }
 
     if (connect_error != ERROR_IO_PENDING) {
       CloseHandle(ev);
       CloseHandle(pipe);
-      --active_accepts_;
+      finish_accept();
       return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(connect_error));
     }
 
@@ -350,11 +364,11 @@ class NamedPipeListener final : public Listener {
         DWORD e = GetLastError();
         CloseHandle(ev);
         CloseHandle(pipe);
-        --active_accepts_;
+        finish_accept();
         return Status::io_error("ConnectNamedPipe failed with error: " + std::to_string(e));
       }
       CloseHandle(ev);
-      --active_accepts_;
+      finish_accept();
       return std::unique_ptr<Pipe>(new NamedPipePipe(pipe, true));
     }
 
@@ -365,7 +379,7 @@ class NamedPipeListener final : public Listener {
     GetOverlappedResult(pipe, &ov, &n, TRUE);
     CloseHandle(ev);
     CloseHandle(pipe);
-    --active_accepts_;
+    finish_accept();
     return Status::closed("listener closed during accept");
   }
 
@@ -380,8 +394,8 @@ class NamedPipeListener final : public Listener {
 
   void close() override {
     std::lock_guard<std::mutex> lock(mu_);
-    if (closing_) return;
-    closing_ = true;
+    if (closing_.load(std::memory_order_relaxed)) return;
+    closing_.store(true, std::memory_order_release);
     // Wake every accept() blocked in WaitForMultipleObjects so it cancels its
     // pending ConnectNamedPipe and returns kClosed promptly instead of hanging.
     if (stop_event_ != NULL) SetEvent(stop_event_);
@@ -393,8 +407,11 @@ class NamedPipeListener final : public Listener {
   std::mutex mu_;
   std::condition_variable cv_;
   HANDLE stop_event_ = NULL;
-  bool closing_ = false;
-  int active_accepts_ = 0;
+  // closing_ guards against late accept() calls; active_accepts_ counts the
+  // accepts in flight so the destructor releases stop_event_ only after every
+  // accept that might wait on it has unwound.
+  std::atomic<bool> closing_{false};
+  std::atomic<int> active_accepts_{0};
 };
 
 }  // namespace
