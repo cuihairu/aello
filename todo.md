@@ -186,3 +186,31 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：test_pipe_concurrent_accepts_unblock_on_close 用 shared_ptr 持有 listener 和 AcceptState（含每线程 done 标志与状态码），分离线程按值捕获这两个 shared_ptr，测试函数返回后对象仍存活，不再访问已销毁的栈对象。Evidence: tests/duct_tests.cc:609-660; wine exit 0; ctest 3/3 green。
 - [x] 审核发现：Windows CI 改为直接运行 duct_tests.exe 后不再执行已注册的 duct_install 测试，Windows 安装规则回归无法被该流水线发现（.github/workflows/cmake-multi-platform.yml:81）。
   属实（已修复）：Windows 分支在直接运行 duct_tests.exe 后追加 ctest -R '^duct_install$'（.github/workflows/cmake-multi-platform.yml:82-85），CMakeLists.txt 为 add_test 传入 --config $<CONFIG> 以支持多配置生成器（CMakeLists.txt:142-145）；本地验证 ctest --test-dir build-mingw -R duct_install 通过（1/1）。Evidence: .github/workflows/cmake-multi-platform.yml:79-86; CMakeLists.txt:142-145; build-mingw/Testing/Temporary/LastTest.log duct_install Passed; wine exit 0。
+- [ ] 审核发现：命名管道拨号重试每次都向 WaitNamedPipe 传入完整超时而非剩余时间，管道临近截止时变忙可使总拨号时长超过约定的截止时间（src/pipe_transport.cc:475）。
+- [ ] 审核发现：WaitNamedPipe 成功后若最后一个管道实例在 CreateFile 前被关闭，CreateFile 返回的 ERROR_FILE_NOT_FOUND 未被重试，导致截止时间内可能出现瞬时拨号失败（src/pipe_transport.cc:490）。
+- [ ] 审核发现：命名管道在拨号截止时间内始终不存在时返回 kIoError 而非 kTimeout，使调用方无法正确识别等待超时（src/pipe_transport.cc:502）。
+
+## 源码分层分析 2026-11-07
+
+### a) 抽象层清单
+
+| 层 | 职责一句话 | 代表模块 |
+|---|---|---|
+| 基础契约 | 提供消息所有权、错误结果和平台套接字原语。 | `include/duct/message.h:15`; `include/duct/status.h:66`; `src/socket_utils.cc:19` |
+| 线协议与内存帧 | 统一 socket 帧校验/分片/重组，并定义共享内存 ring 记录。 | `src/wire.cc:28`; `src/shm_transport.cc:163`; `src/win_shm.cc:76` |
+| 传输后端 | 按 OS 通道实现连接、接受、读写和资源关闭生命周期。 | `src/tcp_transport.cc:57`; `src/uds_transport.cc:31`; `src/shm_transport.cc:540`; `src/pipe_transport.cc:109` |
+| 传输抽象与分发 | 用公共 Pipe/Listener 和地址 scheme 隐藏后端选择。 | `include/duct/duct.h:127`; `include/duct/duct.h:154`; `src/duct.cc:29`; `src/duct.cc:56` |
+| 连接策略与 QoS | 以有界队列、背压/限速、自动重连和状态回调装饰任意 pipe。 | `src/qos_pipe.cc:11`; `src/reconnect_pipe.cc:18`; `src/state_callback_pipe.cc:10` |
+| 消息模式 | 在已连接 pipe 上提供请求关联与进程内主题分发。 | `include/duct/rpc.h:58`; `include/duct/pubsub.h:27` |
+| 应用适配器 | 提供 builder、RAII 所有权、同步批量和应用循环便利面。 | `include/duct/convenience.h:22`; `include/duct/raii.h:17`; `examples/convenience_example.cc:23`; `bench/aello_bench.cc:150` |
+
+### b) 超大文件候选
+
+- [ ] LAY-001 [P1] 拆分 `tests/duct_tests.cc`（4209 行）——单文件同时承载自建断言、测试替身、六类传输回归、QoS/重连/RPC/pubsub 与主测试清单，拆分可按被测层隔离失败并降低并发编辑冲突（`tests/duct_tests.cc:46`; `tests/duct_tests.cc:4110`）。
+
+### c) 目录/分类不合理处
+
+- [ ] `include/duct/convenience.h`（365 行）与 `include/duct/raii.h`（160 行）是 header-only 应用适配层，但库源码没有对应 `.cc`/内部模块边界；README 仍说 `convenience.h` 不属于库，而 `add_library(duct)` 虽不编译头文件，公共安装却通过 `install(DIRECTORY include/duct ...)` 导出该契约（`include/duct/convenience.h:22`；`include/duct/raii.h:17`；`CMakeLists.txt:109`；`README.md:148`）。
+- [ ] `src/duct.cc` 同时承担公开 scheme 分发和“dial once + 传 reconnect 选项”的组合职责，而 `src/state_callback_pipe.*` 写好了却无生产调用方；组合生命周期应统一到一个明确的组合器入口，避免 callback 能力分叉（`src/duct.cc:56`；`src/duct.cc:105`；`src/state_callback_pipe.cc:63`）。
+- [ ] LAY-002 [P2] 更正 README 构建与目录章节——`install/export/pkg-config/CPack` 已存在且被安装冒烟测试覆盖，而死头清单会误导消费者（`CMakeLists.txt:99`; `CMakeLists.txt:135`; `CMakeLists.txt:142`; `README.md:134`; `README.zh.md:126`）。
+- [ ] LAY-003 [P2] 拆分 `README.md` 与 `README.zh.md` 中“当前能力/当前没有”的维护面——同一能力矩阵分散在两种语言和源码注释中，已出现 `state_callback_pipe`、`heartbeat_interval`、`reliability`、`ListenOptions::qos` 等预留契约未声明的问题（`README.md:30`; `README.md:42`; `README.zh.md:30`; `README.zh.md:38`; `src/duct.cc:110`; `src/state_callback_pipe.cc:63`）。
