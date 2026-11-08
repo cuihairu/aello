@@ -186,9 +186,12 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：test_pipe_concurrent_accepts_unblock_on_close 用 shared_ptr 持有 listener 和 AcceptState（含每线程 done 标志与状态码），分离线程按值捕获这两个 shared_ptr，测试函数返回后对象仍存活，不再访问已销毁的栈对象。Evidence: tests/duct_tests.cc:609-660; wine exit 0; ctest 3/3 green。
 - [x] 审核发现：Windows CI 改为直接运行 duct_tests.exe 后不再执行已注册的 duct_install 测试，Windows 安装规则回归无法被该流水线发现（.github/workflows/cmake-multi-platform.yml:81）。
   属实（已修复）：Windows 分支在直接运行 duct_tests.exe 后追加 ctest -R '^duct_install$'（.github/workflows/cmake-multi-platform.yml:82-85），CMakeLists.txt 为 add_test 传入 --config $<CONFIG> 以支持多配置生成器（CMakeLists.txt:142-145）；本地验证 ctest --test-dir build-mingw -R duct_install 通过（1/1）。Evidence: .github/workflows/cmake-multi-platform.yml:79-86; CMakeLists.txt:142-145; build-mingw/Testing/Temporary/LastTest.log duct_install Passed; wine exit 0。
-- [ ] 审核发现：命名管道拨号重试每次都向 WaitNamedPipe 传入完整超时而非剩余时间，管道临近截止时变忙可使总拨号时长超过约定的截止时间（src/pipe_transport.cc:475）。
-- [ ] 审核发现：WaitNamedPipe 成功后若最后一个管道实例在 CreateFile 前被关闭，CreateFile 返回的 ERROR_FILE_NOT_FOUND 未被重试，导致截止时间内可能出现瞬时拨号失败（src/pipe_transport.cc:490）。
-- [ ] 审核发现：命名管道在拨号截止时间内始终不存在时返回 kIoError 而非 kTimeout，使调用方无法正确识别等待超时（src/pipe_transport.cc:502）。
+- [x] 审核发现：命名管道拨号重试每次都向 WaitNamedPipe 传入完整超时而非剩余时间，管道临近截止时变忙可使总拨号时长超过约定的截止时间（src/pipe_transport.cc:475）。
+  属实（已修复）：pipe_dial 改为先算 steady_clock 截止时间，每次 WaitNamedPipeA 只传 remaining_ms()（deadline-now），重试 yield 也不越过截止时间（src/pipe_transport.cc:472-489）。Evidence: commit 835f405; wine 全量 84 RUN/84 DONE exit 0。
+- [x] 审核发现：WaitNamedPipe 成功后若最后一个管道实例在 CreateFile 前被关闭，CreateFile 返回的 ERROR_FILE_NOT_FOUND 未被重试，导致截止时间内可能出现瞬时拨号失败（src/pipe_transport.cc:490）。
+  属实（已修复）：CreateFile 的 ERROR_PIPE_BUSY 与 ERROR_FILE_NOT_FOUND 都视为瞬态并在截止时间内重试，其余错误码仍立即返回 kIoError（src/pipe_transport.cc:503-517）。Evidence: commit 835f405; wine 全量 84 RUN/84 DONE exit 0。
+- [x] 审核发现：命名管道在拨号截止时间内始终不存在时返回 kIoError 而非 kTimeout，使调用方无法正确识别等待超时（src/pipe_transport.cc:502）。
+  属实（已修复）：新增红测试 test_pipe_dial_absent_reports_timeout（修复前 wine 在 tests/duct_tests.cc:681 报 code != kTimeout），修复后对不存在的管道 300ms 拨号返回 kTimeout 且耗时 300/304/300ms（独立探针 3/3 PROBE OK；修复前基线 PROBE FAIL (3) 全部 kIoError）。Evidence: commit 835f405; tests/duct_tests.cc test_pipe_dial_absent_reports_timeout; wine 全量 84 RUN/84 DONE exit 0; Linux ctest 3/3 (26.56s)。
 
 ## 源码分层分析 2026-11-07
 
