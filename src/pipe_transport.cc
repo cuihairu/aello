@@ -463,16 +463,30 @@ Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptio
   // inside accept(), so WaitNamedPipe can race the accept thread and return
   // ERROR_FILE_NOT_FOUND; and a successful WaitNamedPipe does not guarantee
   // CreateFile wins the race against another client or the server's pending
-  // ConnectNamedPipe (ERROR_PIPE_BUSY). Both are transient, so retry within the
-  // deadline instead of failing the whole dial.
-  DWORD timeout = static_cast<DWORD>(opt.timeout.count());
-  if (timeout == 0) {
-    timeout = kDefaultTimeoutMs;
-  }
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
+  // ConnectNamedPipe (ERROR_PIPE_BUSY). Nor does it guarantee the last instance
+  // still exists when CreateFile runs (ERROR_FILE_NOT_FOUND). All three are
+  // transient, so retry within the deadline instead of failing the whole dial.
+  //
+  // Each WaitNamedPipe call gets only the time remaining until the deadline, so
+  // retries cannot push the total dial past the caller's bound.
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            opt.timeout.count() == 0 ? kDefaultTimeoutMs
+                                                     : opt.timeout.count());
+  auto remaining_ms = [&]() -> DWORD {
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now())
+                    .count();
+    if (left <= 0) return 0;
+    return static_cast<DWORD>(left);
+  };
   HANDLE pipe = INVALID_HANDLE_VALUE;
   for (;;) {
-    DWORD wait_result = WaitNamedPipeA(pipe_path.c_str(), timeout);
+    DWORD left = remaining_ms();
+    if (left == 0) {
+      return Status::timeout("timeout waiting for named pipe");
+    }
+    DWORD wait_result = WaitNamedPipeA(pipe_path.c_str(), left);
     if (wait_result) {
       // Connect to the named pipe. FILE_FLAG_OVERLAPPED is required so the pipe
       // handle matches the overlapped ReadFile/WriteFile used by NamedPipePipe.
@@ -487,7 +501,9 @@ Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptio
       );
       if (pipe != INVALID_HANDLE_VALUE) break;
       DWORD error = GetLastError();
-      if (error != ERROR_PIPE_BUSY || std::chrono::steady_clock::now() >= deadline) {
+      // Busy or transiently absent: retry until the deadline. Anything else is
+      // a real failure.
+      if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND) {
         return Status::io_error("CreateFile failed with error: " + std::to_string(error));
       }
     } else {
@@ -498,12 +514,9 @@ Result<std::unique_ptr<Pipe>> pipe_dial(const std::string& name, const DialOptio
       if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PIPE_BUSY) {
         return Status::io_error("WaitNamedPipe failed with error: " + std::to_string(error));
       }
-      if (std::chrono::steady_clock::now() >= deadline) {
-        return Status::io_error("named pipe not found within dial deadline");
-      }
     }
     // Briefly yield so the server can create/accept the next instance, then try
-    // again.
+    // again. Do not sleep past the deadline.
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 

@@ -658,6 +658,35 @@ static void test_pipe_concurrent_accepts_unblock_on_close() {
 #endif
 }
 
+// A dial against a pipe name that never appears must fail with kTimeout (not
+// kIoError) so callers can tell "peer absent within the deadline" apart from a
+// transport failure, and the attempt must finish near the caller's deadline
+// instead of running far past it.
+static void test_pipe_dial_absent_reports_timeout() {
+#if !defined(_WIN32)
+  auto r = duct::dial("pipe://duct_testpipe_absent", duct::DialOptions{});
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(300);
+  const auto begin = std::chrono::steady_clock::now();
+  auto r = duct::dial("pipe://duct_testpipe_absent", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kTimeout);
+  }
+  // The dial must have waited for the peer (not failed instantly) and must
+  // stay near the deadline; the upper bound is loose for slow CI machines.
+  EXPECT_TRUE(elapsed >= std::chrono::milliseconds(250));
+  EXPECT_TRUE(elapsed < std::chrono::seconds(2));
+#endif
+}
+
 // A timeout that races with successful completion must not discard an
 // already-completed read. If recv() reports a timeout, the frame must still be
 // available to the next recv(); otherwise the header was consumed and the
@@ -4129,6 +4158,7 @@ int main() {
   RUN_TEST(test_pipe_rejects_oversize_message);
   RUN_TEST(test_pipe_dial_failure_unblocks_accept);
   RUN_TEST(test_pipe_concurrent_accepts_unblock_on_close);
+  RUN_TEST(test_pipe_dial_absent_reports_timeout);
   RUN_TEST(test_pipe_timeout_completion_preserves_message);
   RUN_TEST(test_pipe_midframe_timeout_poisons_connection);
   RUN_TEST(test_shm_backpressure_timeout);
