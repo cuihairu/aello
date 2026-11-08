@@ -209,7 +209,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ### b) 超大文件候选
 
-- [ ] LAY-001 [P1] 拆分 `tests/duct_tests.cc`（4209 行）——单文件同时承载自建断言、测试替身、六类传输回归、QoS/重连/RPC/pubsub 与主测试清单，拆分可按被测层隔离失败并降低并发编辑冲突（`tests/duct_tests.cc:46`; `tests/duct_tests.cc:4110`）。
+- [x] LAY-001 [P1] 拆分 `tests/duct_tests.cc`（4209 行）——单文件同时承载自建断言、测试替身、六类传输回归、QoS/重连/RPC/pubsub 与主测试清单，拆分可按被测层隔离失败并降低并发编辑冲突（`tests/duct_tests.cc:46`; `tests/duct_tests.cc:4110`）。
+  已完成（机械拆分，测试集合与执行顺序不变）：tests/duct_tests.cc 只留 main() 与固定执行顺序（113 行）；断言/RUN_TEST 标记/EXPECT 宏与 7 个测试替身移入 tests/test_support.h（g_failures/fail 改 inline 共享失败计数）；84 个测试按层拆为 core(2)/pipe(7)/shm(16)/stream(21)/qos(23)/wire(9)/session(6) 七对 .h+.cc；CMakeLists.txt add_executable(duct_tests) 加入新源文件（CMakeLists.txt:83-92）。Evidence: commit 71478ac; Linux ctest 3/3 且 duct_tests 84 RUN/84 DONE exit 0; mingw 交叉编译 + wine 全量 84 RUN/84 DONE exit 0。
 
 ### c) 目录/分类不合理处
 
