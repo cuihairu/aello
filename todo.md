@@ -129,7 +129,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## 漏洞扫描遗留（2026-11-03 全舰队扫描，源 scratch/vuln-scan-*.md）
 
-- [x] VULN-AELLO-001 [高危·GHSA-587h-7wmj-h5pm 路径穿越] vite ≤6.4.3→≥6.4.4（package-lock.json 仓，终扫 1，vite≤6.4.3 受影响）【BLOCKED·规范禁 npm 改 lock】npm-lock 仓只审计未改动；验收：迁 pnpm（pnpm import）后 pnpm audit --audit-level=high 该包不再命中（或编排者批准 npm 侧修复后 npm audit 清零）；该仓无 test 脚本，audit-only。
+- [x] VULN-AELLO-001 [高危·GHSA-587h-7wmj-h5pm 路径穿越] vite ≤6.4.3→≥6.4.4（vite≤6.4.3 受影响）已解决；验收：迁 pnpm（pnpm import）后 pnpm audit --audit-level=high 该包不再命中（或编排者批准 npm 侧修复后 npm audit 清零）；该仓无 test 脚本，audit-only。
   属实（已解决）：f7405a7 已将 docs 部署迁 pnpm 并 override vite 至 6.4.5（≥6.4.4 修复版），删除旧 package-lock.json；验收实测 pnpm-lock.yaml 锁定 vite 6.4.5，`pnpm audit --audit-level=high` → "No known vulnerabilities found"，GHSA-587h-7wmj-h5pm 不再命中。Evidence: commit f7405a7; pnpm audit 2026-11-09 clean。
 
 - [x] 审核发现：本轮 diff 未见问题（a038db59..HEAD）——该区间仅含 70aa548（docs: record vulnerability scan leftovers），只改动 todo.md 审核台账，无任何源代码变更，故无新增安全/正确性/测试缺口可审；新增条目（102-117 行）均为既有代码缺陷与依赖漏洞的台账记录，非本区间引入。 Evidence: re-checked a038db59..HEAD (only 70aa548, a todo.md-only docs commit); no source change, so no new security/correctness/test gap; ctest 3/3. 1d2b503
@@ -228,3 +228,6 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：双语 README 构建章节改为如实描述——`cmake --install` 导出 CMake package config（duct::）、pkg-config（duct.pc）与 CPack TGZ，且由 ctest 的 duct_install 冒烟测试覆盖；目录章节补 bench/；死头清单（已删除的 async.h/utils.h/logging.h/queue.h/duct_export.h）移除，改为说明 socket_utils.h 为库所用、convenience.h/raii.h 为随库安装的 header-only 适配层并由测试套件编译。Evidence: commit 4bb3374; README.md 与 README.zh.md 构建章节、仓库结构章节逐段核对于 CMakeLists.txt:105-146（install/EXPORT/pkg-config/CPack/duct_install）。
 - [x] LAY-003 [P2] 拆分 `README.md` 与 `README.zh.md` 中“当前能力/当前没有”的维护面——同一能力矩阵分散在两种语言和源码注释中，已出现 `state_callback_pipe`、`heartbeat_interval`、`reliability`、`ListenOptions::qos` 等预留契约未声明的问题（`README.md:30`; `README.md:42`; `README.zh.md:30`; `README.zh.md:38`; `src/duct.cc:110`; `src/state_callback_pipe.cc:63`）。
   属实（已收敛）：新增 docs/design/capabilities.md 作为唯一维护面（已实现能力矩阵 / 明确未实现 / 预留契约三节），双语 README 的重复能力矩阵改为摘要+链接，之后只更新该文件；预留契约显式声明——`ReconnectPolicy::heartbeat_interval`（无任何传输消费，`duct.h:43` 原注释谎称"maps to OS TCP keepalive settings"，grep 全 src/ 无 SO_KEEPALIVE/TCP_KEEP，已改为 reserved 如实注释）、`QosOptions::reliability`（从未被读取，kAtMostOnce 是唯一有实现的枚举值）、`ListenOptions::qos`（预留）；`state_callback_pipe` 记录为已删除（84e6e6d）。Evidence: commit ff4ba35; capabilities.md 行号引用（duct.h:45/77/180）逐一核对；Linux 全量 93 RUN/93 DONE exit 0，ctest 3/3。
+
+- [x] 审核发现：VULN-AELLO-001 已标记完成并注明修复，但同一条目仍标为 BLOCKED 且称 npm-lock 仓未改动，误导读者认为修复仍受阻（todo.md:132）。
+  属实（已修正）：todo.md:132 勾选后残留 `【BLOCKED·规范禁 npm 改 lock】npm-lock 仓只审计未改动` 陈旧片段，与已解决状态矛盾；已改写为去掉 BLOCKED/未改动措辞、保留验收标准与修复证据（f7405a7 + pnpm audit 2026-11-09 clean）。Evidence: 556dcd4（勾销）；本行修正 8f88bee。
