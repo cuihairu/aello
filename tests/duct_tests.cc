@@ -66,6 +66,8 @@ int main() {
   RUN_TEST(test_qos_close_under_full_ring);
   RUN_TEST(test_reconnect_dial_connects_and_echoes);
   RUN_TEST(test_reconnect_dial_fails_after_attempts);
+  RUN_TEST(test_reconnect_dial_unreachable_fails_within_deadline);
+  RUN_TEST(test_reconnect_dial_reports_bound_on_return);
   RUN_TEST(test_reconnect_callback_ops_pipe);
   RUN_TEST(test_qos_recv_watermark_and_worker);
   RUN_TEST(test_qos_linger_drains_before_close);

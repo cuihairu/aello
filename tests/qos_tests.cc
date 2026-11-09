@@ -320,20 +320,14 @@ void test_reconnect_dial_fails_after_attempts() {
   dial_opt.reconnect.max_attempts = 3;
 
   auto c = duct::dial("tcp://127.0.0.1:1", dial_opt);
-  EXPECT_TRUE(c.ok());
-  if (!c.ok()) return;
-
-  // The dial itself returns immediately; the first send blocks until the
-  // background worker exhausts all attempts.
-  duct::SendOptions send_opt;
-  send_opt.timeout = std::chrono::milliseconds(5000);
-  auto st = c.value()->send(duct::Message::from_string("x"), send_opt);
-  EXPECT_TRUE(!st.ok());
-  if (!st.ok()) {
-    EXPECT_TRUE(st.status().code() == duct::StatusCode::kIoError ||
-                st.status().code() == duct::StatusCode::kTimeout);
+  // dial() no longer succeeds vacuously: once the policy's attempts are
+  // exhausted the dial itself fails instead of handing out a pipe whose first
+  // send later reports the exhausted attempts.
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_TRUE(c.status().code() == duct::StatusCode::kIoError ||
+                c.status().code() == duct::StatusCode::kTimeout);
   }
-  c.value()->close();
 }
 
 
@@ -929,4 +923,51 @@ void test_qos_drop_old_evicts_oldest_queued() {
   EXPECT_TRUE(transport->wait_for_sent("d", std::chrono::milliseconds(500)));
   EXPECT_TRUE(!transport->was_sent("b"));
   pipe.close();
+}
+
+// A reconnect-enabled dial must not report success for an address it cannot
+// reach: dial() returns an error inside the caller's deadline instead of a
+// pipe that only fails later on first send/recv.
+void test_reconnect_dial_unreachable_fails_within_deadline() {
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(300);
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.initial_delay = std::chrono::milliseconds(10);
+  dial_opt.reconnect.max_delay = std::chrono::milliseconds(20);
+  dial_opt.reconnect.max_attempts = 3;
+
+  const auto begin = std::chrono::steady_clock::now();
+  auto r = duct::dial("shm://duct_reconnect_absent", dial_opt);
+  const auto elapsed = std::chrono::steady_clock::now() - begin;
+
+  EXPECT_TRUE(!r.ok());
+  EXPECT_TRUE(elapsed < std::chrono::seconds(5));
+}
+
+// The pipe returned by a reconnect-enabled dial wraps the transport, so the
+// transport's send bound is honored immediately instead of falling back to the
+// unbounded base default while the background first connect is still running.
+void test_reconnect_dial_reports_bound_on_return() {
+  auto lis_r = duct::listen("shm://duct_reconnect_bound");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(2000);
+  dial_opt.qos.enabled = true;
+  dial_opt.qos.snd_hwm_bytes = 1024;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.initial_delay = std::chrono::milliseconds(10);
+  dial_opt.reconnect.max_attempts = 5;
+
+  auto c = duct::dial("shm://duct_reconnect_bound", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (c.ok()) {
+    EXPECT_EQ(c.value()->max_message_bytes(), static_cast<std::size_t>(1024));
+    c.value()->close();
+  }
+  lis_r.value()->close();
 }

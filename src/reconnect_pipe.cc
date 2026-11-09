@@ -3,8 +3,10 @@
 #include "duct/wire.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -26,6 +28,23 @@ class ReconnectPipe final : public Pipe {
   }
 
   ~ReconnectPipe() override { close(); }
+
+  // Public so the dial combinator can require the first connect to complete
+  // before dial() returns (see make_connected_reconnect_pipe).
+  Result<void> wait_connected(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(mu_);
+    auto pred = [&] { return closed_ || inner_ != nullptr || permanently_failed_; };
+    if (timeout.count() > 0) {
+      if (!cv_.wait_for(lk, timeout, pred)) {
+        return Status::timeout("connect timed out");
+      }
+    } else {
+      cv_.wait(lk, pred);
+    }
+    if (closed_) return Status::closed("pipe closed");
+    if (permanently_failed_) return Status::io_error("reconnect attempts exhausted: " + last_error_);
+    return {};
+  }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
     for (;;) {
@@ -92,10 +111,17 @@ class ReconnectPipe final : public Pipe {
   // reconnect pipe still rejects oversize messages synchronously (otherwise the
   // default unlimited cap lets the drain worker enqueue a message the inner
   // transport will permanently reject, silently dropping it).
+  //
+  // The bound is memoized: during a disconnect window inner_ is empty and
+  // callers sizing messages must not see the unbounded base default again, or
+  // the next transport would reject what the drain worker already queued.
   std::size_t max_message_bytes() const override {
     std::shared_ptr<Pipe> inner_snapshot = snapshot_inner();
-    if (!inner_snapshot) return Pipe::max_message_bytes();
-    return inner_snapshot->max_message_bytes();
+    if (inner_snapshot) {
+      last_bound_.store(inner_snapshot->max_message_bytes(),
+                        std::memory_order_release);
+    }
+    return last_bound_.load(std::memory_order_acquire);
   }
 
   void close() override {
@@ -132,21 +158,6 @@ class ReconnectPipe final : public Pipe {
   std::shared_ptr<Pipe> snapshot_inner() const {
     std::lock_guard<std::mutex> lk(mu_);
     return inner_;
-  }
-
-  Result<void> wait_connected(std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lk(mu_);
-    auto pred = [&] { return closed_ || inner_ != nullptr || permanently_failed_; };
-    if (timeout.count() > 0) {
-      if (!cv_.wait_for(lk, timeout, pred)) {
-        return Status::timeout("connect timed out");
-      }
-    } else {
-      cv_.wait(lk, pred);
-    }
-    if (closed_) return Status::closed("pipe closed");
-    if (permanently_failed_) return Status::io_error("reconnect attempts exhausted: " + last_error_);
-    return {};
   }
 
   void mark_disconnected(const std::shared_ptr<Pipe>& which, const std::string& reason) {
@@ -260,6 +271,10 @@ class ReconnectPipe final : public Pipe {
   std::string last_error_;
   std::shared_ptr<Pipe> inner_;
   std::thread worker_;
+
+  // Last inner bound seen by max_message_bytes(); unbounded until the first
+  // successful dial lands an inner pipe.
+  mutable std::atomic<std::size_t> last_bound_{std::numeric_limits<std::size_t>::max()};
 };
 
 }  // namespace
@@ -268,6 +283,20 @@ std::unique_ptr<Pipe> make_reconnect_pipe(DialOnceFn dial_once,
                                          ReconnectPolicy policy,
                                          ConnectionCallback on_state_change) {
   return std::make_unique<ReconnectPipe>(std::move(dial_once), policy, std::move(on_state_change));
+}
+
+Result<std::unique_ptr<Pipe>> make_connected_reconnect_pipe(
+    DialOnceFn dial_once, const ReconnectPolicy& policy,
+    ConnectionCallback on_state_change,
+    std::chrono::milliseconds first_connect_timeout) {
+  auto pipe = std::make_unique<ReconnectPipe>(std::move(dial_once), policy,
+                                              std::move(on_state_change));
+  auto st = pipe->wait_connected(first_connect_timeout);
+  if (!st.ok()) {
+    pipe->close();
+    return st.status();
+  }
+  return std::unique_ptr<Pipe>(std::move(pipe));
 }
 
 }  // namespace duct

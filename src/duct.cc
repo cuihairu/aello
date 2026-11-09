@@ -113,7 +113,16 @@ Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions
     auto dial_once = [address, base]() -> Result<std::unique_ptr<Pipe>> {
       return dial_impl(address, base);
     };
-    return make_reconnect_pipe(std::move(dial_once), opt.reconnect, opt.on_state_change);
+    // dial() must return a connected pipe or a dial error, exactly like a
+    // plain dial: wait for the first connect within the caller's deadline
+    // (0 = default bound) instead of succeeding vacuously while the background
+    // worker is still trying an unreachable peer. Later disconnects still
+    // redial through the worker.
+    constexpr auto kReconnectFirstConnectDefault = std::chrono::milliseconds(5000);
+    const auto first_wait = opt.timeout.count() > 0 ? opt.timeout
+                                                    : kReconnectFirstConnectDefault;
+    return make_connected_reconnect_pipe(std::move(dial_once), opt.reconnect,
+                                         opt.on_state_change, first_wait);
   }
   return dial_impl(address, opt);
 }

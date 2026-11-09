@@ -10,6 +10,8 @@ void test_qos_delivery_under_hwm();
 void test_qos_close_under_full_ring();
 void test_reconnect_dial_connects_and_echoes();
 void test_reconnect_dial_fails_after_attempts();
+void test_reconnect_dial_unreachable_fails_within_deadline();
+void test_reconnect_dial_reports_bound_on_return();
 void test_reconnect_callback_ops_pipe();
 void test_qos_recv_watermark_and_worker();
 void test_qos_linger_drains_before_close();
