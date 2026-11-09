@@ -40,8 +40,8 @@ struct ReconnectPolicy {
   // Maximum reconnect attempts; 0 means retry forever.
   int max_attempts = 0;
 
-  // Heartbeat/keepalive interval. For tcp:// this maps to OS TCP keepalive settings.
-  // Zero means disabled.
+  // Reserved: no transport consumes this yet; keepalives are whatever the OS
+  // defaults to. Tracked in docs/design/capabilities.md.
   std::chrono::milliseconds heartbeat_interval{5'000};
 };
 

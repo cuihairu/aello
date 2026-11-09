@@ -16,30 +16,17 @@ Formerly known as `duct`.
 
 ## Status
 
-Experimental, pre-release. What exists today:
+Experimental, pre-release. One `Pipe`/`Listener` API over `tcp://`, `shm://`,
+`uds://` (POSIX) and `pipe://` (Windows named pipes), with a bounded `shm://`
+fast path, a QoS layer (watermarks, backpressure, per-message TTL), automatic
+reconnect with exponential backoff, and header-only RPC and pub/sub layers
+on top.
 
-- Message model (`Message`) and `Result`/`Status` error handling — no exceptions required.
-- One `Pipe`/`Listener` API over four transports: `tcp://`, `shm://`, `uds://`
-  (POSIX) and `pipe://` (Windows named pipes).
-- The `shm://` fast path: a bounded, pre-allocated fixed-slot ring per direction
-  (64 slots × 64 KiB), semaphore-synchronized, with copy-send semantics.
-- A 16-byte wire header for the byte-stream transports (`tcp://`, `uds://`,
-  `pipe://`). Per-frame payloads on the socket byte-stream transports
-  (`tcp://`, `uds://`) are capped at 64 KiB, and larger messages are fragmented
-  and reassembled (up to a 64 MiB limit).
-- A QoS layer with send/receive byte watermarks (`QosOptions::snd_hwm_bytes` /
-  `rcv_hwm_bytes`), backpressure policies, and per-message TTL.
-- Automatic reconnect with exponential backoff (`DialOptions::reconnect`,
-  `src/reconnect_pipe.cc`).
-- Header-only layers above the pipe: correlated request/response RPC
-  (`duct/rpc.h`) and a topic pub/sub broker (`duct/pubsub.h`).
-- A ping-pong benchmark harness (`bench/aello_bench.cc`, built by default on POSIX
-  and registered as a CI smoke test).
-- Cross-platform CI (GCC / Clang / MSVC) running the test suite.
-
-What does **not** exist yet — stated plainly so nobody has to discover it:
-
-- No async/event-loop API on the pipe itself. Note the send side does run an internal queue-drain worker when QoS is enabled.
+The capability matrix — what exists, what does **not** exist yet, and which
+option fields are reserved but not consumed — is maintained in one place,
+[`docs/design/capabilities.md`](docs/design/capabilities.md); this section and
+its Chinese twin only summarize it. Notable absences: no async/event-loop API
+on the pipe itself, delivery is at-most-once, and there is no TLS layer.
 
 Design audit and roadmap live in [`docs/design/`](docs/design/):
 

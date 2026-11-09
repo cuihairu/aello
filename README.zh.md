@@ -15,27 +15,15 @@
 
 ## 状态
 
-实验阶段，未发布。当前已有的：
+实验阶段，未发布。一套 `Pipe`/`Listener` API 覆盖 `tcp://`、`shm://`、`uds://`
+（POSIX）与 `pipe://`（Windows 命名管道），附带有界 `shm://` 快路径、QoS 层
+（水位、背压、逐消息 TTL）、指数退避自动重连，以及管道之上的纯头文件 RPC
+与发布订阅层。
 
-- 消息模型（`Message`）与 `Result`/`Status` 错误处理——不强制异常。
-- 一套 `Pipe`/`Listener` API 覆盖四种传输：`tcp://`、`shm://`、`uds://`（POSIX）
-  与 `pipe://`（Windows 命名管道）。
-- `shm://` 快路径：每方向一个有界、预分配的固定槽环（64 槽 × 64 KiB），
-  信号量同步，复制发送语义。
-- 字节流传输（`tcp://`、`uds://`、`pipe://`）使用 16 字节帧头。套接字字节流
-  传输（`tcp://`、`uds://`）单帧负载上限 64 KiB，更大的消息被分片并重组（上限
-  64 MiB）。
-- QoS 层：发送/接收字节水位（`QosOptions::snd_hwm_bytes` / `rcv_hwm_bytes`）、
-  背压策略、逐消息 TTL。
-- 自动重连：指数退避（`DialOptions::reconnect`、`src/reconnect_pipe.cc`）。
-- 管道之上的纯头文件层：关联请求/响应 RPC（`duct/rpc.h`）与主题发布订阅
-  （`duct/pubsub.h`）。
-- ping-pong 基准工具（`bench/aello_bench.cc`，POSIX 上默认构建并注册为 CI 冒烟测试）。
-- 跨平台 CI（GCC / Clang / MSVC）运行测试套件。
-
-当前**没有**的——直说，免得你自己踩：
-
-- 管道本身没有异步/事件循环 API。注意：启用 QoS 时发送侧确有内部排空工作线程。
+能力矩阵——已有什么、明确没有什么、哪些选项字段是预留但未被消费的——只在
+一处维护：[`docs/design/capabilities.md`](docs/design/capabilities.md)；本节及
+英文版仅作摘要。显著的缺失：管道本身没有异步/事件循环 API，送达语义为至多
+一次，没有 TLS 层。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
 
