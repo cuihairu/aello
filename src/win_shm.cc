@@ -538,22 +538,19 @@ class ShmListener final : public Listener {
 
     // Wait for client connection.
     // 等待客户端连接。
+    //
+    // A client that dials before accept() runs connects, sends its connid, and
+    // disconnects; ConnectNamedPipe then reports an error even though the
+    // handshake bytes are already buffered in the pipe. The failure is not
+    // fatal by itself: ReadFile below decides whether the connid arrived, so
+    // the return value is deliberately not checked here.
     HANDLE pipe = bootstrap_pipe_;
-    BOOL connected = ConnectNamedPipe(pipe, NULL);
-    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-      CloseHandle(pipe);
-      bootstrap_pipe_ = INVALID_HANDLE_VALUE;
-      auto next = create_bootstrap_pipe(names_.bootstrap_pipe);
-      if (next.ok()) {
-        bootstrap_pipe_ = next.value();
-      }
-      return Status::io_error("ConnectNamedPipe failed");
-    }
+    ConnectNamedPipe(pipe, NULL);
 
     // Read connection ID from client.
     // 读取客户端发送的 connid。
     char connid[16];
-    DWORD bytes_read;
+    DWORD bytes_read = 0;
     BOOL read_ok = ReadFile(pipe, connid, sizeof(connid), &bytes_read, NULL);
     CloseHandle(pipe);
     bootstrap_pipe_ = INVALID_HANDLE_VALUE;
