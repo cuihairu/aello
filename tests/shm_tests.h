@@ -17,4 +17,5 @@ void test_shm_configurable_slot_geometry();
 void test_shm_geometry_mismatch_rejected();
 void test_shm_rejects_invalid_geometry();
 void test_shm_rejects_oversize_message();
+void test_shm_recv_unblocks_on_peer_close();
 void test_multi_process_kill9_restart();

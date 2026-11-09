@@ -170,6 +170,12 @@ struct ShmLayout {
   std::uint32_t slot_count = 0;   // slots per ring (each direction)
   std::atomic_uint32_t owner_pid{0};  // PID of the creating (owner) process
   std::atomic_uint32_t magic{0};      // kShmMagic on a live, initialized segment
+  // Set (with release ordering) by whichever endpoint closes first, so a peer
+  // blocked in recv()/send() on a named semaphore can observe the close and
+  // return kClosed instead of waiting forever on a peer that never signals.
+  // The flag lives in the shared mapping because closing one side's handles
+  // does not signal the other side's semaphore objects.
+  std::atomic_uint32_t closed{0};
   RingMeta c2s_meta;
   RingMeta s2c_meta;
   // Slot data follows the header, laid out as:
@@ -555,6 +561,11 @@ class ShmPipe final : public Pipe {
     const std::uint32_t slot_bytes = h_.slot_bytes;
     const std::uint32_t slot_count = h_.slot_count;
 
+    auto peer_closed = [&] {
+      return h_.mem->closed.load(std::memory_order_acquire) != 0;
+    };
+    if (peer_closed()) return Status::closed("shm peer closed");
+
     // Fragment payloads larger than one slot into multiple slots. Each slot
     // header stores the remaining length; the final slot carries a zero-length
     // marker via a high bit so recv() can reassemble. We use a leading bit in
@@ -577,6 +588,7 @@ class ShmPipe final : public Pipe {
       // false-timeout a live peer under load (kTimeout mid-reassembly).
       auto st = sem_wait_opt(spaces, first ? opt.timeout : kMidFragmentWait);
       if (!st.ok()) return st;
+      if (peer_closed()) return Status::closed("shm peer closed");
 
       std::uint32_t head = tx->head.load(std::memory_order_relaxed);
       std::uint32_t idx = head % slot_count;
@@ -605,6 +617,15 @@ class ShmPipe final : public Pipe {
     const std::uint32_t slot_bytes = h_.slot_bytes;
     const std::uint32_t slot_count = h_.slot_count;
 
+    // Deliver anything already queued before reporting the close so a peer
+    // that sent and closed in quick succession loses no data.
+    auto peer_closed_and_drained = [&] {
+      return h_.mem->closed.load(std::memory_order_acquire) != 0 &&
+             rx->head.load(std::memory_order_acquire) ==
+                 rx->tail.load(std::memory_order_relaxed);
+    };
+    if (peer_closed_and_drained()) return Status::closed("shm peer closed");
+
     std::vector<std::uint8_t> assembled;
     bool first = true;
     for (;;) {
@@ -618,6 +639,8 @@ class ShmPipe final : public Pipe {
       // would false-timeout a live peer under load (kTimeout mid-reassembly).
       auto st = sem_wait_opt(items, first ? opt.timeout : kMidFragmentWait);
       if (!st.ok()) return st.status();
+      // A wake with an empty ring means the token came from close(), not data.
+      if (peer_closed_and_drained()) return Status::closed("shm peer closed");
 
       std::uint32_t tail = rx->tail.load(std::memory_order_relaxed);
       std::uint32_t idx = tail % slot_count;
@@ -657,6 +680,18 @@ class ShmPipe final : public Pipe {
 
   void close() override {
     if (!h_.mem && h_.shm_fd < 0) return;
+    if (h_.mem) {
+      h_.mem->closed.store(1, std::memory_order_release);
+      // Wake the peer if it is blocked in send()/recv() on a named semaphore:
+      // closing this side's handles does not signal the peer's semaphores, so
+      // a waiter with no timeout would block forever. Post the peer's recv
+      // items sem and the peer's send spaces sem; the peer re-checks the
+      // closed flag after waking and returns kClosed once its ring is drained.
+      sem_t* peer_rx_items = is_client_ ? h_.c2s_items : h_.s2c_items;
+      sem_t* peer_tx_spaces = is_client_ ? h_.s2c_spaces : h_.c2s_spaces;
+      ::sem_post(peer_rx_items);
+      ::sem_post(peer_tx_spaces);
+    }
     close_handles(&h_);
     if (owner_) {
       ::sem_unlink(names_.c2s_items_sem.c_str());

@@ -865,3 +865,80 @@ void test_multi_process_kill9_restart() {
   lis2_r.value()->close();
 #endif
 }
+
+// A peer blocked in recv() with no timeout must observe close() and return
+// kClosed instead of waiting forever. Closing one side's handles does not
+// signal the peer's named semaphores, so close() sets a shared closed flag and
+// posts wake tokens; the waiter re-checks after waking and reports kClosed
+// once the ring is drained. Mirrors the Windows shm fix (same defect class).
+void test_shm_recv_unblocks_on_peer_close() {
+  struct WakeState {
+    std::atomic<bool> entered{false};  // blocking recv about to be called
+    std::atomic<bool> done{false};
+    duct::StatusCode code = duct::StatusCode::kOk;
+  };
+  auto lis_r = duct::listen("shm://duct_shm_wake_close");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto lis = std::make_shared<std::unique_ptr<duct::Listener>>(
+      std::move(lis_r.value()));
+  auto state = std::make_shared<WakeState>();
+
+  std::thread waiter([lis, state]() {
+    auto p = (*lis)->accept();
+    if (!p.ok()) {
+      state->code = p.status().code();
+      state->done.store(true, std::memory_order_release);
+      return;
+    }
+    // Consume one message first so the peer is provably connected before the
+    // no-timeout recv starts; this removes the accept/handshake race.
+    auto sync = p.value()->recv({.timeout = std::chrono::seconds(5)});
+    if (!sync.ok()) {
+      state->code = sync.status().code();
+      state->done.store(true, std::memory_order_release);
+      return;
+    }
+    state->entered.store(true, std::memory_order_release);
+    auto m = p.value()->recv({});  // no timeout: must still unblock on close
+    state->code = m.ok() ? duct::StatusCode::kOk : m.status().code();
+    state->done.store(true, std::memory_order_release);
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_shm_wake_close", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    waiter.detach();
+    (*lis)->close();
+    return;
+  }
+
+  auto st = c.value()->send(duct::Message::from_string("sync"), {});
+  EXPECT_TRUE(st.ok());
+
+  // Wait until the peer is about to enter the blocking recv, then close.
+  for (int i = 0; i < 100 && !state->entered.load(std::memory_order_acquire);
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_TRUE(state->entered.load(std::memory_order_acquire));
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  c.value()->close();  // must wake the accepted side's recv
+
+  for (int i = 0; i < 80 && !state->done.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (state->done.load(std::memory_order_acquire)) {
+    waiter.join();
+  } else {
+    // Fail fast instead of hanging the suite on a stuck accept/recv thread.
+    waiter.detach();
+  }
+  EXPECT_TRUE(state->done.load(std::memory_order_acquire));
+  EXPECT_EQ(state->code, duct::StatusCode::kClosed);
+
+  (*lis)->close();
+}

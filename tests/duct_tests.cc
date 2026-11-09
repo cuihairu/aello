@@ -11,6 +11,7 @@
 #include "qos_tests.h"
 #include "wire_tests.h"
 #include "session_tests.h"
+#include "adapter_tests.h"
 
 int main() {
 #if defined(SIGPIPE)
@@ -81,6 +82,7 @@ int main() {
   RUN_TEST(test_tcp_channel_recv_does_not_drop_other_channel);
   RUN_TEST(test_tcp_channel_pending_capped);
   RUN_TEST(test_shm_rejects_oversize_message);
+  RUN_TEST(test_shm_recv_unblocks_on_peer_close);
   RUN_TEST(test_tcp_channel_recv_deadline_bounded);
   RUN_TEST(test_tcp_channel_recv_subms_deadline_bounded);
   RUN_TEST(test_reconnect_channel_preserved);
@@ -105,6 +107,13 @@ int main() {
   RUN_TEST(test_pubsub_multiple_subscribers);
   RUN_TEST(test_pubsub_subscription_outlives_broker);
   RUN_TEST(test_pubsub_concurrent_broker_subscription_destruction);
+
+  RUN_TEST(test_adapter_dial_builder_propagates_options);
+  RUN_TEST(test_adapter_listen_builder_binds_and_accepts);
+  RUN_TEST(test_adapter_request_reply_roundtrip);
+  RUN_TEST(test_adapter_batch_roundtrip);
+  RUN_TEST(test_adapter_raii_scoped_roundtrip);
+  RUN_TEST(test_adapter_echo_server_loop);
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";
