@@ -89,6 +89,7 @@ if (DUCT_BUILD_TESTS)
     tests/qos_tests.cc
     tests/wire_tests.cc
     tests/session_tests.cc
+    tests/adapter_tests.cc
   )
   target_link_libraries(duct_tests PRIVATE duct)
   add_test(NAME duct_tests COMMAND duct_tests)

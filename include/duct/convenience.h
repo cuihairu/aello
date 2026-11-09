@@ -32,18 +32,23 @@ class DialBuilder {
   // 设置发送高水位
   DialBuilder& send_hwm(std::size_t bytes) {
     options_.qos.snd_hwm_bytes = bytes;
+    // QoS fields are inert unless the wrapper is opted in (dial() returns the
+    // raw transport otherwise), so configuring a watermark enables it.
+    options_.qos.enabled = true;
     return *this;
   }
 
   // 设置接收高水位
   DialBuilder& recv_hwm(std::size_t bytes) {
     options_.qos.rcv_hwm_bytes = bytes;
+    options_.qos.enabled = true;
     return *this;
   }
 
   // 设置背压策略
   DialBuilder& backpressure(BackpressurePolicy policy) {
     options_.qos.backpressure = policy;
+    options_.qos.enabled = true;
     return *this;
   }
 
