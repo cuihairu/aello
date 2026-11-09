@@ -192,6 +192,10 @@ Requirements ledger for humans. One requirement per line; done items carry one e
   属实（已修复）：CreateFile 的 ERROR_PIPE_BUSY 与 ERROR_FILE_NOT_FOUND 都视为瞬态并在截止时间内重试，其余错误码仍立即返回 kIoError（src/pipe_transport.cc:503-517）。Evidence: commit 835f405; wine 全量 84 RUN/84 DONE exit 0。
 - [x] 审核发现：命名管道在拨号截止时间内始终不存在时返回 kIoError 而非 kTimeout，使调用方无法正确识别等待超时（src/pipe_transport.cc:502）。
   属实（已修复）：新增红测试 test_pipe_dial_absent_reports_timeout（修复前 wine 在 tests/duct_tests.cc:681 报 code != kTimeout），修复后对不存在的管道 300ms 拨号返回 kTimeout 且耗时 300/304/300ms（独立探针 3/3 PROBE OK；修复前基线 PROBE FAIL (3) 全部 kIoError）。Evidence: commit 835f405; tests/duct_tests.cc test_pipe_dial_absent_reports_timeout; wine 全量 84 RUN/84 DONE exit 0; Linux ctest 3/3 (26.56s)。
+- [x] 巡检发现（2026-11-09 适配层验收）：POSIX shm close() 只做 munmap/unlink，对端在无超时 recv()/send() 中阻塞在命名信号量上会永远等待，echo_server 等应用循环无法按文档以 kClosed 收尾（src/shm_transport.cc:658）。
+  属实（已修复）：与 Windows 侧 de0c4df 同类缺陷——ShmLayout 增设共享 closed 标志，close() 先置标志再 post 对端的 rx items 与 tx spaces 信号量作唤醒令牌，recv/send 在等待返回后复查"已关闭且环已排空"再报 kClosed（排空优先，不丢已入队数据）。新增 test_shm_recv_unblocks_on_peer_close（无超时 recv 在对端 close 后 2s 内返回 kClosed，红先：修复前 tests/shm_tests.cc:917 报 code != kClosed）。Evidence: commit 0d5257f; Linux 91 RUN/91 DONE exit 0 连续 3 次; wine 全量 91 RUN/91 DONE exit 0。
+- [x] 巡检发现（2026-11-09 适配层验收）：Windows shm accept() 竞态——客户端在 accept() 尚未调用 ConnectNamedPipe 前完成拨号（连接→发 connid→断开），ConnectNamedPipe 对已断开实例报错，accept 误判为致命错误丢弃已缓冲的握手字节并返回 kIoError，慢启动的服务端丢连接（src/win_shm.cc:534）。
+  属实（已修复）：POSIX 侧因 backlog 缓冲天然无此问题，Windows 侧改为不检查 ConnectNamedPipe 返回值、由 ReadFile 决定握手字节是否已送达（未到达时 ReadFile 立即失败走原错误路径）。独立探针修复前 acc_code=3("ConnectNamedPipe failed")，修复后 accept ok / sync recv ok / 阻塞 recv 返回 kClosed。Evidence: commit b12a5c5; wine 全量 91 RUN/91 DONE exit 0（此前适配层测试在该竞态下 3 次运行 2 次失败）。
 
 ## 源码分层分析 2026-11-07
 
@@ -214,7 +218,10 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ### c) 目录/分类不合理处
 
-- [ ] `include/duct/convenience.h`（365 行）与 `include/duct/raii.h`（160 行）是 header-only 应用适配层，但库源码没有对应 `.cc`/内部模块边界；README 仍说 `convenience.h` 不属于库，而 `add_library(duct)` 虽不编译头文件，公共安装却通过 `install(DIRECTORY include/duct ...)` 导出该契约（`include/duct/convenience.h:22`；`include/duct/raii.h:17`；`CMakeLists.txt:109`；`README.md:148`）。
+- [x] `include/duct/convenience.h`（365 行）与 `include/duct/raii.h`（160 行）是 header-only 应用适配层，但库源码没有对应 `.cc`/内部模块边界；README 仍说 `convenience.h` 不属于库，而 `add_library(duct)` 虽不编译头文件，公共安装却通过 `install(DIRECTORY include/duct ...)` 导出该契约（`include/duct/convenience.h:22`；`include/duct/raii.h:17`；`CMakeLists.txt:109`；`README.md:148`）。
+  属实（已修复，编译边界 + 接线 + 文档三面闭合）：新增 tests/adapter_tests.{h,cc}（6 个行为测试：builder 选项传播、listen builder、request/reply、批量、RAII scoped、echo 循环，全部跑真实 shm 传输）编入 duct_tests 目标（CMakeLists.txt:83-93），头文件在三个 CI 平台被编译验证（故意改名 convenience.h 方法验证边界生效：构建报 4 错，恢复后 0 错）。测试暴露的静默失效已接线：DialBuilder send_hwm/recv_hwm/backpressure 现在置 qos.enabled=true（此前 QoS 需显式 opt-in，这三个 setter 无效）。README 定性矛盾由 LAY-002（下一项）同步更正。附带发现并记录：reconnect 拨号异步首连落地前 max_message_bytes() 返回无界（见下方新增条目）。Evidence: commit 046ef5e; Linux 91 RUN/91 DONE exit 0（连续 3 次）; mingw+wine 全量 91 RUN/91 DONE exit 0。
 - [ ] `src/duct.cc` 同时承担公开 scheme 分发和“dial once + 传 reconnect 选项”的组合职责，而 `src/state_callback_pipe.*` 写好了却无生产调用方；组合生命周期应统一到一个明确的组合器入口，避免 callback 能力分叉（`src/duct.cc:56`；`src/duct.cc:105`；`src/state_callback_pipe.cc:63`）。
-- [ ] LAY-002 [P2] 更正 README 构建与目录章节——`install/export/pkg-config/CPack` 已存在且被安装冒烟测试覆盖，而死头清单会误导消费者（`CMakeLists.txt:99`; `CMakeLists.txt:135`; `CMakeLists.txt:142`; `README.md:134`; `README.zh.md:126`）。
+  附带发现（本项范围内待处理）：dial() 启用 reconnect 时首连在后台线程异步进行，dial() 返回即报成功（不可达地址也不失败），且首连落地前 ReconnectPipe::max_message_bytes() 回落为无界基类默认（独立探针：plain qos dial max=1024，reconnect qos dial max=SIZE_MAX）。组合生命周期收敛时应一并决定首连是否同步。
+- [x] LAY-002 [P2] 更正 README 构建与目录章节——`install/export/pkg-config/CPack` 已存在且被安装冒烟测试覆盖，而死头清单会误导消费者（`CMakeLists.txt:99`; `CMakeLists.txt:135`; `CMakeLists.txt:142`; `README.md:134`; `README.zh.md:126`）。
+  属实（已修复）：双语 README 构建章节改为如实描述——`cmake --install` 导出 CMake package config（duct::）、pkg-config（duct.pc）与 CPack TGZ，且由 ctest 的 duct_install 冒烟测试覆盖；目录章节补 bench/；死头清单（已删除的 async.h/utils.h/logging.h/queue.h/duct_export.h）移除，改为说明 socket_utils.h 为库所用、convenience.h/raii.h 为随库安装的 header-only 适配层并由测试套件编译。Evidence: commit 4bb3374; README.md 与 README.zh.md 构建章节、仓库结构章节逐段核对于 CMakeLists.txt:105-146（install/EXPORT/pkg-config/CPack/duct_install）。
 - [ ] LAY-003 [P2] 拆分 `README.md` 与 `README.zh.md` 中“当前能力/当前没有”的维护面——同一能力矩阵分散在两种语言和源码注释中，已出现 `state_callback_pipe`、`heartbeat_interval`、`reliability`、`ListenOptions::qos` 等预留契约未声明的问题（`README.md:30`; `README.md:42`; `README.zh.md:30`; `README.zh.md:38`; `src/duct.cc:110`; `src/state_callback_pipe.cc:63`）。
