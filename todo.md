@@ -31,7 +31,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Protocol
 
 - [x] Fragmentation and reassembly for payloads larger than 64 KiB. Evidence: 8c0b3ee; wire + shm multi-chunk round-trip tests green (36 duct cases, ctest 2/2).
-- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.
+- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.（2026-11-09 复核：仍阻塞——传输协议未改、无丢包注入测试矩阵，属需设计决策的大特性，无实现可代办）
 - [x] Priority scheduling and channel_id multiplexing. Evidence: 4dc7aa6; priority drains high-first and channel_id demux round-trip tests green (38 duct cases, ctest 2/2).
 - [x] Rate limiting (token bucket) per pipe or per socket. Evidence: f3d2870; paced delivery test green (39 duct cases, ctest 2/2).
 - [x] Capability / version negotiation in the handshake. Evidence: bfe0629; tcp handshake version negotiation + post-handshake echo test green (40 duct cases, ctest 2/2).
@@ -57,7 +57,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Pub/sub with multiple subscribers. Evidence: 81b4490; include/duct/pubsub.h adds a topic-filter Broker with per-subscriber prefix filters and unsubscribe-on-destroy; multi-subscriber delivery + unsubscribe test green (51 duct cases, ctest 3/3, 12x stress).
 - [x] Async/event-loop API (async.h is on the design audit delete list; not part of the library). Evidence: d00e310; deleted async.h, tests/async_tests.cc, examples/async_example.cc and the async_tests build target per design audit (aello-audit §7: conflicts with v1 no-general-event-loop direction); remaining ctest 2/2.
 - [x] Peer credential checks for uds (SO_PEERCRED uid/gid/pid, wired via Pipe::peer_credential(), both ends verify own-process identity; test green, 12x stress). Evidence: 8fd33cb.
-- [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).
+- [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).（2026-11-09 复核：仍阻塞——CMake 无 OpenSSL、无证书配置 API，需凭据方案与用户签核）
 - [x] Crash recovery for orphaned shm segments. Evidence: f90c944; shm header records owner PID+magic; shm_listen scans /dev/shm for dead-owner segments and unlinks them + their semaphores; fork/SIGKILL/orphan/reclaim test green (ctest 2/2, 12x stress, no leftover segments).
 - [x] Install / packaging target. Evidence: CMake install/export + generated version header + pkg-config + CPack TGZ; `ctest 3/3`; consumer `find_package(duct)` link/run green; external-prefix `pkg-config --cflags --libs duct` green.
 
@@ -129,7 +129,8 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 
 ## 漏洞扫描遗留（2026-11-03 全舰队扫描，源 scratch/vuln-scan-*.md）
 
-- [ ] VULN-AELLO-001 [高危·GHSA-587h-7wmj-h5pm 路径穿越] vite ≤6.4.3→≥6.4.4（package-lock.json 仓，终扫 1，vite≤6.4.3 受影响）【BLOCKED·规范禁 npm 改 lock】npm-lock 仓只审计未改动；验收：迁 pnpm（pnpm import）后 pnpm audit --audit-level=high 该包不再命中（或编排者批准 npm 侧修复后 npm audit 清零）；该仓无 test 脚本，audit-only
+- [x] VULN-AELLO-001 [高危·GHSA-587h-7wmj-h5pm 路径穿越] vite ≤6.4.3→≥6.4.4（package-lock.json 仓，终扫 1，vite≤6.4.3 受影响）【BLOCKED·规范禁 npm 改 lock】npm-lock 仓只审计未改动；验收：迁 pnpm（pnpm import）后 pnpm audit --audit-level=high 该包不再命中（或编排者批准 npm 侧修复后 npm audit 清零）；该仓无 test 脚本，audit-only。
+  属实（已解决）：f7405a7 已将 docs 部署迁 pnpm 并 override vite 至 6.4.5（≥6.4.4 修复版），删除旧 package-lock.json；验收实测 pnpm-lock.yaml 锁定 vite 6.4.5，`pnpm audit --audit-level=high` → "No known vulnerabilities found"，GHSA-587h-7wmj-h5pm 不再命中。Evidence: commit f7405a7; pnpm audit 2026-11-09 clean。
 
 - [x] 审核发现：本轮 diff 未见问题（a038db59..HEAD）——该区间仅含 70aa548（docs: record vulnerability scan leftovers），只改动 todo.md 审核台账，无任何源代码变更，故无新增安全/正确性/测试缺口可审；新增条目（102-117 行）均为既有代码缺陷与依赖漏洞的台账记录，非本区间引入。 Evidence: re-checked a038db59..HEAD (only 70aa548, a todo.md-only docs commit); no source change, so no new security/correctness/test gap; ctest 3/3. 1d2b503
 - [x] 审核发现：tcp/uds channel 过滤 recv 的墙钟 deadline 在剩余 <1ms 时被 `duration_cast<milliseconds>` 截断为 0，而 `recv_frame` 以 timeout=0 调用 `apply_socket_timeout`（src/wire.cc:125-127）清零 SO_RCVTIMEO 变为阻塞读，`read_exact` 内 `recv()`（src/wire.cc:248）可无限阻塞，使 `recv(opt)` 实际挂起远超 `opt.timeout`，违背“wall-clock 截止”契约（`test_tcp_channel_recv_deadline_bounded` 用 300ms 大裕量未能捕获 <1ms 边界）（src/tcp_transport.cc:126；src/uds_transport.cc:78）。 Evidence: tcp/uds channel-filtered recv clamps a sub-millisecond remaining deadline to 1ms (instead of truncating to 0, which would clear SO_RCVTIMEO and block forever); new sub-ms deadline tests for both tcp and uds fail on the unpatched code (watchdog catches the hang) and pass with the fix; ctest 3/3.
