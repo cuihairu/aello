@@ -1,5 +1,8 @@
 # Source Glossary (2026-11-07)
 
+> Update 2026-11-09: `StateCallbackPipe` (`src/state_callback_pipe.*`) was removed — it was never compiled or wired into a dial, and the reconnect dial is the single callback path. References below reflect HEAD `f7405a7` at writing time.
+
+
 This glossary records the source-derived vocabulary of Aello. Terms are grouped by conceptual layer so the table reads as an architecture contract rather than a file inventory. All paths and line numbers refer to HEAD `f7405a7a6dd726b0552e09294a4303b5cc1cc682`; for the layer narrative and split rationale, see [source layer analysis](/design/source-layer-analysis-2026-11-07). Chinese readers should start from the [Chinese glossary](/zh/design/source-glossary-2026-11-07).
 
 ## Terms

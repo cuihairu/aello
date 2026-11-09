@@ -1,5 +1,8 @@
 # Source Layer Analysis (2026-11-07)
 
+> Update 2026-11-09: `StateCallbackPipe` (`src/state_callback_pipe.*`) was removed — it was never compiled or wired into a dial; reconnect dial is the single callback path. References below reflect HEAD `f7405a7` at writing time.
+
+
 This analysis is based on HEAD `f7405a7a6dd726b0552e09294a4303b5cc1cc682` and the current source tree. It records responsibilities, state ownership, communication paths, configuration inputs, lifecycle, and the concrete reason each conceptual layer exists. Paths are repository-relative; line references were captured from that revision.
 
 ## Scope and Non-Goals

@@ -1,5 +1,8 @@
 # 源码术语表（2026-11-07）
 
+> 更新 2026-11-09：`StateCallbackPipe`（`src/state_callback_pipe.*`）已删除——其从未参与编译，也未接入任何拨号路径；重连拨号是唯一的连接回调路径。下表引用反映撰写时的 HEAD `f7405a7`。
+
+
 本表按源码归纳 Aello 术语，并按概念层分组，使其成为架构契约而不是文件清单。所有路径与行号基于 HEAD `f7405a7a6dd726b0552e09294a4303b5cc1cc682`。分层叙述与拆分理由见[源码分层分析](/zh/design/source-layer-analysis-2026-11-07)；英文读者请从 [English glossary](/design/source-glossary-2026-11-07) 开始。
 
 ## 术语
