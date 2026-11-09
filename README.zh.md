@@ -123,7 +123,10 @@ CMake 选项：
 | `DUCT_BUILD_EXAMPLES` | `ON` | echo 服务端/客户端与手动传输工具 |
 | `DUCT_BUILD_TESTS` | `ON` | 测试套件（用 `ctest` 运行） |
 
-尚无 install 目标——通过 `add_subdirectory(aello)` 引入并链接 `duct` 目标。
+尚无正式版本发布——通过 `add_subdirectory(aello)` 引入并链接 `duct` 目标，
+或直接安装：`cmake --install` 导出 CMake package config（`duct::`、
+`ductTargets.cmake` / `ductConfig.cmake`）、pkg-config 文件（`duct.pc`）与
+CPack TGZ 打包。安装规则由 `ctest` 中的 `duct_install` 冒烟测试覆盖。
 库命名（`duct` → `aello`）将在后续版本序列变更；GitHub 自 `duct` 的重定向仍然有效。
 
 ## 仓库结构
@@ -131,14 +134,15 @@ CMake 选项：
 ```
 include/duct/     公共头文件（核心 API、消息、状态、帧协议、传输）
 src/              传输实现（tcp、shm、命名管道 + 辅助）
-tests/            跨平台测试套件
+tests/            跨平台测试套件（按被测层一文件）
 examples/         echo 对 + 手动传输工具
+bench/            基准测试
 docs/design/      分析、审计与吸收结论
 ```
 
-`include/duct/` 下的部分头文件（`async.h`、`utils.h`、`logging.h`、`queue.h`、
-`convenience.h`、`raii.h`、`socket_utils.h`、`duct_export.h`）尚未编入库，
-在设计审计的删除/重构清单上。
+`socket_utils.h` 为库源码所用。`convenience.h`（builder 与
+request/reply/批量/循环便捷层）与 `raii.h`（RAII 所有权薄封装）是 header-only
+应用适配层：随库一并安装、由测试套件编译验证，但不为 `duct` 产生二进制工件。
 
 ## 许可证
 

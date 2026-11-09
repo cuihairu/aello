@@ -131,23 +131,29 @@ CMake options:
 | `DUCT_BUILD_EXAMPLES` | `ON` | echo server/client and manual transport tools |
 | `DUCT_BUILD_TESTS` | `ON` | test suite (run via `ctest`) |
 
-There is no install target yet — consume via `add_subdirectory(aello)` and link
-the `duct` target. Library naming (`duct` → `aello`) will change in a later
-release series; the GitHub redirect from `duct` remains valid.
+There is no versioned release yet — consume via `add_subdirectory(aello)` and
+link the `duct` target, or install it: `cmake --install` exports a CMake
+package config (`duct::`, `ductTargets.cmake` / `ductConfig.cmake`), a
+pkg-config file (`duct.pc`), and CPack TGZ packaging. The install rules are
+covered by the `duct_install` smoke test in `ctest`. Library naming
+(`duct` → `aello`) will change in a later release series; the GitHub redirect
+from `duct` remains valid.
 
 ## Repository layout
 
 ```
 include/duct/     public headers (core API, message, status, wire, transports)
 src/              transport implementations (tcp, shm, named pipe + helpers)
-tests/            cross-platform test suite
+tests/            cross-platform test suite (one source per layer under test)
 examples/         echo pair + manual transport tools
+bench/            benchmarks
 docs/design/      analysis, audit, and adoption decisions
 ```
 
-A few headers under `include/duct/` (`utils.h`, `logging.h`, `queue.h`,
-`convenience.h`, `raii.h`, `socket_utils.h`, `duct_export.h`) are not part of the
-built library yet; they are on the design audit's delete/refactor list.
+`socket_utils.h` backs the built library. `convenience.h` (builders and
+request/reply/batch/loop helpers) and `raii.h` (scoped ownership wrappers) are
+header-only application adapters: they are installed with the library and
+compiled by the test suite, but add no binary artifacts to `duct` itself.
 
 ## License
 
