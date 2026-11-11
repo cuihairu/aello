@@ -327,12 +327,19 @@ Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
 Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
                                            std::chrono::milliseconds timeout) {
   constexpr std::size_t kMaxReassembledBytes = 64 * 1024 * 1024;  // 64 MiB
+  // Zero-length kFrag continuations never grow the reassembly buffer, so the
+  // byte cap alone cannot stop a peer from spinning the reader on 16-byte
+  // headers forever. Bound the chunk count too: a legitimate sender fills
+  // 64 KiB chunks (1024 chunks for a full 64 MiB message), so this only ever
+  // rejects malformed streams.
+  constexpr std::size_t kMaxFragChunks = 4096;
   auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
   if (!timeout_st.ok()) return timeout_st.status();
 
   std::vector<std::uint8_t> assembled;
   std::uint32_t frame_flags = 0;
   bool first = true;
+  std::size_t chunks = 0;
   for (;;) {
     std::uint8_t hdr[kHeaderLen];
     bool frame_started = false;
@@ -340,6 +347,10 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
     if (!st.ok()) return st.status();
     auto decoded = decode_header(hdr);
     if (!decoded.ok()) return decoded.status();
+
+    if (++chunks > kMaxFragChunks) {
+      return Status::protocol_error("fragment stream has too many chunks");
+    }
 
     const std::uint32_t payload_len = decoded.value().payload_len;
     const bool is_frag = (decoded.value().flags & to_u32(FrameFlags::kFrag)) != 0;

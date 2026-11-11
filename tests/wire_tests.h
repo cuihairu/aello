@@ -5,6 +5,7 @@
 void test_wire_decode_rejects_bad_magic();
 void test_wire_socketpair_frames();
 void test_wire_fragment_stream_size_capped();
+void test_wire_fragment_chunk_count_capped();
 void test_wire_read_timeout();
 void test_wire_write_timeout();
 void test_wire_partial_frame_timeout();

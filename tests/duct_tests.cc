@@ -44,6 +44,7 @@ int main() {
   RUN_TEST(test_wire_decode_rejects_bad_magic);
   RUN_TEST(test_wire_socketpair_frames);
   RUN_TEST(test_wire_fragment_stream_size_capped);
+  RUN_TEST(test_wire_fragment_chunk_count_capped);
   RUN_TEST(test_wire_read_timeout);
   RUN_TEST(test_wire_write_timeout);
   RUN_TEST(test_wire_partial_frame_timeout);

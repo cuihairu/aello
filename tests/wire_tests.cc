@@ -397,3 +397,47 @@ void test_wire_fragmentation_and_reassembly() {
   ::close(fds[1]);
 #endif
 }
+
+// A hostile peer keeps the reader spinning with zero-length kFrag
+// continuations: the reassembled size never grows, so the byte cap never
+// trips and the loop is unbounded. The reader must reject the stream by
+// chunk count instead.
+void test_wire_fragment_chunk_count_capped() {
+#if defined(_WIN32)
+  return;
+#else
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  duct::wire::FrameHeader h;
+  h.magic = duct::kProtocolMagic;
+  h.version = duct::kProtocolVersion;
+  h.header_len = duct::wire::kHeaderLen;
+  h.payload_len = 0;
+  h.flags = static_cast<std::uint32_t>(duct::FrameFlags::kFrag);
+  std::uint8_t hdr[duct::wire::kHeaderLen]{};
+  duct::wire::encode_header(h, hdr);
+
+  // Feed from a separate thread: many small writes exceed the socketpair
+  // buffer once per-skb overhead is accounted, and the reader must drain as
+  // the writer produces.
+  auto writer = std::thread([&] {
+    for (int i = 0; i < 5000; ++i) {
+      if (::write(fds[0], hdr, sizeof(hdr)) != static_cast<ssize_t>(sizeof(hdr))) break;
+    }
+  });
+
+  auto r = duct::wire::read_frame_with_flags(fds[1], std::chrono::milliseconds(500));
+  EXPECT_TRUE(!r.ok());
+  if (!r.ok()) {
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kProtocolError);
+  }
+  // Unblocking the reader left the writer mid-stream; closing the peer end
+  // turns its blocked write into EPIPE (SIGPIPE is ignored suite-wide).
+  ::close(fds[1]);
+  writer.join();
+  ::close(fds[0]);
+#endif
+}
