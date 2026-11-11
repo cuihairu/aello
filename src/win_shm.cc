@@ -209,7 +209,9 @@ struct ShmHandles {
 static void close_handles(ShmHandles* h) {
   if (!h) return;
 
-  if (h->mem && h->shm_handle != INVALID_HANDLE_VALUE) {
+  // Unmap independently of the handle state: the mapping can exist while the
+  // section handle is already invalid (or closed by an earlier failure path).
+  if (h->mem) {
     UnmapViewOfFile(h->mem);
     h->mem = nullptr;
   }
