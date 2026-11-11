@@ -172,14 +172,13 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
 
   // Check message size against an explicit caller-provided cap (defaults to
   // unlimited; the transport fragments large payloads) and the underlying
-  // transport's non-fragmenting bound. snd_hwm_bytes == 0 means "unlimited".
+  // transport's non-fragmenting bound. snd_hwm_bytes is a queue *watermark*
+  // (backpressure), not a per-message cap: a message larger than the watermark
+  // may occupy an empty queue and drain normally, so it is not rejected here.
   const std::size_t max_message_bytes = qos_.max_message_bytes;
   const std::size_t transport_max = underlying_->max_message_bytes();
   if (msg.size() > max_message_bytes || msg.size() > transport_max) {
     return Status::invalid_argument("message too large for the transport");
-  }
-  if (qos_.snd_hwm_bytes != 0 && msg.size() > qos_.snd_hwm_bytes) {
-    return Status::invalid_argument("message too large for queue limits");
   }
 
   std::unique_lock<std::mutex> lock(send_mutex_);
@@ -363,14 +362,11 @@ void QosPipe::recv_worker() {
 }
 
 std::size_t QosPipe::max_message_bytes() const {
-  // Mirror every bound send() enforces synchronously (qos cap, transport cap,
-  // queue byte watermark) so a caller sizing messages against this value is
-  // never rejected by a limit the accessor failed to report.
-  std::size_t cap = std::min(qos_.max_message_bytes, underlying_->max_message_bytes());
-  if (qos_.snd_hwm_bytes != 0) {
-    cap = std::min(cap, qos_.snd_hwm_bytes);
-  }
-  return cap;
+  // Mirror every per-message bound send() enforces synchronously (qos cap and
+  // transport cap) so a caller sizing messages against this value is never
+  // rejected by a limit the accessor failed to report. snd_hwm_bytes is a
+  // queue watermark, not a message bound, so it does not participate here.
+  return std::min(qos_.max_message_bytes, underlying_->max_message_bytes());
 }
 
 void QosPipe::close() {

@@ -688,15 +688,15 @@ void test_qos_and_reconnect_forward_max_message_bytes() {
       std::make_unique<BoundedPipe>(kTransportCap), limited_qos);
   EXPECT_TRUE(qosed_limited->max_message_bytes() == kTransportCap / 2);
 
-  // A nonzero snd_hwm_bytes is also a synchronous per-message bound in
-  // QosPipe::send(), so the accessor must report it: a caller sizing messages
-  // against max_message_bytes() would otherwise get a rejected send.
+  // snd_hwm_bytes is a queue *watermark* (backpressure), not a per-message
+  // bound: send() accepts a message larger than the watermark into an empty
+  // queue. The accessor must therefore NOT report it as a message cap.
   duct::QosOptions hwm_qos;
   hwm_qos.snd_hwm_bytes = kTransportCap / 4;
   hwm_qos.rcv_hwm_bytes = 0;
   auto qosed_hwm = std::make_unique<duct::QosPipe>(
       std::make_unique<BoundedPipe>(kTransportCap), hwm_qos);
-  EXPECT_TRUE(qosed_hwm->max_message_bytes() == kTransportCap / 4);
+  EXPECT_TRUE(qosed_hwm->max_message_bytes() == kTransportCap);
 
   duct::ReconnectPolicy policy;
   policy.initial_delay = std::chrono::milliseconds(5);
@@ -957,7 +957,7 @@ void test_reconnect_dial_reports_bound_on_return() {
   duct::DialOptions dial_opt;
   dial_opt.timeout = std::chrono::milliseconds(2000);
   dial_opt.qos.enabled = true;
-  dial_opt.qos.snd_hwm_bytes = 1024;
+  dial_opt.qos.max_message_bytes = 1024;
   dial_opt.qos.rcv_hwm_bytes = 0;
   dial_opt.reconnect.enabled = true;
   dial_opt.reconnect.initial_delay = std::chrono::milliseconds(10);
@@ -970,4 +970,25 @@ void test_reconnect_dial_reports_bound_on_return() {
     c.value()->close();
   }
   lis_r.value()->close();
+}
+
+// snd_hwm_bytes is a queue *watermark*, not a per-message cap: a message
+// larger than the watermark must be accepted into an empty queue and drain
+// normally (backpressure still applies to subsequent enqueues).
+void test_qos_hwm_not_a_message_cap() {
+  auto owned = std::make_unique<RecordingPipe>();
+  auto* recording = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 64;
+  qos.rcv_hwm_bytes = 0;
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  const std::string big(200, 'x');
+  auto st = pipe.send(duct::Message::from_string(big), {});
+  EXPECT_TRUE(st.ok());
+  if (st.ok()) {
+    EXPECT_TRUE(recording->wait_for_sent(big, std::chrono::milliseconds(2000)));
+  }
+  pipe.close();
 }

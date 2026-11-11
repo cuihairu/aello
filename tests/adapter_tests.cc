@@ -39,7 +39,8 @@ void test_adapter_dial_builder_propagates_options() {
   });
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-  // Plain QoS dial: the watermark must be visible on the returned pipe.
+  // Plain QoS dial: the explicit message cap must be visible on the returned
+  // pipe.
   auto c = duct::convenience::shm("duct_adapter_bld")
                .timeout(std::chrono::milliseconds(2000))
                .send_hwm(1024)
@@ -52,15 +53,15 @@ void test_adapter_dial_builder_propagates_options() {
     return;
   }
 
-  // send_hwm was honored: the advertised send bound is the watermark, which
-  // only happens when the dial actually wrapped the transport in QoS.
-  EXPECT_EQ(c.value()->max_message_bytes(), static_cast<std::size_t>(1024));
-
-  auto st = c.value()->send(duct::Message::from_string("bld"), {});
+  // send_hwm was honored: the dial wrapped the transport in QoS. The watermark
+  // is a queue cap, not a message cap, so a message larger than it must still
+  // round-trip through the wrapped pipe.
+  const std::string big(2048, 'x');
+  auto st = c.value()->send(duct::Message::from_string(big), {});
   EXPECT_TRUE(st.ok());
   auto echoed = c.value()->recv({.timeout = std::chrono::seconds(2)});
   EXPECT_TRUE(echoed.ok());
-  if (echoed.ok()) EXPECT_EQ(text(echoed.value()), "bld");
+  if (echoed.ok()) EXPECT_EQ(echoed.value().size(), static_cast<std::size_t>(big.size()));
 
   c.value()->close();
 

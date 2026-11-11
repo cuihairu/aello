@@ -61,6 +61,7 @@ int main() {
   RUN_TEST(test_qos_block_zero_timeout_blocks);
   RUN_TEST(test_qos_permanent_send_error_does_not_wedge);
   RUN_TEST(test_qos_oversized_message_rejected);
+  RUN_TEST(test_qos_hwm_not_a_message_cap);
   RUN_TEST(test_qos_zero_hwm_is_unlimited);
   RUN_TEST(test_qos_delivery_under_hwm);
   RUN_TEST(test_qos_close_under_full_ring);
