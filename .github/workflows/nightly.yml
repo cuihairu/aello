@@ -56,7 +56,9 @@ jobs:
 
       - name: Test
         working-directory: build
-        run: ctest --build-config Release --output-on-failure
+        # 每测试 5 分钟上限：macOS 偶发挂死的测试不能吃满 job 6h 硬顶后
+        # 被整单取消（07-11 nightly 因此全红且无失败测试名可查）。
+        run: ctest --build-config Release --output-on-failure --timeout 300
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
