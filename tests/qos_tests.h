@@ -27,4 +27,5 @@ void test_qos_item_count_cap();
 void test_qos_failfast_returns_queue_full();
 void test_qos_dial_opt_in_disabled_by_default();
 void test_qos_ttl_expires_queued_message();
+void test_qos_send_failure_does_not_kill_recv();
 void test_qos_drop_old_evicts_oldest_queued();

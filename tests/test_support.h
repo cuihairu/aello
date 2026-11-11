@@ -304,3 +304,40 @@ class BoundedPipe final : public duct::Pipe {
  private:
   std::size_t cap_;
 };
+
+// Test double: send() always reports a terminal transport failure (kClosed),
+// while recv() holds inbound data back until released, then delivers exactly
+// one message and keeps timing out afterwards. Models a connection whose send
+// side died while the recv side still has data to deliver.
+class SendFailsGatedRecvPipe final : public duct::Pipe {
+ public:
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    return duct::Status::closed("transport closed under test");
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!released_) {
+      // Bounded park; the QoS recv worker treats it as a transient timeout.
+      cv_.wait_for(lock, std::chrono::milliseconds(50));
+      return duct::Status::timeout("gated");
+    }
+    if (delivered_) return duct::Status::timeout("no more inbound data");
+    delivered_ = true;
+    return duct::Message::from_string("inbound");
+  }
+
+  void release() {
+    std::lock_guard<std::mutex> lock(mu_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+  void close() override {}
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool released_ = false;
+  bool delivered_ = false;
+};

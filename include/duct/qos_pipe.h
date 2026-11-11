@@ -50,7 +50,14 @@ class QosPipe : public Pipe {
   std::mutex send_mutex_;
   std::condition_variable send_cv_;
   std::thread send_thread_;
+  // Lifecycle flag: true from construction until close(). Owned by close().
   std::atomic<bool> running_{false};
+  // Health flag: set (with send_error_) when the send worker sees a terminal
+  // transport error (kClosed/kIoError). Independent of running_ so a dead send
+  // worker does not poison the recv side. send_error_ is written before the
+  // flag store; a load() that observes true also observes the message.
+  std::atomic<bool> send_failed_{false};
+  Status send_error_;
 
   // Current queue sizes
   std::atomic<size_t> send_bytes_{0};

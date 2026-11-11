@@ -102,10 +102,10 @@ void QosPipe::send_worker() {
               (static_cast<double>(next_cost - tokens) * 1000.0) /
               static_cast<double>(qos_.rate_bytes_per_sec));
           send_cv_.wait_for(lock, std::chrono::milliseconds(std::max<long long>(1, needed_ms)),
-                            [this] { return !running_; });
-          if (!running_) break;
+                            [this] { return !running_ || send_failed_.load(); });
+          if (!running_ || send_failed_.load()) break;
         }
-        if (!running_) break;
+        if (!running_ || send_failed_.load()) break;
       }
 
       // Drain unconditionally. The HWM water mark gates the *enqueue* side (send()),
@@ -143,9 +143,15 @@ void QosPipe::send_worker() {
       const StatusCode code = result.status().code();
       std::lock_guard<std::mutex> lock(send_mutex_);
       if (code == StatusCode::kClosed || code == StatusCode::kIoError) {
-        running_ = false;
+        // The transport is terminally broken: record the failure so send()
+        // stops accepting messages that can never be delivered, blocked
+        // senders wake with the error, and close()'s linger does not wait on
+        // a dead queue. running_ stays true — it is the close() lifecycle
+        // flag, and the recv side must keep draining independently.
+        send_error_ = result.status();
+        send_failed_ = true;
         send_cv_.notify_all();
-        break;
+        return;
       }
       // A timeout is transient: keep the message and retry it at the head so
       // ordering is preserved (e.g. a full ring or a slow peer).
@@ -169,6 +175,11 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
   if (!running_) {
     return Status::closed("pipe closed");
   }
+  // send_error_ is published before the flag store, so observing the flag
+  // also makes the message visible (release/acquire via the atomic).
+  if (send_failed_.load()) {
+    return Status::closed("send worker failed: " + send_error_.message());
+  }
 
   // Check message size against an explicit caller-provided cap (defaults to
   // unlimited; the transport fragments large payloads) and the underlying
@@ -189,6 +200,9 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
   // be sent.
   if (!running_) {
     return Status::closed("pipe closed");
+  }
+  if (send_failed_.load()) {
+    return Status::closed("send worker failed: " + send_error_.message());
   }
 
   // Handle backpressure policies. A zero watermark means unlimited. Both the
@@ -221,7 +235,7 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
         // immediately and report a spurious timeout under backpressure.
         if (opt.timeout.count() > 0) {
           send_cv_.wait_for(lock, opt.timeout, [this] {
-            return !running_ ||
+            return !running_ || send_failed_.load() ||
                    ((qos_.snd_hwm_bytes == 0 ||
                      send_bytes_.load() < qos_.snd_hwm_bytes) &&
                     (qos_.snd_hwm_count == 0 ||
@@ -229,7 +243,7 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
           });
         } else {
           send_cv_.wait(lock, [this] {
-            return !running_ ||
+            return !running_ || send_failed_.load() ||
                    ((qos_.snd_hwm_bytes == 0 ||
                      send_bytes_.load() < qos_.snd_hwm_bytes) &&
                     (qos_.snd_hwm_count == 0 ||
@@ -238,6 +252,9 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
         }
         if (!running_) {
           return Status::closed("pipe closed");
+        }
+        if (send_failed_.load()) {
+          return Status::closed("send worker failed: " + send_error_.message());
         }
         if ((qos_.snd_hwm_bytes != 0 && send_bytes_.load() >= qos_.snd_hwm_bytes) ||
             (qos_.snd_hwm_count != 0 && send_count_.load() >= qos_.snd_hwm_count)) {
@@ -371,11 +388,12 @@ std::size_t QosPipe::max_message_bytes() const {
 
 void QosPipe::close() {
   // Linger: allow queued outbound messages to drain for up to qos_.linger
-  // before force-closing. Zero means best-effort immediate close.
+  // before force-closing. Zero means best-effort immediate close. A failed
+  // send worker cannot drain anything, so the wait ends immediately.
   if (qos_.linger.count() > 0) {
     std::unique_lock<std::mutex> lock(send_mutex_);
     send_cv_.wait_for(lock, qos_.linger, [this] {
-      return !running_ || send_queue_.empty();
+      return !running_ || send_failed_.load() || send_queue_.empty();
     });
   }
 

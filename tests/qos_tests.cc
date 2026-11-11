@@ -992,3 +992,48 @@ void test_qos_hwm_not_a_message_cap() {
   }
   pipe.close();
 }
+
+// A terminal send-worker failure must not poison the recv side: recv() keeps
+// waiting for inbound data (the recv worker is independent), and subsequent
+// send() calls report the failure instead of accepting messages that can
+// never be delivered.
+void test_qos_send_failure_does_not_kill_recv() {
+  auto owned = std::make_unique<SendFailsGatedRecvPipe>();
+  auto* dbl = owned.get();
+
+  duct::QosOptions qos;
+  qos.snd_hwm_bytes = 0;
+  qos.rcv_hwm_bytes = 4096;  // spawns the recv worker
+  duct::QosPipe pipe(std::move(owned), qos);
+
+  // Accepted while the worker is still alive (at-most-once semantics).
+  EXPECT_TRUE(pipe.send(duct::Message::from_string("m1"), {}).ok());
+
+  // Wait for the worker to drain m1 and hit the terminal error: further
+  // sends must fail with kClosed.
+  bool send_failed_observed = false;
+  for (int i = 0; i < 100 && !send_failed_observed; ++i) {
+    auto st = pipe.send(duct::Message::from_string("m2"), {});
+    if (!st.ok() && st.status().code() == duct::StatusCode::kClosed) {
+      send_failed_observed = true;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  EXPECT_TRUE(send_failed_observed);
+
+  // The inbound message is still gated; release it shortly after recv()
+  // parks, proving recv() waits instead of reporting the pipe closed.
+  std::thread releaser([&]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    dbl->release();
+  });
+
+  auto got = pipe.recv({.timeout = std::chrono::seconds(2)});
+  EXPECT_TRUE(got.ok());
+  if (got.ok()) {
+    EXPECT_EQ(got.value().as_string_view(), std::string_view("inbound"));
+  }
+  releaser.join();
+  pipe.close();
+}
