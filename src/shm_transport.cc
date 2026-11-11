@@ -654,14 +654,23 @@ class ShmPipe final : public Pipe {
       const bool is_first = (len & kFirstChunkFlag) != 0;
       const bool is_last = (len & kLastChunkFlag) != 0;
       len &= ~(kFirstChunkFlag | kLastChunkFlag);
+      // A protocol error in the slot payload must not wedge the ring: consume
+      // the slot (advance tail, post a space token) before returning so later
+      // recv() calls make progress instead of reading the same poisoned slot
+      // forever and leaking spaces.
+      auto consume_and_fail = [&](const char* what) {
+        rx->tail.store(tail + 1, std::memory_order_release);
+        ::sem_post(spaces);
+        return Status::protocol_error(what);
+      };
       if (len > slot_bytes) {
-        return Status::protocol_error("shm slot len too large");
+        return consume_and_fail("shm slot len too large");
       }
 
       if (first) {
-        if (!is_first) return Status::protocol_error("shm fragment stream out of sync");
+        if (!is_first) return consume_and_fail("shm fragment stream out of sync");
         if (len > kMaxReassembledBytes) {
-          return Status::protocol_error("shm fragment stream too large");
+          return consume_and_fail("shm fragment stream too large");
         }
         assembled.resize(len);
         if (len != 0) std::memcpy(assembled.data(), slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
@@ -674,7 +683,7 @@ class ShmPipe final : public Pipe {
 
       const std::size_t old = assembled.size();
       if (old > kMaxReassembledBytes || len > kMaxReassembledBytes - old) {
-        return Status::protocol_error("shm fragment stream too large");
+        return consume_and_fail("shm fragment stream too large");
       }
       assembled.resize(old + len);
       if (len != 0) std::memcpy(assembled.data() + old, slot_payload(h_.mem, rx_ring, idx, slot_bytes), len);
