@@ -24,3 +24,4 @@ void test_tcp_handshake_negotiates_version();
 void test_tcp_accept_rejects_silent_peer();
 void test_concurrent_send_recv_channels();
 void test_wait_writable_getsockopt_failure_reports_errno();
+void test_ensure_stale_uds_removed_policy();

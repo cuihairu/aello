@@ -5,6 +5,10 @@
 
 #include "duct/status.h"
 
+#if !defined(_WIN32)
+#include <sys/un.h>  // sockaddr_un for ensure_stale_uds_removed
+#endif
+
 namespace duct::socket_utils {
 
 // Cross-platform socket handle type.
@@ -32,5 +36,15 @@ Result<void> set_nonblocking(socket_t fd, bool nonblock);
 
 // Close a socket handle.
 Result<void> close_socket(socket_t fd);
+
+#if !defined(_WIN32)
+// Validate an existing UDS path before a listen() binds it: it must be a
+// socket owned by the current user and not a live endpoint; otherwise return
+// kInvalidArgument without touching the filesystem. On success (or if the
+// path does not exist) the stale socket is unlinked so bind() can take it
+// over. Shared by uds_listen and the shm bootstrap listener so the two cannot
+// drift on the security-relevant unlink policy.
+Result<void> ensure_stale_uds_removed(const struct sockaddr_un& addr);
+#endif
 
 }  // namespace duct::socket_utils

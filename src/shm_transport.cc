@@ -293,7 +293,13 @@ static Result<int> uds_listen(std::string_view path, int backlog) {
   }
   std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", std::string(path).c_str());
 
-  ::unlink(addr.sun_path);
+  // The bootstrap socket lives in /tmp; never unlink an arbitrary file or
+  // steal a live shm bus. Same policy as uds_listen (see socket_utils).
+  auto prep = socket_utils::ensure_stale_uds_removed(addr);
+  if (!prep.ok()) {
+    ::close(fd);
+    return prep.status();
+  }
   if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
     ::close(fd);
     return Status::io_error("bind(AF_UNIX) failed" + errno_suffix());

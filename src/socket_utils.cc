@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -207,5 +208,43 @@ Result<void> close_socket(socket_t fd) {
   return {};
 #endif
 }
+
+#if !defined(_WIN32)
+Result<void> ensure_stale_uds_removed(const struct sockaddr_un& addr) {
+  const char* path = addr.sun_path;
+  // Remove an existing socket file only after the path has been validated.
+  // Before unlinking, verify it is actually a socket owned by this user; never
+  // silently delete an arbitrary file or steal a live peer's socket path.
+  struct stat st {};
+  if (::lstat(path, &st) == 0) {
+    if (!S_ISSOCK(st.st_mode) || st.st_uid != ::geteuid()) {
+      return Status::invalid_argument("uds path exists and is not a usable socket");
+    }
+    // Check whether a live endpoint still owns it; if so, do not steal it.
+    int probe = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0) {
+      // Non-blocking probe: a live listener with a full backlog must not make
+      // the listen() caller block while we check ownership.
+      int flags = ::fcntl(probe, F_GETFL, 0);
+      if (flags >= 0) (void)::fcntl(probe, F_SETFL, flags | O_NONBLOCK);
+      int rc = ::connect(probe, reinterpret_cast<const struct sockaddr*>(&addr), sizeof(addr));
+      ::close(probe);
+      if (rc == 0) {
+        return Status::invalid_argument("uds path already in use by a live endpoint");
+      }
+      if (errno != ECONNREFUSED && errno != ENOENT && errno != EAGAIN &&
+          errno != EWOULDBLOCK && errno != EINPROGRESS) {
+        return Status::io_error("connect probe failed for uds path: " + std::string(path));
+      }
+    }
+    if (::unlink(path) != 0) {
+      return Status::io_error("unlink() failed for uds path: " + std::string(path));
+    }
+  } else if (errno != ENOENT) {
+    return Status::io_error("lstat() failed for uds path: " + std::string(path));
+  }
+  return {};
+}
+#endif
 
 }  // namespace duct::socket_utils

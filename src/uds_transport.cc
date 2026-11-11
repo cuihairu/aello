@@ -299,40 +299,12 @@ static Result<int> listen_uds(const std::string& path, int backlog) {
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
   // Remove an existing socket file only after the path has been validated.
-  // Before unlinking, verify it is actually a socket owned by this user; never
-  // silently delete an arbitrary file or steal a live peer's socket path.
-  struct stat st {};
-  if (::lstat(path.c_str(), &st) == 0) {
-    if (!S_ISSOCK(st.st_mode) || st.st_uid != ::geteuid()) {
-      ::close(fd);
-      return Status::invalid_argument("uds path exists and is not a usable socket");
-    }
-    // Check whether a live endpoint still owns it; if so, do not steal it.
-    int probe = ::socket(AF_UNIX, SOCK_STREAM, 0);
-    if (probe >= 0) {
-      // Non-blocking probe: a live listener with a full backlog must not make
-      // the listen() caller block while we check ownership.
-      int flags = ::fcntl(probe, F_GETFL, 0);
-      if (flags >= 0) (void)::fcntl(probe, F_SETFL, flags | O_NONBLOCK);
-      int rc = ::connect(probe, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-      ::close(probe);
-      if (rc == 0) {
-        ::close(fd);
-        return Status::invalid_argument("uds path already in use by a live endpoint");
-      }
-      if (errno != ECONNREFUSED && errno != ENOENT && errno != EAGAIN &&
-          errno != EWOULDBLOCK && errno != EINPROGRESS) {
-        ::close(fd);
-        return Status::io_error("connect probe failed for uds path: " + path);
-      }
-    }
-    if (::unlink(path.c_str()) != 0) {
-      ::close(fd);
-      return Status::io_error("unlink() failed for uds path: " + path);
-    }
-  } else if (errno != ENOENT) {
+  // The socket-type, owner and liveness checks live in socket_utils so the
+  // shm bootstrap listener shares the same policy.
+  auto prep = socket_utils::ensure_stale_uds_removed(addr);
+  if (!prep.ok()) {
     ::close(fd);
-    return Status::io_error("lstat() failed for uds path: " + path);
+    return prep.status();
   }
 
   if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {

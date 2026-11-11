@@ -1085,3 +1085,75 @@ void test_wait_writable_getsockopt_failure_reports_errno() {
   ::close(fds[1]);
 #endif
 }
+
+// ensure_stale_uds_removed must never unlink an arbitrary file or steal a live
+// socket (the shm bootstrap listener relies on this); it must remove only a
+// stale socket owned by the current user, and accept an absent path.
+void test_ensure_stale_uds_removed_policy() {
+#if !defined(_WIN32)
+  const std::string base = "/tmp/duct_uds_policy_" + std::to_string(::getpid());
+
+  // Case 1: a regular file is not a usable socket and must be left untouched.
+  {
+    const std::string path = base + ".file";
+    int fd = ::open(path.c_str(), O_CREAT | O_WRONLY, 0600);
+    EXPECT_TRUE(fd >= 0);
+    ::close(fd);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    auto st = duct::socket_utils::ensure_stale_uds_removed(addr);
+    EXPECT_TRUE(!st.ok());
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+    struct stat s {};
+    EXPECT_TRUE(::lstat(path.c_str(), &s) == 0);  // still exists
+    ::unlink(path.c_str());
+  }
+
+  // Case 2: a live listener's socket must not be stolen.
+  {
+    const std::string path = base + ".live";
+    int lfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    EXPECT_TRUE(lfd >= 0);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    EXPECT_TRUE(::bind(lfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    EXPECT_TRUE(::listen(lfd, 1) == 0);
+    auto st = duct::socket_utils::ensure_stale_uds_removed(addr);
+    EXPECT_TRUE(!st.ok());
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+    struct stat s {};
+    EXPECT_TRUE(::lstat(path.c_str(), &s) == 0);  // still bound
+    ::close(lfd);
+    ::unlink(path.c_str());
+  }
+
+  // Case 3: a stale socket (no live endpoint) is removed so bind can take over.
+  {
+    const std::string path = base + ".stale";
+    int lfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    EXPECT_TRUE(lfd >= 0);
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    EXPECT_TRUE(::bind(lfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+    EXPECT_TRUE(::listen(lfd, 1) == 0);
+    ::close(lfd);  // path remains, but no endpoint owns it
+    auto st = duct::socket_utils::ensure_stale_uds_removed(addr);
+    EXPECT_TRUE(st.ok());
+    struct stat s {};
+    EXPECT_TRUE(::lstat(path.c_str(), &s) != 0);  // gone
+  }
+
+  // Case 4: an absent path is fine (fresh listen).
+  {
+    const std::string path = base + ".absent";
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    auto st = duct::socket_utils::ensure_stale_uds_removed(addr);
+    EXPECT_TRUE(st.ok());
+  }
+#endif
+}
