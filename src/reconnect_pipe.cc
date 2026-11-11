@@ -57,9 +57,20 @@ class ReconnectPipe final : public Pipe {
       st = inner_snapshot->send(msg, opt);
       if (st.ok()) return st;
       if (st.status().code() == StatusCode::kTimeout) return st;
-      if (is_disconnect_error(st.status())) {
+      if (st.status().code() == StatusCode::kClosed) {
+        // kClosed means the transport wrote none of this frame (wire reports
+        // it only when the peer closed before any byte went out), so the
+        // message is safe to resend on the next connection.
         mark_disconnected(inner_snapshot, "send: " + st.status().message());
         continue;
+      }
+      if (st.status().code() == StatusCode::kIoError) {
+        // kIoError includes mid-frame timeouts: the frame may have been
+        // partially or fully written and delivered, so resending could
+        // duplicate it. Tear the connection down (the worker redials) but
+        // surface the error to the caller, who decides whether to retry.
+        mark_disconnected(inner_snapshot, "send: " + st.status().message());
+        return st;
       }
       return st;
     }

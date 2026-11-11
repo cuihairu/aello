@@ -305,6 +305,21 @@ class BoundedPipe final : public duct::Pipe {
   std::size_t cap_;
 };
 
+// Test double: send() fails with kIoError as if the frame timed out mid-write
+// (some of the frame's bytes may already have reached the peer).
+class MidFrameFailPipe final : public duct::Pipe {
+ public:
+  duct::Result<void> send(const duct::Message&, const duct::SendOptions&) override {
+    return duct::Status::io_error("send() timed out mid-frame");
+  }
+
+  duct::Result<duct::Message> recv(const duct::RecvOptions&) override {
+    return duct::Status::timeout("no inbound data");
+  }
+
+  void close() override {}
+};
+
 // Test double: send() always reports a terminal transport failure (kClosed),
 // while recv() holds inbound data back until released, then delivers exactly
 // one message and keeps timing out afterwards. Models a connection whose send

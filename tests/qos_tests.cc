@@ -1037,3 +1037,41 @@ void test_qos_send_failure_does_not_kill_recv() {
   releaser.join();
   pipe.close();
 }
+
+// A send that failed with kIoError (e.g. a mid-frame timeout: bytes may have
+// reached the peer) must surface the error to the caller instead of being
+// silently resent on the next connection, which could duplicate it. Only a
+// kClosed failure (frame never started) is safe to retry on redial.
+void test_reconnect_ioerror_send_not_resent() {
+  auto second = std::make_unique<RecordingPipe>();
+  auto* second_raw = second.get();
+
+  int dials = 0;
+  auto dial_once = [&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    ++dials;
+    if (dials == 1) {
+      return std::unique_ptr<duct::Pipe>(std::make_unique<MidFrameFailPipe>());
+    }
+    return std::unique_ptr<duct::Pipe>(std::move(second));
+  };
+
+  duct::ReconnectPolicy policy;
+  policy.initial_delay = std::chrono::milliseconds(5);
+  policy.max_delay = std::chrono::milliseconds(20);
+  policy.backoff_multiplier = 1.0;
+
+  auto reconnect = duct::make_reconnect_pipe(std::move(dial_once), policy, nullptr);
+
+  auto st = reconnect->send(duct::Message::from_string("m"), {});
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kIoError);
+  }
+
+  // Give the background worker time to redial, and (if the error were
+  // wrongly retried) resend. The original bug resent here within ~10ms, so
+  // a generous absence window is deterministic.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_TRUE(!second_raw->wait_for_sent("m", std::chrono::milliseconds(200)));
+  reconnect->close();
+}

@@ -102,6 +102,7 @@ int main() {
   RUN_TEST(test_qos_dial_opt_in_disabled_by_default);
   RUN_TEST(test_qos_ttl_expires_queued_message);
   RUN_TEST(test_qos_send_failure_does_not_kill_recv);
+  RUN_TEST(test_reconnect_ioerror_send_not_resent);
   RUN_TEST(test_qos_drop_old_evicts_oldest_queued);
   RUN_TEST(test_concurrent_send_recv_channels);
   RUN_TEST(test_multi_process_kill9_restart);
