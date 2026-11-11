@@ -17,6 +17,32 @@
 namespace duct {
 namespace {
 
+// Entry-point validation: a misconfigured policy would otherwise produce
+// undefined backoff arithmetic (NaN/Inf multiplier, negative delays spin with
+// zero waits). dial() reports kInvalidArgument; make_reconnect_pipe (which has
+// no error channel) sanitizes instead.
+Result<void> validate_reconnect_policy(const ReconnectPolicy& policy) {
+  if (policy.initial_delay.count() < 0 || policy.max_delay.count() < 0) {
+    return Status::invalid_argument("reconnect delays must be non-negative");
+  }
+  // >= 1.0 comparison also rejects NaN.
+  if (!(policy.backoff_multiplier >= 1.0)) {
+    return Status::invalid_argument("reconnect backoff multiplier must be >= 1.0");
+  }
+  if (policy.max_attempts < 0) {
+    return Status::invalid_argument("reconnect max_attempts must be >= 0");
+  }
+  return {};
+}
+
+void sanitize_reconnect_policy(ReconnectPolicy& policy) {
+  if (policy.initial_delay.count() < 0) policy.initial_delay = std::chrono::milliseconds(0);
+  if (policy.max_delay.count() < 0) policy.max_delay = std::chrono::milliseconds(0);
+  if (!(policy.backoff_multiplier >= 1.0)) policy.backoff_multiplier = 1.0;
+  if (policy.max_attempts < 0) policy.max_attempts = 0;
+}
+
+
 class ReconnectPipe final : public Pipe {
  public:
   ReconnectPipe(DialOnceFn dial_once, ReconnectPolicy policy, ConnectionCallback on_state_change)
@@ -293,6 +319,7 @@ class ReconnectPipe final : public Pipe {
 std::unique_ptr<Pipe> make_reconnect_pipe(DialOnceFn dial_once,
                                          ReconnectPolicy policy,
                                          ConnectionCallback on_state_change) {
+  sanitize_reconnect_policy(policy);
   return std::make_unique<ReconnectPipe>(std::move(dial_once), policy, std::move(on_state_change));
 }
 
@@ -300,6 +327,8 @@ Result<std::unique_ptr<Pipe>> make_connected_reconnect_pipe(
     DialOnceFn dial_once, const ReconnectPolicy& policy,
     ConnectionCallback on_state_change,
     std::chrono::milliseconds first_connect_timeout) {
+  auto pv = validate_reconnect_policy(policy);
+  if (!pv.ok()) return pv.status();
   auto pipe = std::make_unique<ReconnectPipe>(std::move(dial_once), policy,
                                               std::move(on_state_change));
   auto st = pipe->wait_connected(first_connect_timeout);

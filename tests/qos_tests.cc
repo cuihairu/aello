@@ -1075,3 +1075,40 @@ void test_reconnect_ioerror_send_not_resent() {
   EXPECT_TRUE(!second_raw->wait_for_sent("m", std::chrono::milliseconds(200)));
   reconnect->close();
 }
+
+// A reconnect policy with invalid backoff arithmetic (NaN/negative multiplier,
+// negative delays) must be rejected at dial() with kInvalidArgument instead of
+// producing undefined backoff behavior. make_reconnect_pipe, which has no
+// error channel, sanitizes the policy instead of crashing.
+void test_reconnect_invalid_policy_rejected_at_dial() {
+  auto lis_r = duct::listen("shm://duct_reconnect_policy");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.timeout = std::chrono::milliseconds(500);
+  dial_opt.reconnect.enabled = true;
+  dial_opt.reconnect.backoff_multiplier = 0.0;  // invalid: < 1.0
+  auto c = duct::dial("shm://duct_reconnect_policy", dial_opt);
+  EXPECT_TRUE(!c.ok());
+  if (!c.ok()) {
+    EXPECT_EQ(c.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  // The no-error-channel factory sanitizes instead.
+  duct::ReconnectPolicy policy;
+  policy.backoff_multiplier = 0.0;
+  bool dialed = false;
+  auto pipe = duct::make_reconnect_pipe([&]() -> duct::Result<std::unique_ptr<duct::Pipe>> {
+    dialed = true;
+    return std::unique_ptr<duct::Pipe>(std::make_unique<RecordingPipe>());
+  }, policy, nullptr);
+  EXPECT_TRUE(pipe != nullptr);
+  for (int i = 0; i < 100 && !dialed; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(dialed);
+  pipe->close();
+  lis_r.value()->close();
+}

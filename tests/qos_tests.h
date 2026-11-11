@@ -29,4 +29,5 @@ void test_qos_dial_opt_in_disabled_by_default();
 void test_qos_ttl_expires_queued_message();
 void test_qos_send_failure_does_not_kill_recv();
 void test_reconnect_ioerror_send_not_resent();
+void test_reconnect_invalid_policy_rejected_at_dial();
 void test_qos_drop_old_evicts_oldest_queued();
