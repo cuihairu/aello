@@ -1061,3 +1061,27 @@ void test_concurrent_send_recv_channels() {
   }
   lis_r.value()->close();
 }
+
+// When poll flags an fd but SO_ERROR itself fails, wait_writable must report
+// the getsockopt errno instead of a misleading "peer closed" or a generic
+// poll error. A broken pipe's write end flags POLLERR, and getsockopt on a
+// non-socket fd fails with ENOTSOCK — deterministic on Linux.
+void test_wait_writable_getsockopt_failure_reports_errno() {
+#if !defined(_WIN32)
+  int fds[2];
+  EXPECT_EQ(::pipe(fds), 0);
+  if (fds[0] < 0) return;
+  ::close(fds[0]);  // read end gone: the write end now polls POLLERR
+
+  auto st = duct::socket_utils::wait_writable(
+      duct::socket_utils::socket_t(fds[1]), std::chrono::milliseconds(100));
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kIoError);
+    // The message must carry the real cause (ENOTSOCK), not "peer closed"
+    // or a generic poll error.
+    EXPECT_TRUE(st.status().message().find("getsockopt") != std::string::npos);
+  }
+  ::close(fds[1]);
+#endif
+}

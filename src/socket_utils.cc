@@ -139,9 +139,15 @@ Result<void> wait_writable(socket_t fd, std::chrono::milliseconds timeout) {
     // instead of the POLLHUP branch swallowing it as a generic "peer closed".
     int so_error = 0;
     socklen_t errlen = sizeof(so_error);
-    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) == 0 && so_error != 0) {
+    if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &errlen) != 0) {
+      // SO_ERROR itself failed (e.g. invalid fd): report its errno instead of
+      // falling through to a misleading "peer closed" or a generic error.
+      return Status::io_error(std::string("getsockopt(SO_ERROR) failed: ") +
+                              std::strerror(errno));
+    }
+    if (so_error != 0) {
       return Status::io_error("poll() reported error on fd: SO_ERROR=" +
-                              std::to_string(so_error) + " " + std::strerror(so_error));
+                             std::to_string(so_error) + " " + std::strerror(so_error));
     }
     if (pfd.revents & POLLHUP) {
       return Status::closed("peer closed");

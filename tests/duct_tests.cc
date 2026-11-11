@@ -105,6 +105,7 @@ int main() {
   RUN_TEST(test_reconnect_ioerror_send_not_resent);
   RUN_TEST(test_qos_drop_old_evicts_oldest_queued);
   RUN_TEST(test_concurrent_send_recv_channels);
+  RUN_TEST(test_wait_writable_getsockopt_failure_reports_errno);
   RUN_TEST(test_multi_process_kill9_restart);
   RUN_TEST(test_rpc_request_correlation);
   RUN_TEST(test_rpc_request_timeout);
