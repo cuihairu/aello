@@ -38,6 +38,7 @@ int main() {
   RUN_TEST(test_pipe_dial_absent_reports_timeout);
   RUN_TEST(test_pipe_timeout_completion_preserves_message);
   RUN_TEST(test_pipe_midframe_timeout_poisons_connection);
+  RUN_TEST(test_pipe_rejects_negative_send_recv_timeout);
   RUN_TEST(test_shm_backpressure_timeout);
   RUN_TEST(test_shm_burst_without_receiver);
   RUN_TEST(test_wire_decode_rejects_bad_magic);

@@ -418,3 +418,64 @@ void test_pipe_midframe_timeout_poisons_connection() {
   server.join();
 #endif
 }
+
+// A negative send/recv timeout must be rejected as kInvalidArgument instead of
+// being cast to a ~49.7-day DWORD timeout (same class as the win_shm fix).
+void test_pipe_rejects_negative_send_recv_timeout() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_negtimeout");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_negtimeout");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    // Park until the client closes; no data is expected to flow.
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return {};
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  // Raw transport dial (no QoS wrapper): the timeout reaches pipe_transport
+  // directly instead of being replaced by the worker's own bound.
+  auto c = duct::dial("pipe://duct_testpipe_negtimeout");
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    if (server.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+      server.get();
+    }
+    return;
+  }
+
+  duct::SendOptions sopt;
+  sopt.timeout = std::chrono::milliseconds(-1);
+  auto st = c.value()->send(duct::Message::from_string("x"), sopt);
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  duct::RecvOptions ropt;
+  ropt.timeout = std::chrono::milliseconds(-1);
+  auto got = c.value()->recv(ropt);
+  EXPECT_TRUE(!got.ok());
+  if (!got.ok()) {
+    EXPECT_EQ(got.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  c.value()->close();
+  if (server.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+    server.get();  // expected kClosed
+  }
+  lis_r.value()->close();
+#endif
+}

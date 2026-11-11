@@ -114,6 +114,9 @@ class NamedPipePipe final : public Pipe {
   ~NamedPipePipe() override { close(); }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     if (handle_ == INVALID_HANDLE_VALUE || broken_.load(std::memory_order_acquire)) {
       return Status::closed("pipe closed");
     }
@@ -199,6 +202,9 @@ class NamedPipePipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     if (handle_ == INVALID_HANDLE_VALUE || broken_.load(std::memory_order_acquire)) {
       return Status::closed("pipe closed");
     }

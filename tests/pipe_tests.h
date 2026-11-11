@@ -9,3 +9,4 @@ void test_pipe_concurrent_accepts_unblock_on_close();
 void test_pipe_dial_absent_reports_timeout();
 void test_pipe_timeout_completion_preserves_message();
 void test_pipe_midframe_timeout_poisons_connection();
+void test_pipe_rejects_negative_send_recv_timeout();
