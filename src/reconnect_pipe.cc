@@ -199,14 +199,23 @@ class ReconnectPipe final : public Pipe {
 
   void mark_disconnected(const std::shared_ptr<Pipe>& which, const std::string& reason) {
     std::shared_ptr<Pipe> inner_to_close;
+    bool is_current = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (closed_) return;
-      if (!inner_) return;
-      if (inner_ != which) return;  // Stale error from a prior connection.
-      inner_to_close = std::move(inner_);
-      last_error_ = reason;
-      cv_.notify_all();
+      is_current = inner_ && inner_ == which;
+      if (is_current) {
+        inner_to_close = std::move(inner_);
+        last_error_ = reason;
+        cv_.notify_all();
+      }
+    }
+    if (!is_current) {
+      // Stale error from a prior connection: it was closed when it was marked,
+      // but close it again (idempotent) so a snapshot still held by another
+      // caller cannot keep the transport alive past the disconnect.
+      which->close();
+      return;
     }
     set_state(ConnectionState::kDisconnected, reason);
     if (inner_to_close) inner_to_close->close();
