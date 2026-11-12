@@ -762,8 +762,11 @@ void test_tcp_channel_recv_subms_deadline_bounded() {
     if (!p.ok()) return p.status();
     // Do not send anything: the client's recv must time out on an empty socket.
     // A sub-millisecond remaining deadline truncated to a zero socket timeout
-    // would block forever waiting for data that never arrives.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // would block forever waiting for data that never arrives. Stay silent
+    // longer than the recv watchdog (5s): if the server pipe closed earlier,
+    // a late-started recv would see EOF (kClosed) instead of the expected
+    // kTimeout and report a false red.
+    std::this_thread::sleep_for(std::chrono::seconds(6));
     return {};
   });
 
@@ -792,7 +795,7 @@ void test_tcp_channel_recv_subms_deadline_bounded() {
 
   c.value()->close();
   lis_r.value()->close();
-  auto sst = server.wait_for(std::chrono::seconds(3));
+  auto sst = server.wait_for(std::chrono::seconds(8));
   if (sst == std::future_status::ready) (void)server.get();
 }
 
