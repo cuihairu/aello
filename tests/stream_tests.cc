@@ -1342,7 +1342,10 @@ void run_channel_pending_zero_len_capped_case(const char* url) {
   }
 
   duct::RecvOptions r7;
-  r7.timeout = std::chrono::milliseconds(5000);
+  // Wide window: under wine each stashed frame is a separate read syscall and
+  // 4096 of them can outlast a short deadline. The cap itself trips instantly
+  // once the frames are consumed; this only bounds the fixture wait.
+  r7.timeout = std::chrono::milliseconds(30000);
   r7.channel_id = 7;
   auto m7 = c.value()->recv(r7);
   EXPECT_TRUE(!m7.ok());
