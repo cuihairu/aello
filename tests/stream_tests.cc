@@ -711,6 +711,11 @@ void test_tcp_channel_recv_deadline_bounded() {
     while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
       auto st = p.value()->send(duct::Message::from_string(other), s8);
       if (!st.ok()) return st.status();
+      // Pace the spray so the client's stash stays far below the pending cap:
+      // on a fast runner an unbounded 1 KiB send loop can cross 64 MiB inside
+      // this window and turn the deadline assertion into a kQueueFull. The
+      // pace still keeps ch-8 frames flowing for the client's whole deadline.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return {};
   });

@@ -108,7 +108,10 @@ void test_pipe_rejects_oversize_message() {
   }
 
   c.value()->close();
-  auto sst = server.wait_for(std::chrono::seconds(1));
+  // Generous window: under wine/emulated named pipes the server thread can be
+  // slow to unwind after the client close, and a missed join here fails the
+  // test spuriously.
+  auto sst = server.wait_for(std::chrono::seconds(5));
   if (sst == std::future_status::ready) {
     auto sr = server.get();
     EXPECT_TRUE(!sr.ok());
