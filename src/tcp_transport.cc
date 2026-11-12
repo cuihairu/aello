@@ -156,6 +156,7 @@ class TcpPipe final : public Pipe {
           it->second.erase(it->second.begin());
           if (it->second.empty()) pending_.erase(it);
           pending_bytes_ -= msg.size();
+          if (msg.size() == 0) --pending_zero_len_;
           return msg;
         }
       }
@@ -185,6 +186,7 @@ class TcpPipe final : public Pipe {
           it->second.erase(it->second.begin());
           if (it->second.empty()) pending_.erase(it);
           pending_bytes_ -= msg.size();
+          if (msg.size() == 0) --pending_zero_len_;
           return msg;
         }
         return r.status();
@@ -201,15 +203,31 @@ class TcpPipe final : public Pipe {
         // ceiling would let a peer multiply it by the number of channel_ids it
         // chooses to spray (channel ids come from the wire, not us). 64 MiB of
         // pending frames is a generous ceiling for the wire-level max
-        // reassembled size.
-        auto& pending = pending_[flags_to_channel_id(r.value().flags)];
+        // reassembled size. Zero-length frames charge no bytes and each map
+        // node / vector slot costs real memory regardless of payload, so the
+        // buffered-channel count and the zero-length frame count are capped as
+        // well: empty frames sprayed on many channel ids would otherwise stash
+        // unbounded entries while the byte counter stays at zero.
+        const std::uint32_t stash_chan = flags_to_channel_id(r.value().flags);
+        const bool empty_frame = r.value().message.size() == 0;
+        if (empty_frame && pending_zero_len_ >= kMaxPendingZeroLenFrames) {
+          return Status::queue_full("channel recv buffer full");
+        }
+        auto it = pending_.find(stash_chan);
+        if (it == pending_.end()) {
+          if (pending_.size() >= kMaxPendingChannels) {
+            return Status::queue_full("too many pending channels");
+          }
+          it = pending_.emplace(stash_chan, std::vector<wire::FrameMessage>{}).first;
+        }
         pending_bytes_ += r.value().message.size();
         if (pending_bytes_ > kMaxPendingBytes) {
           pending_bytes_ -= r.value().message.size();
-          if (pending.empty()) pending_.erase(flags_to_channel_id(r.value().flags));
+          if (it->second.empty()) pending_.erase(it);
           return Status::queue_full("channel recv buffer full");
         }
-        pending.push_back(std::move(r.value()));
+        if (empty_frame) ++pending_zero_len_;
+        it->second.push_back(std::move(r.value()));
       }
     }
   }
@@ -307,7 +325,12 @@ class TcpPipe final : public Pipe {
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
   // Total bytes stashed in pending_ across all channels, guarded by ch_mu_.
   static constexpr std::size_t kMaxPendingBytes = 64 * 1024 * 1024;
+  // Zero-length frames charge no bytes, so their count and the number of
+  // buffered channels are capped separately (both guarded by ch_mu_).
+  static constexpr std::size_t kMaxPendingChannels = 1024;
+  static constexpr std::size_t kMaxPendingZeroLenFrames = 4096;
   std::size_t pending_bytes_ = 0;
+  std::size_t pending_zero_len_ = 0;
 };
 
 class TcpListener final : public Listener {

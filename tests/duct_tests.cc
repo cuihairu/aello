@@ -88,6 +88,8 @@ int main() {
   RUN_TEST(test_tcp_channel_recv_does_not_drop_other_channel);
   RUN_TEST(test_tcp_channel_pending_capped);
   RUN_TEST(test_channel_pending_cap_is_shared_across_channels);
+  RUN_TEST(test_channel_pending_channel_count_capped);
+  RUN_TEST(test_channel_pending_zero_len_frames_capped);
   RUN_TEST(test_tcp_close_unblocks_blocked_recv);
   RUN_TEST(test_uds_close_unblocks_blocked_recv);
   RUN_TEST(test_shm_rejects_oversize_message);

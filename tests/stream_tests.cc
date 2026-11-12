@@ -1229,6 +1229,125 @@ void test_channel_pending_cap_is_shared_across_channels() {
 #endif
 }
 
+// The pending byte cap alone cannot bound memory: a zero-length frame adds
+// zero bytes to the counter, and each map node / vector slot costs real memory
+// regardless of payload. A peer spraying empty frames on distinct channel ids
+// would stash unbounded entries while the byte counter stays at zero. The
+// stash must cap the number of buffered channels as well.
+void run_channel_pending_channel_count_capped_case(const char* url) {
+  auto lis_r = duct::listen(url);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // 2000 distinct channels with empty frames: no bytes are ever charged, only
+  // the buffered-channel count can trip.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::SendOptions s;
+    s.timeout = std::chrono::milliseconds(30000);
+    for (std::uint32_t ch = 1; ch <= 2000; ++ch) {
+      s.channel_id = ch;
+      auto st = p.value()->send(duct::Message::from_string(""), s);
+      if (!st.ok()) return st.status();
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    server.wait_for(std::chrono::seconds(5));
+    return;
+  }
+
+  duct::RecvOptions r;
+  r.timeout = std::chrono::milliseconds(5000);
+  r.channel_id = 3000;  // never sprayed by the server
+  auto m = c.value()->recv(r);
+  EXPECT_TRUE(!m.ok());
+  if (!m.ok()) {
+    EXPECT_EQ(m.status().code(), duct::StatusCode::kQueueFull);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(10));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+void test_channel_pending_channel_count_capped() {
+  run_channel_pending_channel_count_capped_case("tcp://127.0.0.1:0");
+#if !defined(_WIN32)
+  run_channel_pending_channel_count_capped_case("uds://duct_test_chcap");
+#endif
+}
+
+// Even on a single channel, zero-length frames must not accumulate without
+// bound: the byte cap never sees them, so the stash counts them separately.
+void run_channel_pending_zero_len_capped_case(const char* url) {
+  auto lis_r = duct::listen(url);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  // 5000 empty frames on one channel: one map entry, zero charged bytes, only
+  // the zero-length frame count can trip.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    duct::SendOptions s;
+    s.timeout = std::chrono::milliseconds(30000);
+    s.channel_id = 8;
+    for (int i = 0; i < 5000; ++i) {
+      auto st = p.value()->send(duct::Message::from_string(""), s);
+      if (!st.ok()) return st.status();
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    server.wait_for(std::chrono::seconds(5));
+    return;
+  }
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(5000);
+  r7.channel_id = 7;
+  auto m7 = c.value()->recv(r7);
+  EXPECT_TRUE(!m7.ok());
+  if (!m7.ok()) {
+    EXPECT_EQ(m7.status().code(), duct::StatusCode::kQueueFull);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(10));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+void test_channel_pending_zero_len_frames_capped() {
+  run_channel_pending_zero_len_capped_case("tcp://127.0.0.1:0");
+#if !defined(_WIN32)
+  run_channel_pending_zero_len_capped_case("uds://duct_test_zerocap");
+#endif
+}
+
 
 // close() on a pipe with a blocked recv must unblock that recv promptly with
 // kClosed. On POSIX, ::close() does not wake a thread blocked in read(): the

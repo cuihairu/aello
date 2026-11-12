@@ -20,6 +20,8 @@ void test_tcp_channel_pending_capped();
 void test_tcp_close_unblocks_blocked_recv();
 void test_uds_close_unblocks_blocked_recv();
 void test_channel_pending_cap_is_shared_across_channels();
+void test_channel_pending_channel_count_capped();
+void test_channel_pending_zero_len_frames_capped();
 void test_tcp_channel_recv_deadline_bounded();
 void test_tcp_channel_recv_subms_deadline_bounded();
 void test_tcp_concurrent_channel_recv();
