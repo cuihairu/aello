@@ -567,10 +567,17 @@ class ShmListener final : public Listener {
                        [&] { return state->active_accepts.load() == 0; });
   }
 
-  // Decrement the in-flight accept count and wake the destructor's wait. Every
+  // Decrement the in-flight accept count and wake the destructor's wait. The
+  // decrement happens under the mutex so it serializes against the
+  // destructor's predicate check: a decrement outside the lock could land
+  // after the destructor observed a nonzero count but before it slept, losing
+  // the notify and stalling the destructor for its full 2s timeout. Every
   // accept() return path calls this exactly once after the increment.
   static void finish_accept(const std::shared_ptr<ShmListenerState>& state) {
-    state->active_accepts.fetch_sub(1, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      state->active_accepts.fetch_sub(1, std::memory_order_acq_rel);
+    }
     state->cv.notify_all();
   }
 
