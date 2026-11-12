@@ -59,7 +59,7 @@ class UdsPipe final : public Pipe {
     }
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{this};
+    IoGuard guard{io_};
 
     // Wait for writable if timeout is specified.
     if (opt.timeout.count() > 0) {
@@ -76,7 +76,7 @@ class UdsPipe final : public Pipe {
     }
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{this};
+    IoGuard guard{io_};
     // Serialize socket reads: concurrent recv() calls for different channels
     // must not interleave their raw frame reads on the same fd.
     std::lock_guard<std::mutex> lock(read_mu_);
@@ -194,7 +194,7 @@ class UdsPipe final : public Pipe {
   Result<PeerCredential> peer_credential() const override {
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{this};
+    IoGuard guard{io_};
 #if defined(SO_PEERCRED)
     struct ucred cred {};
     socklen_t len = sizeof(cred);
@@ -225,23 +225,28 @@ class UdsPipe final : public Pipe {
     return true;
   }
 
-  void io_end() const {
+  // Static on the shared state (not the pipe): a guard whose io outlives a
+  // timed-out destructor must never touch freed pipe memory.
+  static void io_end(std::shared_ptr<PipeIoState> io) {
     int fd_to_close = -1;
     {
-      std::lock_guard<std::mutex> lock(io_->mu);
-      --io_->active;
-      if (io_->closing && io_->active == 0 && io_->fd >= 0) {
-        fd_to_close = io_->fd;
-        io_->fd = -1;
+      std::lock_guard<std::mutex> lock(io->mu);
+      --io->active;
+      if (io->closing && io->active == 0 && io->fd >= 0) {
+        fd_to_close = io->fd;
+        io->fd = -1;
       }
     }
-    io_->cv.notify_all();
+    io->cv.notify_all();
     if (fd_to_close >= 0) ::close(fd_to_close);
   }
 
+  // Holds the shared state, not the pipe: if the pipe is destroyed after its
+  // destructor's bounded wait expires while this io is still in flight, the
+  // state stays alive and io_end remains memory-safe.
   struct IoGuard {
-    const UdsPipe* p;
-    ~IoGuard() { p->io_end(); }
+    std::shared_ptr<PipeIoState> io;
+    ~IoGuard() { io_end(io); }
   };
 
   std::shared_ptr<PipeIoState> io_;

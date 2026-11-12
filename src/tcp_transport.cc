@@ -120,7 +120,7 @@ class TcpPipe final : public Pipe {
     }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{this};
+    IoGuard guard{io_};
     auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs;
     return wire::write_frame(fd, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
@@ -132,7 +132,7 @@ class TcpPipe final : public Pipe {
     }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{this};
+    IoGuard guard{io_};
     auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs.status();
     // Serialize socket reads: channel demux is designed for concurrent recv()
@@ -291,23 +291,28 @@ class TcpPipe final : public Pipe {
     return true;
   }
 
-  void io_end() {
+  // Static on the shared state (not the pipe): a guard whose io outlives a
+  // timed-out destructor must never touch freed pipe memory.
+  static void io_end(std::shared_ptr<PipeIoState> io) {
     wire::SocketHandle fd_to_close = wire::kInvalidSocket;
     {
-      std::lock_guard<std::mutex> lock(io_->mu);
-      --io_->active;
-      if (io_->closing && io_->active == 0 && io_->fd != wire::kInvalidSocket) {
-        fd_to_close = io_->fd;
-        io_->fd = wire::kInvalidSocket;
+      std::lock_guard<std::mutex> lock(io->mu);
+      --io->active;
+      if (io->closing && io->active == 0 && io->fd != wire::kInvalidSocket) {
+        fd_to_close = io->fd;
+        io->fd = wire::kInvalidSocket;
       }
     }
-    io_->cv.notify_all();
+    io->cv.notify_all();
     if (fd_to_close != wire::kInvalidSocket) close_socket(fd_to_close);
   }
 
+  // Holds the shared state, not the pipe: if the pipe is destroyed after its
+  // destructor's bounded wait expires while this io is still in flight, the
+  // state stays alive and io_end remains memory-safe.
   struct IoGuard {
-    TcpPipe* p;
-    ~IoGuard() { p->io_end(); }
+    std::shared_ptr<PipeIoState> io;
+    ~IoGuard() { io_end(io); }
   };
 
   Result<void> ensure_handshake(wire::SocketHandle fd) {
