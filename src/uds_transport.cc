@@ -54,6 +54,9 @@ class UdsPipe final : public Pipe {
   }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
     IoGuard guard{this};
@@ -68,6 +71,9 @@ class UdsPipe final : public Pipe {
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
     IoGuard guard{this};
@@ -82,6 +88,9 @@ class UdsPipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     const bool has_deadline = opt.timeout.count() > 0;
     const auto deadline = std::chrono::steady_clock::now() + opt.timeout;
     for (;;) {

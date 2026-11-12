@@ -115,6 +115,9 @@ class TcpPipe final : public Pipe {
   }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
     IoGuard guard{this};
@@ -124,6 +127,9 @@ class TcpPipe final : public Pipe {
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
     IoGuard guard{this};
@@ -142,6 +148,9 @@ class TcpPipe final : public Pipe {
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
+    if (opt.timeout.count() < 0) {
+      return Status::invalid_argument("negative timeout");
+    }
     // Track the deadline across the filtering loop so a peer that keeps sending
     // frames for other channels cannot extend the wait indefinitely.
     const bool has_deadline = opt.timeout.count() > 0;

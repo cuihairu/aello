@@ -22,6 +22,8 @@ void test_uds_close_unblocks_blocked_recv();
 void test_tcp_listener_close_unblocks_bare_accept();
 void test_uds_listener_close_unblocks_bare_accept();
 void test_tcp_listener_close_unblocks_silent_client_accept();
+void test_tcp_rejects_negative_send_recv_timeout();
+void test_uds_rejects_negative_send_recv_timeout();
 void test_channel_pending_cap_is_shared_across_channels();
 void test_channel_pending_channel_count_capped();
 void test_channel_pending_zero_len_frames_capped();

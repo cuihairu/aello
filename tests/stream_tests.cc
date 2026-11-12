@@ -1587,3 +1587,95 @@ void test_uds_listener_close_unblocks_bare_accept() {
   ::unlink(path.c_str());
 #endif
 }
+
+
+// A negative send/recv timeout must be rejected as kInvalidArgument instead of
+// silently turning into an unbounded blocking call (a negative duration fails
+// the "> 0" checks and clears the socket timeout — the same class as the
+// pipe_transport negative-DWORD fix).
+void run_negative_timeout_rejected_case(const char* url) {
+  auto lis_r = duct::listen(url);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Park the server in recv() so the pipe stays open; the client close at the
+  // end is what lets this thread unwind.
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto m = p.value()->recv({});
+    if (!m.ok()) return m.status();
+    return {};
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) {
+    lis_r.value()->close();
+    server.wait_for(std::chrono::seconds(2));
+    return;
+  }
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    server.wait_for(std::chrono::seconds(2));
+    return;
+  }
+
+  duct::SendOptions sopt;
+  sopt.timeout = std::chrono::milliseconds(-1);
+  auto st = c.value()->send(duct::Message::from_string("x"), sopt);
+  EXPECT_TRUE(!st.ok());
+  if (!st.ok()) {
+    EXPECT_EQ(st.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+
+  // Deliberately heap-allocated: a stuck recv (regression) must not hang the
+  // suite via the std::async destructor join.
+  auto* rfut = new std::future<duct::Result<duct::Message>>(
+      std::async(std::launch::async, [&]() -> duct::Result<duct::Message> {
+        duct::RecvOptions ropt;
+        ropt.timeout = std::chrono::milliseconds(-1);
+        return c.value()->recv(ropt);
+      }));
+  const bool ready = rfut->wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  EXPECT_TRUE(ready);
+  if (ready) {
+    auto got = rfut->get();
+    delete rfut;
+    EXPECT_TRUE(!got.ok());
+    if (!got.ok()) {
+      EXPECT_EQ(got.status().code(), duct::StatusCode::kInvalidArgument);
+    }
+  } else {
+    // Stuck past the deadline (negative timeout became a blocking call):
+    // leak the future and let close() below unblock the reader.
+    rfut->wait_for(std::chrono::seconds(0));
+  }
+
+  c.value()->close();
+  if (server.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+    (void)server.get();  // expected kClosed from the client close
+  }
+  lis_r.value()->close();
+}
+
+void test_tcp_rejects_negative_send_recv_timeout() {
+  run_negative_timeout_rejected_case("tcp://127.0.0.1:0");
+}
+
+void test_uds_rejects_negative_send_recv_timeout() {
+#if defined(_WIN32)
+  return;
+#else
+  std::string path = "/tmp/duct_uds_negtimeout_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+  run_negative_timeout_rejected_case(("uds://" + path).c_str());
+  ::unlink(path.c_str());
+#endif
+}

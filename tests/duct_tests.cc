@@ -96,6 +96,8 @@ int main() {
   RUN_TEST(test_tcp_listener_close_unblocks_bare_accept);
   RUN_TEST(test_uds_listener_close_unblocks_bare_accept);
   RUN_TEST(test_tcp_listener_close_unblocks_silent_client_accept);
+  RUN_TEST(test_tcp_rejects_negative_send_recv_timeout);
+  RUN_TEST(test_uds_rejects_negative_send_recv_timeout);
   RUN_TEST(test_shm_rejects_oversize_message);
   RUN_TEST(test_shm_recv_unblocks_on_peer_close);
   RUN_TEST(test_tcp_channel_recv_deadline_bounded);
