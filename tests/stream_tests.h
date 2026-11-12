@@ -17,6 +17,7 @@ void test_uds_positive_connect_timeout_is_preserved();
 void test_tcp_channel_multiplexing();
 void test_tcp_channel_recv_does_not_drop_other_channel();
 void test_tcp_channel_pending_capped();
+void test_channel_pending_cap_is_shared_across_channels();
 void test_tcp_channel_recv_deadline_bounded();
 void test_tcp_channel_recv_subms_deadline_bounded();
 void test_tcp_concurrent_channel_recv();

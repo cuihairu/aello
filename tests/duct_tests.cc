@@ -86,6 +86,7 @@ int main() {
   RUN_TEST(test_tcp_channel_multiplexing);
   RUN_TEST(test_tcp_channel_recv_does_not_drop_other_channel);
   RUN_TEST(test_tcp_channel_pending_capped);
+  RUN_TEST(test_channel_pending_cap_is_shared_across_channels);
   RUN_TEST(test_shm_rejects_oversize_message);
   RUN_TEST(test_shm_recv_unblocks_on_peer_close);
   RUN_TEST(test_tcp_channel_recv_deadline_bounded);

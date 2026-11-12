@@ -1157,3 +1157,69 @@ void test_ensure_stale_uds_removed_policy() {
   }
 #endif
 }
+
+namespace {
+
+// The pending-frame cap must be shared across channels: a peer can pick any
+// number of channel_ids, so a per-channel ceiling multiplies by however many
+// channels it sprays. 1024 full-size frames stay just under the old per-channel
+// 64 MiB cap (67,064,320 <= 67,108,864), so two sprayed channels reject only
+// under the shared accounting.
+void run_channel_shared_cap_case(const char* url) {
+  auto lis_r = duct::listen(url);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    const std::string payload(64 * 1024 - 16, 'p');
+    duct::SendOptions s;
+    s.timeout = std::chrono::milliseconds(30000);
+    for (std::uint32_t ch : {8u, 9u}) {
+      s.channel_id = ch;
+      for (int i = 0; i < 1024; ++i) {
+        auto st = p.value()->send(duct::Message::from_string(payload), s);
+        if (!st.ok()) return st.status();
+      }
+    }
+    return {};
+  });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    lis_r.value()->close();
+    server.wait_for(std::chrono::seconds(5));
+    return;
+  }
+
+  duct::RecvOptions r7;
+  r7.timeout = std::chrono::milliseconds(20000);
+  r7.channel_id = 7;
+  auto m7 = c.value()->recv(r7);
+  EXPECT_TRUE(!m7.ok());
+  if (!m7.ok()) {
+    EXPECT_EQ(m7.status().code(), duct::StatusCode::kQueueFull);
+  }
+
+  c.value()->close();
+  lis_r.value()->close();
+  auto sst = server.wait_for(std::chrono::seconds(10));
+  if (sst == std::future_status::ready) (void)server.get();
+}
+
+}  // namespace
+
+void test_channel_pending_cap_is_shared_across_channels() {
+  run_channel_shared_cap_case("tcp://127.0.0.1:0");
+#if !defined(_WIN32)
+  run_channel_shared_cap_case("uds://duct_test_shared_cap");
+#endif
+}

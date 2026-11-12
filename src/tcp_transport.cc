@@ -114,6 +114,7 @@ class TcpPipe final : public Pipe {
           auto msg = std::move(it->second.front().message);
           it->second.erase(it->second.begin());
           if (it->second.empty()) pending_.erase(it);
+          pending_bytes_ -= msg.size();
           return msg;
         }
       }
@@ -142,6 +143,7 @@ class TcpPipe final : public Pipe {
           auto msg = std::move(it->second.front().message);
           it->second.erase(it->second.begin());
           if (it->second.empty()) pending_.erase(it);
+          pending_bytes_ -= msg.size();
           return msg;
         }
         return r.status();
@@ -153,14 +155,17 @@ class TcpPipe final : public Pipe {
       // Not our channel: stash it for the matching consumer and keep reading.
       {
         std::lock_guard<std::mutex> lock(ch_mu_);
-        // Bound the per-channel buffer so an unconsumed channel cannot grow
-        // without limit. 64 MiB of pending frames is a generous ceiling for the
-        // wire-level max reassembled size.
-        static constexpr std::size_t kMaxPendingBytes = 64 * 1024 * 1024;
+        // Bound the buffered frames so unconsumed channels cannot grow memory
+        // without limit. The cap is shared across channels: a per-channel
+        // ceiling would let a peer multiply it by the number of channel_ids it
+        // chooses to spray (channel ids come from the wire, not us). 64 MiB of
+        // pending frames is a generous ceiling for the wire-level max
+        // reassembled size.
         auto& pending = pending_[flags_to_channel_id(r.value().flags)];
-        std::size_t bytes = r.value().message.size();
-        for (const auto& f : pending) bytes += f.message.size();
-        if (bytes > kMaxPendingBytes) {
+        pending_bytes_ += r.value().message.size();
+        if (pending_bytes_ > kMaxPendingBytes) {
+          pending_bytes_ -= r.value().message.size();
+          if (pending.empty()) pending_.erase(flags_to_channel_id(r.value().flags));
           return Status::queue_full("channel recv buffer full");
         }
         pending.push_back(std::move(r.value()));
@@ -194,6 +199,9 @@ class TcpPipe final : public Pipe {
   std::mutex ch_mu_;
   std::mutex read_mu_;
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
+  // Total bytes stashed in pending_ across all channels, guarded by ch_mu_.
+  static constexpr std::size_t kMaxPendingBytes = 64 * 1024 * 1024;
+  std::size_t pending_bytes_ = 0;
 };
 
 class TcpListener final : public Listener {
