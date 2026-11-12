@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <cerrno>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,33 +29,54 @@ namespace {
 
 #if !defined(_WIN32)
 
+// Socket ownership shared between the pipe and any in-flight send/recv. The
+// fd is only released when no io is registered against it, so close() can
+// shutdown() a blocked syscall without racing fd reuse (a closed fd number
+// can be handed to a new connection while a read still holds the old one).
+struct PipeIoState {
+  std::mutex mu;
+  std::condition_variable cv;
+  int fd = -1;
+  bool closing = false;
+  int active = 0;
+};
+
 class UdsPipe final : public Pipe {
  public:
-  explicit UdsPipe(int fd) : fd_(fd) {}
-  ~UdsPipe() override { close(); }
+  explicit UdsPipe(int fd) : io_(std::make_shared<PipeIoState>()) { io_->fd = fd; }
+  ~UdsPipe() override {
+    close();
+    // Wait for already-registered io to unwind before the shared state dies.
+    std::unique_lock<std::mutex> lock(io_->mu);
+    io_->cv.wait_for(lock, std::chrono::seconds(2), [&] { return io_->active == 0; });
+  }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
-    if (fd_ < 0) return Status::closed("pipe closed");
+    int fd;
+    if (!io_begin(&fd)) return Status::closed("pipe closed");
+    IoGuard guard{this};
 
     // Wait for writable if timeout is specified.
     if (opt.timeout.count() > 0) {
-      auto st = socket_utils::wait_writable(fd_, opt.timeout);
+      auto st = socket_utils::wait_writable(fd, opt.timeout);
       if (!st.ok()) return st;
     }
 
-    return wire::write_frame(fd_, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
+    return wire::write_frame(fd, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
-    if (fd_ < 0) return Status::closed("pipe closed");
+    int fd;
+    if (!io_begin(&fd)) return Status::closed("pipe closed");
+    IoGuard guard{this};
     // Serialize socket reads: concurrent recv() calls for different channels
     // must not interleave their raw frame reads on the same fd.
     std::lock_guard<std::mutex> lock(read_mu_);
     if (opt.timeout.count() > 0) {
-      auto st = socket_utils::wait_readable(fd_, opt.timeout);
+      auto st = socket_utils::wait_readable(fd, opt.timeout);
       if (!st.ok()) return st.status();
     }
-    return wire::read_frame_with_flags(fd_, opt.timeout);
+    return wire::read_frame_with_flags(fd, opt.timeout);
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
@@ -122,18 +144,31 @@ class UdsPipe final : public Pipe {
   }
 
   void close() override {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
+    int fd_to_shutdown = -1;
+    int fd_to_close = -1;
+    {
+      std::lock_guard<std::mutex> lock(io_->mu);
+      io_->closing = true;
+      if (io_->fd >= 0) {
+        fd_to_shutdown = io_->fd;
+        if (io_->active == 0) {
+          fd_to_close = io_->fd;
+          io_->fd = -1;
+        }
+      }
     }
+    if (fd_to_shutdown >= 0) ::shutdown(fd_to_shutdown, SHUT_RDWR);
+    if (fd_to_close >= 0) ::close(fd_to_close);
   }
 
   Result<PeerCredential> peer_credential() const override {
-    if (fd_ < 0) return Status::closed("pipe closed");
+    int fd;
+    if (!io_begin(&fd)) return Status::closed("pipe closed");
+    IoGuard guard{this};
 #if defined(SO_PEERCRED)
     struct ucred cred {};
     socklen_t len = sizeof(cred);
-    if (::getsockopt(fd_, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
       return Status::io_error("getsockopt(SO_PEERCRED) failed: " +
                               std::string(std::strerror(errno)));
     }
@@ -148,7 +183,38 @@ class UdsPipe final : public Pipe {
   }
 
  private:
-  int fd_ = -1;
+  // Register this io on the socket. Returns false once the pipe is closed; the
+  // captured fd stays open until io_end (via IoGuard), so close() can
+  // shutdown() to wake a blocked syscall without racing fd reuse. Both are
+  // const: they only mutate the shared state through the shared_ptr pointee.
+  bool io_begin(int* fd_out) const {
+    std::lock_guard<std::mutex> lock(io_->mu);
+    if (io_->closing || io_->fd < 0) return false;
+    ++io_->active;
+    *fd_out = io_->fd;
+    return true;
+  }
+
+  void io_end() const {
+    int fd_to_close = -1;
+    {
+      std::lock_guard<std::mutex> lock(io_->mu);
+      --io_->active;
+      if (io_->closing && io_->active == 0 && io_->fd >= 0) {
+        fd_to_close = io_->fd;
+        io_->fd = -1;
+      }
+    }
+    io_->cv.notify_all();
+    if (fd_to_close >= 0) ::close(fd_to_close);
+  }
+
+  struct IoGuard {
+    const UdsPipe* p;
+    ~IoGuard() { p->io_end(); }
+  };
+
+  std::shared_ptr<PipeIoState> io_;
   std::mutex ch_mu_;
   std::mutex read_mu_;
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;

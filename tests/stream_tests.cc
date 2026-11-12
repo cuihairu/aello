@@ -1228,3 +1228,109 @@ void test_channel_pending_cap_is_shared_across_channels() {
   run_channel_shared_cap_case("uds://duct_test_shared_cap");
 #endif
 }
+
+
+// close() on a pipe with a blocked recv must unblock that recv promptly with
+// kClosed. On POSIX, ::close() does not wake a thread blocked in read(): the
+// kernel holds the file reference until the read returns, and the freed fd
+// number can even be reused by a new connection mid-read. The transport must
+// shutdown() the socket (which does wake blocked reads) and defer the actual
+// close until the in-flight io unwinds.
+void run_close_unblocks_blocked_recv_case(const char* addr) {
+  auto lis_r = duct::listen(addr);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto fut = accepted.get_future();
+  auto* listener = lis_r.value().get();
+  std::thread accept_thread([&] { accepted.set_value(listener->accept()); });
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto client_r = duct::dial(addr_r.value(), dial_opt);
+  EXPECT_TRUE(client_r.ok());
+  if (!client_r.ok()) {
+    lis_r.value()->close();
+    accept_thread.join();
+    return;
+  }
+
+  auto server_r = fut.get();
+  EXPECT_TRUE(server_r.ok());
+  if (!server_r.ok()) {
+    client_r.value()->close();
+    lis_r.value()->close();
+    accept_thread.join();
+    return;
+  }
+
+  // Shared ownership: a recv thread that misses the deadline is detached and
+  // must not touch stack objects after the test frame returns.
+  auto client = std::shared_ptr<duct::Pipe>(std::move(client_r.value()));
+  auto server = std::shared_ptr<duct::Pipe>(std::move(server_r.value()));
+
+  struct RecvState {
+    std::atomic<bool> done{false};
+    duct::StatusCode code = duct::StatusCode::kOk;
+  };
+  auto state = std::make_shared<RecvState>();
+  // Capture by value (shared_ptr copies): a reader detached past the deadline
+  // must keep the pipe and state alive instead of touching a dangling ref.
+  std::thread reader([client, state] {
+    auto r = client->recv({});
+    state->code = r.ok() ? duct::StatusCode::kOk : r.status().code();
+    state->done.store(true, std::memory_order_release);
+  });
+
+  // Let the reader reach its blocking read, then close the pipe.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  client->close();
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!state->done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(state->done.load(std::memory_order_acquire));
+  if (state->done.load(std::memory_order_acquire)) {
+    reader.join();
+#if defined(_WIN32)
+    // On Windows close() uses closesocket() to wake a blocked recv, which
+    // surfaces as a socket error (WSAECONNABORTED) rather than the graceful EOF
+    // a POSIX shutdown() produces; either status means close unblocked the
+    // recv, which is the property under test.
+    EXPECT_TRUE(state->code == duct::StatusCode::kClosed ||
+                state->code == duct::StatusCode::kIoError);
+#else
+    EXPECT_EQ(state->code, duct::StatusCode::kClosed);
+#endif
+  } else {
+    // Stuck past the deadline: detach instead of joining so the process
+    // reports the failure rather than hanging on the join.
+    reader.detach();
+  }
+
+  client.reset();
+  server->close();
+  server.reset();
+  lis_r.value()->close();
+  accept_thread.join();
+}
+
+void test_tcp_close_unblocks_blocked_recv() {
+  run_close_unblocks_blocked_recv_case("tcp://127.0.0.1:0");
+}
+
+void test_uds_close_unblocks_blocked_recv() {
+#if defined(_WIN32)
+  return;
+#else
+  run_close_unblocks_blocked_recv_case("uds://duct_test_close_unblocks");
+#endif
+}

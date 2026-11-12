@@ -5,6 +5,7 @@
 #include "duct/wire.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -54,38 +55,78 @@ static void close_socket(wire::SocketHandle fd) {
 #endif
 }
 
+// Wake any send/recv blocked on the socket without releasing the fd number:
+// a blocked ::close(fd) does not interrupt the syscall (the kernel holds the
+// file reference), and once the number is freed a new connection can reuse
+// it mid-read. shutdown() delivers the wake-up while the fd stays owned.
+static void shutdown_socket(wire::SocketHandle fd) {
+#if defined(_WIN32)
+  ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+#else
+  ::shutdown(fd, SHUT_RDWR);
+#endif
+}
+
+// Socket ownership shared between the pipe and any in-flight send/recv. The
+// fd is only released when no io is registered against it, so close() can
+// shutdown() a blocked syscall without racing fd reuse. The state is shared so
+// an io on another thread can outlive the pipe object and close the socket
+// when the last one unwinds.
+struct PipeIoState {
+  std::mutex mu;
+  std::condition_variable cv;
+  wire::SocketHandle fd = wire::kInvalidSocket;
+  bool closing = false;
+  int active = 0;
+};
+
 class TcpPipe final : public Pipe {
  public:
   // handshake_ready: true when the server side already completed negotiation in
   // accept(). The client side performs it lazily on the first send/recv so a
   // blocking dial() does not deadlock before the peer calls accept().
   TcpPipe(wire::SocketHandle fd, bool handshake_ready = true)
-      : fd_(fd), handshake_ready_(handshake_ready) {
+      : io_(std::make_shared<PipeIoState>()), handshake_ready_(handshake_ready) {
+    io_->fd = fd;
     // Send the client's handshake eagerly (write-only, fire-and-forget). The
     // peer's accept() reads it whenever it runs, so this never deadlocks even
     // when accept() is called after dial() returns.
     if (!handshake_ready_) {
-      auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
+      auto hs = wire::handshake_client(io_->fd, /*capabilities=*/0);
       if (!hs.ok()) {
-        close_socket(fd_);
-        fd_ = wire::kInvalidSocket;
+        // Same discipline as close(): shutdown first, and let the last
+        // registered io (or close()) release the fd.
+        std::lock_guard<std::mutex> lock(io_->mu);
+        if (!io_->closing) {
+          io_->closing = true;
+          shutdown_socket(io_->fd);
+        }
       } else {
         handshake_ready_ = true;
       }
     }
   }
-  ~TcpPipe() override { close(); }
+  ~TcpPipe() override {
+    close();
+    // Wait for already-registered io to unwind before the shared state dies.
+    std::unique_lock<std::mutex> lock(io_->mu);
+    io_->cv.wait_for(lock, std::chrono::seconds(2), [&] { return io_->active == 0; });
+  }
 
   Result<void> send(const Message& msg, const SendOptions& opt) override {
-    if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
-    auto hs = ensure_handshake();
+    wire::SocketHandle fd;
+    if (!io_begin(&fd)) return Status::closed("pipe closed");
+    IoGuard guard{this};
+    auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs;
-    return wire::write_frame(fd_, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
+    return wire::write_frame(fd, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
-    if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
-    auto hs = ensure_handshake();
+    wire::SocketHandle fd;
+    if (!io_begin(&fd)) return Status::closed("pipe closed");
+    IoGuard guard{this};
+    auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs.status();
     // Serialize socket reads: channel demux is designed for concurrent recv()
     // on different channels, and a frame read is not atomic on the wire.
@@ -93,7 +134,7 @@ class TcpPipe final : public Pipe {
     // Transparently consume the server's kCtrl handshake reply; it is protocol
     // metadata, not an application frame.
     for (;;) {
-      auto r = wire::read_frame_with_flags(fd_, opt.timeout);
+      auto r = wire::read_frame_with_flags(fd, opt.timeout);
       if (!r.ok()) return r.status();
       if ((r.value().flags & to_u32(FrameFlags::kCtrl)) == 0) return r;
     }
@@ -174,19 +215,84 @@ class TcpPipe final : public Pipe {
   }
 
   void close() override {
-    if (fd_ != wire::kInvalidSocket) {
-      close_socket(fd_);
-      fd_ = wire::kInvalidSocket;
+#if defined(_WIN32)
+    // On Windows, closesocket() wakes a blocked recv/send and the kernel pins
+    // the socket object for the in-flight io, so closing immediately is safe
+    // (there is no POSIX-style fd-number-reuse race for the pending operation).
+    wire::SocketHandle fd = wire::kInvalidSocket;
+    {
+      std::lock_guard<std::mutex> lock(io_->mu);
+      io_->closing = true;
+      if (io_->fd != wire::kInvalidSocket) {
+        fd = io_->fd;
+        io_->fd = wire::kInvalidSocket;
+      }
     }
+    if (fd != wire::kInvalidSocket) close_socket(fd);
+#else
+    // On POSIX ::close() does not wake a blocked read and the freed fd number
+    // can be reused by a new connection mid-read, so shutdown() delivers the
+    // wake-up and the close is deferred to the last registered io.
+    wire::SocketHandle fd_to_shutdown = wire::kInvalidSocket;
+    wire::SocketHandle fd_to_close = wire::kInvalidSocket;
+    {
+      std::lock_guard<std::mutex> lock(io_->mu);
+      io_->closing = true;
+      if (io_->fd != wire::kInvalidSocket) {
+        fd_to_shutdown = io_->fd;
+        if (io_->active == 0) {
+          fd_to_close = io_->fd;
+          io_->fd = wire::kInvalidSocket;
+        }
+      }
+    }
+    if (fd_to_shutdown != wire::kInvalidSocket) shutdown_socket(fd_to_shutdown);
+    if (fd_to_close != wire::kInvalidSocket) close_socket(fd_to_close);
+#endif
   }
 
  private:
-  Result<void> ensure_handshake() {
+  // Register this io on the socket. Returns false once the pipe is closed; the
+  // captured fd stays open until io_end (via IoGuard), so close() can
+  // shutdown() to wake a blocked syscall without racing fd reuse.
+  bool io_begin(wire::SocketHandle* fd_out) {
+    std::lock_guard<std::mutex> lock(io_->mu);
+    if (io_->closing || io_->fd == wire::kInvalidSocket) return false;
+    ++io_->active;
+    *fd_out = io_->fd;
+    return true;
+  }
+
+  void io_end() {
+    wire::SocketHandle fd_to_close = wire::kInvalidSocket;
+    {
+      std::lock_guard<std::mutex> lock(io_->mu);
+      --io_->active;
+      if (io_->closing && io_->active == 0 && io_->fd != wire::kInvalidSocket) {
+        fd_to_close = io_->fd;
+        io_->fd = wire::kInvalidSocket;
+      }
+    }
+    io_->cv.notify_all();
+    if (fd_to_close != wire::kInvalidSocket) close_socket(fd_to_close);
+  }
+
+  struct IoGuard {
+    TcpPipe* p;
+    ~IoGuard() { p->io_end(); }
+  };
+
+  Result<void> ensure_handshake(wire::SocketHandle fd) {
     if (!handshake_ready_) {
-      auto hs = wire::handshake_client(fd_, /*capabilities=*/0);
+      auto hs = wire::handshake_client(fd, /*capabilities=*/0);
       if (!hs.ok()) {
-        close_socket(fd_);
-        fd_ = wire::kInvalidSocket;
+        // Shutdown the socket so any io blocked elsewhere wakes; the fd is
+        // released by the last registered io (or close()).
+        std::lock_guard<std::mutex> lock(io_->mu);
+        if (!io_->closing) {
+          io_->closing = true;
+          shutdown_socket(io_->fd);
+        }
         return hs;
       }
       handshake_ready_ = true;
@@ -194,7 +300,7 @@ class TcpPipe final : public Pipe {
     return {};
   }
 
-  wire::SocketHandle fd_ = wire::kInvalidSocket;
+  std::shared_ptr<PipeIoState> io_;
   bool handshake_ready_ = true;
   std::mutex ch_mu_;
   std::mutex read_mu_;
