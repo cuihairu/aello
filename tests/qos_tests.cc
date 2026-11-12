@@ -739,7 +739,11 @@ void test_qos_channel_multiplexing() {
     auto p = lis_r.value()->accept();
     if (!p.ok()) return p.status();
     duct::RecvOptions opt;
-    opt.timeout = std::chrono::milliseconds(500);
+    // Generous per-recv window: under wine/emulated sockets the client's
+    // "quit" can land later than 500ms after the echo round-trip, and a
+    // timeout here fails the test spuriously. Deadline bounding itself is
+    // covered by test_tcp_channel_recv_deadline_bounded.
+    opt.timeout = std::chrono::milliseconds(5000);
     for (;;) {
       auto msg = p.value()->recv(opt);
       if (!msg.ok()) return msg.status();
