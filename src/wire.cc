@@ -441,4 +441,55 @@ Result<std::uint32_t> handshake_server(SocketHandle fd, std::uint32_t server_cap
   return client_caps;
 }
 
+Result<std::uint32_t> handshake_server_stoppable(
+    SocketHandle fd, std::uint32_t server_capabilities,
+    std::chrono::milliseconds timeout, const std::atomic<bool>& stop) {
+  // Slice the handshake read into 100ms windows: the stop flag must be
+  // observed even while no bytes arrive (a blocked recv is not woken by
+  // close() on POSIX). The overall handshake deadline still bounds the wait.
+  // Note: a timeout that fires on a partial frame poisons this connection —
+  // the listener discards it, same as the unsliced variant's midframe timeout.
+  const bool has_deadline = timeout.count() > 0;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    if (stop.load(std::memory_order_acquire)) {
+      return Status::closed("listener closed");
+    }
+    std::chrono::milliseconds slice(100);
+    if (has_deadline) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) return Status::timeout("handshake timed out");
+      slice = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      if (slice <= std::chrono::milliseconds::zero()) {
+        return Status::timeout("handshake timed out");
+      }
+      if (slice > std::chrono::milliseconds(100)) slice = std::chrono::milliseconds(100);
+    }
+    auto r = read_frame_with_flags(fd, slice);
+    if (r.ok()) {
+      const auto& sv = r.value().message.as_string_view();
+      if (sv.size() != kHandshakeLen) {
+        return Status::protocol_error("handshake length mismatch");
+      }
+      if (static_cast<std::uint8_t>(sv[0]) != kProtocolVersion) {
+        return Status::protocol_error("unsupported protocol version");
+      }
+      std::uint32_t client_caps = 0;
+      std::memcpy(&client_caps, sv.data() + 1, sizeof(client_caps));
+      if (stop.load(std::memory_order_acquire)) {
+        return Status::closed("listener closed");
+      }
+      std::uint8_t reply[kHandshakeLen] = {};
+      reply[0] = kProtocolVersion;
+      std::memcpy(reply + 1, &server_capabilities, sizeof(server_capabilities));
+      auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
+                            to_u32(FrameFlags::kCtrl), timeout);
+      if (!ws.ok()) return ws.status();
+      return client_caps;
+    }
+    if (r.status().code() == StatusCode::kTimeout) continue;  // slice elapsed
+    return r.status();
+  }
+}
+
 }  // namespace duct::wire

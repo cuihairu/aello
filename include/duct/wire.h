@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -67,6 +68,15 @@ Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
 Result<std::uint32_t> handshake_server(
     SocketHandle fd, std::uint32_t server_capabilities,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+
+// Stop-aware variant of handshake_server(): the client handshake read is
+// sliced in 100ms windows, so a silent client (connected but never writing the
+// handshake) cannot pin accept() past a listener close — a blocked recv is not
+// woken by close() on POSIX. Returns kClosed as soon as `stop` is observed
+// set. The overall handshake deadline still bounds the wait.
+Result<std::uint32_t> handshake_server_stoppable(
+    SocketHandle fd, std::uint32_t server_capabilities,
+    std::chrono::milliseconds timeout, const std::atomic<bool>& stop);
 
 }  // namespace duct::wire
 

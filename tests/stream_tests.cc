@@ -1,6 +1,18 @@
 #include "test_support.h"
 #include "stream_tests.h"
 
+#include <string>
+
+#if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <cstdlib>
+#include <cstring>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+
 
 void test_uds_echo_one() {
 #if !defined(_WIN32)
@@ -1454,5 +1466,124 @@ void test_uds_close_unblocks_blocked_recv() {
   return;
 #else
   run_close_unblocks_blocked_recv_case("uds://duct_test_close_unblocks");
+#endif
+}
+
+
+#if !defined(_WIN32)
+// Connect a raw TCP socket to a tcp://host:port address without sending
+// anything. Returns the fd, or -1 on failure (expect already reported).
+static int raw_tcp_connect(const std::string& url) {
+  const auto colon = url.rfind(':');
+  if (colon == std::string::npos) return -1;
+  const int port = std::atoi(url.c_str() + colon + 1);
+  if (port <= 0 || port > 65535) return -1;
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  struct sockaddr_in addr {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<std::uint16_t>(port));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+#endif
+
+// A silent client (connected but never writing the handshake) must not pin
+// tcp listener accept() past a close(): the handshake read is stop-aware, so
+// accept() returns kClosed promptly instead of waiting out the full handshake
+// timeout. UDS has no handshake phase — its close-interruptibility is covered
+// by the bare-accept cases below.
+void run_tcp_listener_close_unblocks_silent_client_case() {
+#if defined(_WIN32)
+  return;
+#else
+  auto lis_r = duct::listen("tcp://127.0.0.1:0");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  auto addr_r = lis_r.value()->local_address();
+  EXPECT_TRUE(addr_r.ok());
+  if (!addr_r.ok()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // Silent client: connect but never write the handshake.
+  const int cfd = raw_tcp_connect(addr_r.value());
+  EXPECT_TRUE(cfd >= 0);
+  if (cfd < 0) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // Deliberately heap-allocated: a stuck accept (regression) must not hang the
+  // suite via the std::async destructor join.
+  auto* acc = new std::future<duct::Result<std::unique_ptr<duct::Pipe>>>(
+      std::async(std::launch::async, [&]() { return lis_r.value()->accept(); }));
+  // Let accept() take the connection and enter the handshake read.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  lis_r.value()->close();
+  auto st = acc->wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(st == std::future_status::ready);
+  if (st == std::future_status::ready) {
+    auto r = acc->get();
+    delete acc;
+    EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+  ::close(cfd);
+#endif
+}
+
+void test_tcp_listener_close_unblocks_silent_client_accept() {
+  run_tcp_listener_close_unblocks_silent_client_case();
+}
+
+
+// close() must wake a bare accept() (no client at all): the listener wait is
+// sliced, so accept() returns kClosed promptly instead of hanging forever in
+// an uninterruptible ::accept(2).
+void run_listener_close_unblocks_bare_accept_case(const char* url) {
+  auto lis_r = duct::listen(url);
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Deliberately heap-allocated: a stuck accept (regression) must not hang the
+  // suite via the std::async destructor join.
+  auto* acc = new std::future<duct::Result<std::unique_ptr<duct::Pipe>>>(
+      std::async(std::launch::async, [&]() { return lis_r.value()->accept(); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  lis_r.value()->close();
+  auto st = acc->wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(st == std::future_status::ready);
+  if (st == std::future_status::ready) {
+    auto r = acc->get();
+    delete acc;
+    EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+}
+
+void test_tcp_listener_close_unblocks_bare_accept() {
+  run_listener_close_unblocks_bare_accept_case("tcp://127.0.0.1:0");
+}
+
+void test_uds_listener_close_unblocks_bare_accept() {
+#if defined(_WIN32)
+  return;
+#else
+  std::string path = "/tmp/duct_uds_bclose_" + std::to_string(::getpid()) + ".sock";
+  ::unlink(path.c_str());
+  run_listener_close_unblocks_bare_accept_case(("uds://" + path).c_str());
+  ::unlink(path.c_str());
 #endif
 }

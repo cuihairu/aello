@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <cerrno>
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -22,6 +23,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #endif
 
 namespace duct {
@@ -247,42 +249,139 @@ class UdsPipe final : public Pipe {
   std::size_t pending_zero_len_ = 0;
 };
 
+// Listener socket ownership shared with in-flight accept() calls, mirroring
+// the shm bootstrap listener: close() cannot wake a blocked ::accept(2), so
+// accept() slices its wait and re-checks `closing` every 100ms; the fd is
+// only released when no accept is registered against it (close defers the
+// release to the last registered accept).
+struct UdsListenerState {
+  std::mutex mu;
+  std::condition_variable cv;
+  int fd = -1;
+  bool closing = false;
+  std::atomic<int> active_accepts{0};
+};
+
 class UdsListener final : public Listener {
  public:
-  UdsListener(int fd, std::string path) : fd_(fd), path_(std::move(path)) {}
+  UdsListener(int fd, std::string path)
+      : state_(std::make_shared<UdsListenerState>()), path_(std::move(path)) {
+    state_->fd = fd;
+  }
 
-  ~UdsListener() override { close(); }
+  ~UdsListener() override {
+    close();
+    // Wait for already-registered accepts to unwind before the shared state
+    // (and possibly the fd) dies.
+    std::unique_lock<std::mutex> lock(state_->mu);
+    state_->cv.wait_for(lock, std::chrono::seconds(2),
+                        [&] { return state_->active_accepts.load() == 0; });
+  }
+
+  // Decrement the in-flight accept count and wake the destructor's wait.
+  // Every accept() return path calls this exactly once after registering.
+  static void finish_accept(const std::shared_ptr<UdsListenerState>& s) {
+    int fd_to_close = -1;
+    {
+      std::lock_guard<std::mutex> lock(s->mu);
+      const int prev = s->active_accepts.fetch_sub(1, std::memory_order_acq_rel);
+      if (prev == 1 && s->closing && s->fd >= 0) {
+        fd_to_close = s->fd;
+        s->fd = -1;
+      }
+    }
+    if (fd_to_close >= 0) ::close(fd_to_close);
+    s->cv.notify_all();
+  }
 
   Result<std::unique_ptr<Pipe>> accept() override {
-    if (fd_ < 0) return Status::closed("listener closed");
+    auto state = state_;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (state->closing) return Status::closed("listener closed");
+      state->active_accepts.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    int cfd = ::accept(fd_, nullptr, nullptr);
-    if (cfd < 0) {
-      return Status::io_error("accept() failed");
+    // Slice the listener wait: close() cannot wake a blocked ::accept(2).
+    int cfd = -1;
+    bool stopped = false;
+    for (;;) {
+      int lfd;
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (state->closing) {
+          stopped = true;
+          break;
+        }
+        lfd = state->fd;
+      }
+      if (lfd < 0) {
+        stopped = true;
+        break;
+      }
+      struct pollfd p;
+      p.fd = lfd;
+      p.events = POLLIN;
+      p.revents = 0;
+      const int rc = ::poll(&p, 1, 100);
+      if (rc < 0) {
+        if (errno == EINTR) continue;
+        finish_accept(state);
+        return Status::io_error("poll(uds listener) failed");
+      }
+      if (rc == 0) continue;  // slice elapsed: re-check closing
+      cfd = ::accept(lfd, nullptr, nullptr);
+      if (cfd < 0) {
+        const int e = errno;
+        // A concurrent accept may have consumed the connection between our
+        // poll wake and ::accept(2); retry in that case.
+        if (e == EINTR || e == ECONNABORTED || e == EAGAIN || e == EWOULDBLOCK) {
+          continue;
+        }
+        finish_accept(state);
+        return Status::io_error("accept() failed");
+      }
+      break;
+    }
+    if (stopped) {
+      finish_accept(state);
+      return Status::closed("listener closed during accept");
     }
 #if defined(__APPLE__)
     int one = 1;
     (void)::setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+    finish_accept(state);
     return std::unique_ptr<Pipe>(new UdsPipe(cfd));
   }
 
   Result<std::string> local_address() const override {
-    if (fd_ < 0) return Status::closed("listener closed");
+    std::lock_guard<std::mutex> lock(state_->mu);
+    if (state_->fd < 0) return Status::closed("listener closed");
     return std::string("uds://") + path_;
   }
 
   void close() override {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
-      // Remove the socket file to allow rebinding.
-      ::unlink(path_.c_str());
+    int fd_to_close = -1;
+    {
+      std::lock_guard<std::mutex> lock(state_->mu);
+      if (state_->closing) return;
+      state_->closing = true;
+      if (state_->fd >= 0 && state_->active_accepts.load() == 0) {
+        // No accept in flight: this thread owns the fd release. Otherwise the
+        // last registered accept releases it in finish_accept.
+        fd_to_close = state_->fd;
+        state_->fd = -1;
+      }
     }
+    if (fd_to_close >= 0) ::close(fd_to_close);
+    // Remove the socket file to allow rebinding.
+    ::unlink(path_.c_str());
+    state_->cv.notify_all();
   }
 
  private:
-  int fd_ = -1;
+  std::shared_ptr<UdsListenerState> state_;
   std::string path_;
 };
 

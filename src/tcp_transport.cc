@@ -4,6 +4,7 @@
 #include "duct/socket_utils.h"
 #include "duct/wire.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -333,23 +334,120 @@ class TcpPipe final : public Pipe {
   std::size_t pending_zero_len_ = 0;
 };
 
+// Listener socket ownership shared with in-flight accept() calls. close()
+// cannot wake a blocked ::accept(2) on POSIX (the kernel holds the file
+// reference; the fd number could even be reused by a new connection), so
+// accept() slices its wait and re-checks `closing` every 100ms. The fd is
+// only released when no accept is registered against it: close() defers the
+// release to the last registered accept's finish_accept.
+struct TcpListenerState {
+  std::mutex mu;
+  std::condition_variable cv;
+  wire::SocketHandle fd = wire::kInvalidSocket;
+  std::atomic<bool> closing{false};
+  std::atomic<int> active_accepts{0};
+};
+
 class TcpListener final : public Listener {
  public:
   TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port,
               std::chrono::milliseconds handshake_timeout)
-      : fd_(fd), host_(std::move(host)), port_(port), handshake_timeout_(handshake_timeout) {}
-  ~TcpListener() override { close(); }
+      : state_(std::make_shared<TcpListenerState>()),
+        host_(std::move(host)),
+        port_(port),
+        handshake_timeout_(handshake_timeout) {
+    state_->fd = fd;
+  }
+  ~TcpListener() override {
+    close();
+    // Wait for already-registered accepts to unwind before the shared state
+    // (and possibly the fd) dies.
+    std::unique_lock<std::mutex> lock(state_->mu);
+    state_->cv.wait_for(lock, std::chrono::seconds(2),
+                        [&] { return state_->active_accepts.load() == 0; });
+  }
+
+  // Decrement the in-flight accept count and wake the destructor's wait.
+  // Every accept() return path calls this exactly once after registering.
+  // When the last accept unwinds after close(), it owns the fd release.
+  static void finish_accept(const std::shared_ptr<TcpListenerState>& s) {
+    wire::SocketHandle fd_to_close = wire::kInvalidSocket;
+    {
+      std::lock_guard<std::mutex> lock(s->mu);
+      int prev = s->active_accepts.fetch_sub(1, std::memory_order_acq_rel);
+      if (prev == 1 && s->closing.load(std::memory_order_acquire) &&
+          s->fd != wire::kInvalidSocket) {
+        fd_to_close = s->fd;
+        s->fd = wire::kInvalidSocket;
+      }
+    }
+    if (fd_to_close != wire::kInvalidSocket) close_socket(fd_to_close);
+    s->cv.notify_all();
+  }
 
   Result<std::unique_ptr<Pipe>> accept() override {
-    if (fd_ == wire::kInvalidSocket) return Status::closed("listener closed");
-#if defined(_WIN32)
-    auto cfd = static_cast<wire::SocketHandle>(::accept(static_cast<SOCKET>(fd_), nullptr, nullptr));
-#else
-    auto cfd = static_cast<wire::SocketHandle>(::accept(fd_, nullptr, nullptr));
-#endif
-    if (cfd == wire::kInvalidSocket) {
-      return Status::io_error("accept() failed");
+    auto state = state_;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (state->closing.load(std::memory_order_acquire)) {
+        return Status::closed("listener closed");
+      }
+      state->active_accepts.fetch_add(1, std::memory_order_relaxed);
     }
+
+    // Slice the listener wait: a blocked ::accept(2) cannot be woken by
+    // close() on POSIX, so poll in 100ms slices and re-check `closing` (and
+    // re-read the fd under the lock) at least once per slice.
+    wire::SocketHandle cfd = wire::kInvalidSocket;
+    bool stopped = false;
+    for (;;) {
+      wire::SocketHandle lfd;
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (state->closing.load(std::memory_order_acquire)) {
+          stopped = true;
+          break;
+        }
+        lfd = state->fd;
+      }
+      if (lfd == wire::kInvalidSocket) {
+        stopped = true;
+        break;
+      }
+      auto wr = socket_utils::wait_readable(lfd, std::chrono::milliseconds(100));
+      if (!wr.ok()) {
+        if (wr.status().code() == StatusCode::kTimeout) continue;  // slice elapsed
+        finish_accept(state);
+        return wr.status();
+      }
+#if defined(_WIN32)
+      cfd = static_cast<wire::SocketHandle>(
+          ::accept(static_cast<SOCKET>(lfd), nullptr, nullptr));
+#else
+      cfd = static_cast<wire::SocketHandle>(::accept(lfd, nullptr, nullptr));
+#endif
+      if (cfd == wire::kInvalidSocket) {
+#if defined(_WIN32)
+        finish_accept(state);
+        return Status::io_error("accept() failed");
+#else
+        const int e = errno;
+        // A concurrent accept may have consumed the connection between our
+        // poll wake and ::accept(2); retry in that case.
+        if (e == EINTR || e == ECONNABORTED || e == EAGAIN || e == EWOULDBLOCK) {
+          continue;
+        }
+        finish_accept(state);
+        return Status::io_error("accept() failed");
+#endif
+      }
+      break;
+    }
+    if (stopped) {
+      finish_accept(state);
+      return Status::closed("listener closed during accept");
+    }
+
     // Disable Nagle on the accepted socket so echo replies are not delayed by
     // up to 40ms (delayed ACK + Nagle) on every small round-trip. The dial side
     // already sets TCP_NODELAY; the accept side must match.
@@ -361,28 +459,43 @@ class TcpListener final : public Listener {
 #else
     (void)::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #endif
-    auto hs = wire::handshake_server(cfd, /*server_capabilities=*/0, handshake_timeout_);
+    // Stop-aware handshake: a silent client (connected but never writing the
+    // handshake) must not pin accept() past a listener close.
+    auto hs = wire::handshake_server_stoppable(cfd, /*server_capabilities=*/0,
+                                               handshake_timeout_, state->closing);
     if (!hs.ok()) {
       close_socket(cfd);
+      finish_accept(state);
       return hs.status();
     }
+    finish_accept(state);
     return std::unique_ptr<Pipe>(new TcpPipe(cfd, /*handshake_ready=*/true));
   }
 
   Result<std::string> local_address() const override {
-    if (fd_ == wire::kInvalidSocket) return Status::closed("listener closed");
+    if (state_->fd == wire::kInvalidSocket) return Status::closed("listener closed");
     return std::string("tcp://") + (host_.empty() ? "127.0.0.1" : host_) + ":" + std::to_string(port_);
   }
 
   void close() override {
-    if (fd_ != wire::kInvalidSocket) {
-      close_socket(fd_);
-      fd_ = wire::kInvalidSocket;
+    wire::SocketHandle fd_to_close = wire::kInvalidSocket;
+    {
+      std::lock_guard<std::mutex> lock(state_->mu);
+      if (state_->closing.exchange(true, std::memory_order_acq_rel)) return;
+      if (state_->fd != wire::kInvalidSocket &&
+          state_->active_accepts.load(std::memory_order_acquire) == 0) {
+        // No accept in flight: this thread owns the fd release. Otherwise the
+        // last registered accept releases it in finish_accept.
+        fd_to_close = state_->fd;
+        state_->fd = wire::kInvalidSocket;
+      }
     }
+    if (fd_to_close != wire::kInvalidSocket) close_socket(fd_to_close);
+    state_->cv.notify_all();
   }
 
  private:
-  wire::SocketHandle fd_ = wire::kInvalidSocket;
+  std::shared_ptr<TcpListenerState> state_;
   std::string host_;
   std::uint16_t port_ = 0;
   std::chrono::milliseconds handshake_timeout_{5000};
