@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <random>
 #include <string>
@@ -376,9 +378,11 @@ static Result<ShmHandles> open_resources(const ShmNames& n, const ShmOptions& ex
 // client sends 16-byte connid, server opens the corresponding shared resources.
 // 启动握手使用命名管道：客户端发送 16 字节 connid，服务端据此打开对应共享资源。
 static Result<HANDLE> create_bootstrap_pipe(const std::string& path) {
+  // FILE_FLAG_OVERLAPPED so accept() can wait on {connect event, stop event}
+  // and close() can interrupt a pending accept (see ShmListener).
   HANDLE pipe = CreateNamedPipeA(
       path.c_str(),
-      PIPE_ACCESS_DUPLEX,
+      PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
       PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
       1,    // Max instances
       512,  // Out buffer size
@@ -527,14 +531,68 @@ class ShmPipe final : public Pipe {
   bool is_client_ = false;
 };
 
+// Listener state shared between the ShmListener and any in-flight accept().
+// The bootstrap handle is swapped OUT of the state before accept() waits, so
+// close() never closes a handle an accept is using; stopping is signalled via
+// stop_event instead.
+struct ShmListenerState {
+  std::mutex mu;
+  HANDLE bootstrap_pipe = INVALID_HANDLE_VALUE;
+  HANDLE stop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  bool closing = false;
+  std::atomic<int> active_accepts{0};
+  std::condition_variable cv;
+
+  ~ShmListenerState() {
+    if (stop_event != NULL) CloseHandle(stop_event);
+  }
+};
+
 class ShmListener final : public Listener {
  public:
   ShmListener(ShmNames names, HANDLE bootstrap_pipe, ShmOptions expected)
-      : names_(std::move(names)), bootstrap_pipe_(bootstrap_pipe), expected_(expected) {}
-  ~ShmListener() override { close(); }
+      : state_(std::make_shared<ShmListenerState>()),
+        names_(std::move(names)),
+        expected_(expected) {
+    state_->bootstrap_pipe = bootstrap_pipe;
+  }
+  ~ShmListener() override {
+    close();
+    // Wait for already-registered accepts, but do not destroy state they still
+    // need if one is pathologically slow. The shared state (including the stop
+    // event) lives until the last accept() returns.
+    auto state = state_;
+    std::unique_lock<std::mutex> lock(state->mu);
+    state->cv.wait_for(lock, std::chrono::seconds(2),
+                       [&] { return state->active_accepts.load() == 0; });
+  }
+
+  // Decrement the in-flight accept count and wake the destructor's wait. Every
+  // accept() return path calls this exactly once after the increment.
+  static void finish_accept(const std::shared_ptr<ShmListenerState>& state) {
+    state->active_accepts.fetch_sub(1, std::memory_order_release);
+    state->cv.notify_all();
+  }
 
   Result<std::unique_ptr<Pipe>> accept() override {
-    if (bootstrap_pipe_ == INVALID_HANDLE_VALUE) {
+    auto state = state_;
+
+    // Take the bootstrap handle out under the lock so close() cannot close a
+    // handle this accept is about to block on.
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (state->closing || state->stop_event == NULL) {
+        return Status::closed("listener closed");
+      }
+      pipe = state->bootstrap_pipe;
+      state->bootstrap_pipe = INVALID_HANDLE_VALUE;
+      state->active_accepts.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (pipe == INVALID_HANDLE_VALUE) {
+      // Instance already consumed (or recreate failed previously); preserve
+      // the pre-existing closed-by-design return here.
+      finish_accept(state);
       return Status::closed("listener closed");
     }
 
@@ -545,24 +603,98 @@ class ShmListener final : public Listener {
     // disconnects; ConnectNamedPipe then reports an error even though the
     // handshake bytes are already buffered in the pipe. The failure is not
     // fatal by itself: ReadFile below decides whether the connid arrived, so
-    // the return value is deliberately not checked here.
-    HANDLE pipe = bootstrap_pipe_;
-    ConnectNamedPipe(pipe, NULL);
+    // non-pending connect errors are deliberately not fatal here.
+    HANDLE ev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (ev == NULL) {
+      CloseHandle(pipe);
+      finish_accept(state);
+      return Status::io_error("CreateEvent failed");
+    }
+    OVERLAPPED connect_ov{};
+    connect_ov.hEvent = ev;
+    BOOL connected = ConnectNamedPipe(pipe, &connect_ov);
+    DWORD connect_error = connected ? ERROR_SUCCESS : GetLastError();
 
-    // Read connection ID from client.
+    if (connect_error == ERROR_IO_PENDING) {
+      HANDLE waits[2] = { ev, state->stop_event };
+      DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+      if (w != WAIT_OBJECT_0) {
+        // stop_event signalled (or wait failed): the listener is closing.
+        // Cancel the pending connect and wait for it to unwind before
+        // releasing the handle.
+        CancelIoEx(pipe, &connect_ov);
+        DWORD n = 0;
+        GetOverlappedResult(pipe, &connect_ov, &n, TRUE);
+        CloseHandle(ev);
+        CloseHandle(pipe);
+        finish_accept(state);
+        return Status::closed("listener closed during accept");
+      }
+      DWORD n = 0;
+      if (!GetOverlappedResult(pipe, &connect_ov, &n, FALSE)) {
+        CloseHandle(ev);
+        CloseHandle(pipe);
+        finish_accept(state);
+        return Status::io_error("ConnectNamedPipe failed with error: " +
+                                std::to_string(GetLastError()));
+      }
+    } else if (connect_error != ERROR_SUCCESS &&
+               connect_error != ERROR_PIPE_CONNECTED &&
+               connect_error != ERROR_NO_DATA) {
+      // ERROR_NO_DATA means the client connected and left before
+      // ConnectNamedPipe ran; buffered handshake bytes may still be readable.
+      CloseHandle(ev);
+      CloseHandle(pipe);
+      finish_accept(state);
+      return Status::io_error("ConnectNamedPipe failed with error: " +
+                              std::to_string(connect_error));
+    }
+    CloseHandle(ev);
+
+    // Read connection ID from client (overlapped, stoppable).
     // 读取客户端发送的 connid。
     char connid[16];
     DWORD bytes_read = 0;
-    BOOL read_ok = ReadFile(pipe, connid, sizeof(connid), &bytes_read, NULL);
+    BOOL read_ok = FALSE;
+    HANDLE rev = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (rev == NULL) {
+      CloseHandle(pipe);
+      finish_accept(state);
+      return Status::io_error("CreateEvent failed");
+    }
+    OVERLAPPED read_ov{};
+    read_ov.hEvent = rev;
+    read_ok = ReadFile(pipe, connid, sizeof(connid), &bytes_read, &read_ov);
+    DWORD read_error = read_ok ? ERROR_SUCCESS : GetLastError();
+    if (read_error == ERROR_IO_PENDING) {
+      HANDLE waits[2] = { rev, state->stop_event };
+      DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+      if (w != WAIT_OBJECT_0) {
+        CancelIoEx(pipe, &read_ov);
+        DWORD n = 0;
+        GetOverlappedResult(pipe, &read_ov, &n, TRUE);
+        CloseHandle(rev);
+        CloseHandle(pipe);
+        finish_accept(state);
+        return Status::closed("listener closed during accept");
+      }
+      read_ok = GetOverlappedResult(pipe, &read_ov, &bytes_read, FALSE);
+    }
+    CloseHandle(rev);
     CloseHandle(pipe);
-    bootstrap_pipe_ = INVALID_HANDLE_VALUE;
 
     // Recreate bootstrap pipe instance for subsequent accepts.
     // 为后续 accept() 重新创建管道实例（本实现一次只接受一个并发连接）。
     auto next = create_bootstrap_pipe(names_.bootstrap_pipe);
-    if (next.ok()) {
-      bootstrap_pipe_ = next.value();
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (next.ok() && !state->closing) {
+        state->bootstrap_pipe = next.value();
+      } else if (next.ok()) {
+        CloseHandle(next.value());
+      }
     }
+    finish_accept(state);
 
     if (!read_ok || bytes_read != sizeof(connid)) {
       return Status::io_error("Failed to read connection ID");
@@ -581,15 +713,21 @@ class ShmListener final : public Listener {
   }
 
   void close() override {
-    if (bootstrap_pipe_ != INVALID_HANDLE_VALUE) {
-      CloseHandle(bootstrap_pipe_);
-      bootstrap_pipe_ = INVALID_HANDLE_VALUE;
+    auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mu);
+    if (state->closing) return;
+    state->closing = true;
+    if (state->bootstrap_pipe != INVALID_HANDLE_VALUE) {
+      // Safe to close here: accept() swapped the handle out before waiting.
+      CloseHandle(state->bootstrap_pipe);
+      state->bootstrap_pipe = INVALID_HANDLE_VALUE;
     }
+    if (state->stop_event != NULL) SetEvent(state->stop_event);
   }
 
  private:
+  std::shared_ptr<ShmListenerState> state_;
   ShmNames names_;
-  HANDLE bootstrap_pipe_ = INVALID_HANDLE_VALUE;
   ShmOptions expected_{};
 };
 

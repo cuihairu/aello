@@ -9,6 +9,7 @@ void test_shm_backpressure_timeout();
 void test_shm_burst_without_receiver();
 void test_shm_dial_timeout_honored();
 void test_shm_dial_positive_timeout_path();
+void test_shm_accept_unblocks_on_listener_close();
 void test_shm_fragmentation_and_reassembly();
 void test_shm_reassembly_size_capped();
 void test_shm_first_chunk_size_capped();

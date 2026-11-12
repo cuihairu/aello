@@ -17,6 +17,7 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,8 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
 #include <dirent.h>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <poll.h>
 #include <random>
 #include <signal.h>
 #include <string>
@@ -724,42 +727,145 @@ class ShmPipe final : public Pipe {
   bool is_client_ = false;
 };
 
+// Listener state shared between the ShmListener and any in-flight accept().
+// The bootstrap fd is only closed when no accept() is registered against it,
+// so close() can never yank the fd out from under a blocked accept (a closed
+// listen fd does not wake ::accept(2), and the fd number could be reused by an
+// unrelated connection).
+struct ShmListenerState {
+  std::mutex mu;
+  std::condition_variable cv;
+  int fd = -1;
+  bool closing = false;
+  std::atomic<int> active_accepts{0};
+};
+
 class ShmListener final : public Listener {
  public:
   ShmListener(ShmNames names, int fd, ShmOptions expected)
-      : names_(std::move(names)), fd_(fd), expected_(expected) {}
-  ~ShmListener() override { close(); }
+      : state_(std::make_shared<ShmListenerState>()),
+        names_(std::move(names)),
+        expected_(expected) {
+    state_->fd = fd;
+  }
+  ~ShmListener() override {
+    close();
+    // Wait for already-registered accepts, but do not destroy state they still
+    // need if one is pathologically slow. The shared state (and the fd) live
+    // until the last accept() unwinds; that accept closes the fd when closing
+    // is already set.
+    auto state = state_;
+    std::unique_lock<std::mutex> lock(state->mu);
+    state->cv.wait_for(lock, std::chrono::seconds(2),
+                       [&] { return state->active_accepts.load() == 0; });
+  }
+
+  // Decrement the in-flight accept count and wake the destructor's wait. Every
+  // accept() return path calls this exactly once after the increment. When the
+  // last accept unwinds after close(), it owns the fd release.
+  static void finish_accept(const std::shared_ptr<ShmListenerState>& s) {
+    int fd_to_close = -1;
+    {
+      std::lock_guard<std::mutex> lock(s->mu);
+      int prev = s->active_accepts.fetch_sub(1, std::memory_order_acq_rel);
+      if (prev == 1 && s->closing && s->fd >= 0) {
+        fd_to_close = s->fd;
+        s->fd = -1;
+      }
+    }
+    if (fd_to_close >= 0) ::close(fd_to_close);
+    s->cv.notify_all();
+  }
 
   Result<std::unique_ptr<Pipe>> accept() override {
-    if (fd_ < 0) return Status::closed("listener closed");
-    int cfd = ::accept(fd_, nullptr, nullptr);
-    if (cfd < 0) return Status::io_error("accept(uds bootstrap) failed" + errno_suffix());
+    auto state = state_;
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (state->closing) return Status::closed("listener closed");
+      state->active_accepts.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Poll in bounded slices instead of blocking in ::accept(2): a blocked
+    // accept cannot be woken by close() (and closing the fd under it would
+    // race fd reuse), so check `closing` at least every 100ms.
+    int cfd = -1;
+    bool stopped = false;
+    for (;;) {
+      int lfd;
+      {
+        std::lock_guard<std::mutex> lock(state->mu);
+        if (state->closing) {
+          stopped = true;
+          break;
+        }
+        lfd = state->fd;
+      }
+      struct pollfd p;
+      p.fd = lfd;
+      p.events = POLLIN;
+      p.revents = 0;
+      int rc = ::poll(&p, 1, 100);
+      if (rc < 0) {
+        if (errno == EINTR) continue;
+        finish_accept(state);
+        return Status::io_error("poll(uds bootstrap) failed" + errno_suffix());
+      }
+      if (rc == 0) continue;  // slice elapsed: re-check closing
+      int c = ::accept(lfd, nullptr, nullptr);
+      if (c < 0) {
+        int e = errno;
+        // Another concurrent accept may have consumed the connection between
+        // our poll wake and ::accept; re-poll in that case.
+        if (e == EINTR || e == ECONNABORTED || e == EAGAIN || e == EWOULDBLOCK) continue;
+        finish_accept(state);
+        return Status::io_error("accept(uds bootstrap) failed" + errno_suffix());
+      }
+      cfd = c;
+      break;
+    }
+    if (stopped) {
+      finish_accept(state);
+      return Status::closed("listener closed during accept");
+    }
 
     char connid[16];
     auto st = read_exact(cfd, connid, sizeof(connid));
     ::close(cfd);
-    if (!st.ok()) return st.status();
+    if (!st.ok()) {
+      finish_accept(state);
+      return st.status();
+    }
 
     ShmNames n = make_names(names_.base, std::string(connid, sizeof(connid)));
     auto h = open_resources(n, expected_);
-    if (!h.ok()) return h.status();
+    if (!h.ok()) {
+      finish_accept(state);
+      return h.status();
+    }
+    finish_accept(state);
     return std::unique_ptr<Pipe>(new ShmPipe(h.value(), std::move(n), /*owner=*/false, /*is_client=*/false));
   }
 
   Result<std::string> local_address() const override { return std::string("shm://") + names_.base; }
 
   void close() override {
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
-      // Keep path cleanup best-effort.
-      ::unlink(names_.bootstrap_path.c_str());
+    auto state = state_;
+    std::lock_guard<std::mutex> lock(state->mu);
+    if (state->closing) return;
+    state->closing = true;
+    if (state->fd >= 0 && state->active_accepts.load() == 0) {
+      // No accept in flight: this thread owns the fd release. Otherwise the
+      // last registered accept releases it in finish_accept.
+      ::close(state->fd);
+      state->fd = -1;
     }
+    // Keep path cleanup best-effort.
+    ::unlink(names_.bootstrap_path.c_str());
   }
 
  private:
+  std::shared_ptr<ShmListenerState> state_;
   ShmNames names_;
-  int fd_ = -1;
   ShmOptions expected_{};
 };
 }  // namespace duct

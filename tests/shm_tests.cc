@@ -942,3 +942,32 @@ void test_shm_recv_unblocks_on_peer_close() {
 
   (*lis)->close();
 }
+
+// accept() must be interruptible by listener close(): the bootstrap wait used
+// to block uninterruptibly (overlapped-free ConnectNamedPipe on Windows,
+// ::accept(2) on POSIX), so close() could neither wake it nor run cleanly
+// beside it.
+void test_shm_accept_unblocks_on_listener_close() {
+  auto lis_r = duct::listen("shm://duct_shm_accept_close");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  // Deliberately heap-allocated: if accept() stays blocked (regression), the
+  // leaked future avoids the std::async destructor joining the stuck thread
+  // and hanging the suite; the process tears it down at exit.
+  auto* acc = new std::future<duct::Result<std::unique_ptr<duct::Pipe>>>(
+      std::async(std::launch::async, [&]() { return lis_r.value()->accept(); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  lis_r.value()->close();
+  auto st = acc->wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(st == std::future_status::ready);
+  if (st == std::future_status::ready) {
+    auto r = acc->get();
+    delete acc;
+    EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+}
