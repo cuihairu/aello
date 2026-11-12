@@ -740,6 +740,41 @@ struct ShmListenerState {
   std::atomic<int> active_accepts{0};
 };
 
+// Read n bytes from an accepted bootstrap connection in bounded slices,
+// re-checking the listener state every 100ms: a silent client (connected but
+// never writing the connid) must not pin accept() past a listener close (same
+// class as the poll-sliced bootstrap accept above). Returns kClosed when the
+// listener closes mid-read.
+static Result<void> read_exact_or_closed(int fd, void* p, std::size_t n,
+                                          const std::shared_ptr<ShmListenerState>& state) {
+  std::uint8_t* cur = static_cast<std::uint8_t*>(p);
+  while (n != 0) {
+    {
+      std::lock_guard<std::mutex> lock(state->mu);
+      if (state->closing) return Status::closed("listener closed during accept");
+    }
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int rc = ::poll(&pfd, 1, 100);
+    if (rc < 0) {
+      if (errno == EINTR) continue;
+      return Status::io_error("poll(connid) failed" + errno_suffix());
+    }
+    if (rc == 0) continue;  // slice elapsed: re-check closing
+    ssize_t r = ::recv(fd, cur, n, 0);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return Status::io_error("recv(connid) failed" + errno_suffix());
+    }
+    if (r == 0) return Status::closed("peer closed");
+    cur += static_cast<std::size_t>(r);
+    n -= static_cast<std::size_t>(r);
+  }
+  return {};
+}
+
 class ShmListener final : public Listener {
  public:
   ShmListener(ShmNames names, int fd, ShmOptions expected)
@@ -829,7 +864,7 @@ class ShmListener final : public Listener {
     }
 
     char connid[16];
-    auto st = read_exact(cfd, connid, sizeof(connid));
+    auto st = read_exact_or_closed(cfd, connid, sizeof(connid), state);
     ::close(cfd);
     if (!st.ok()) {
       finish_accept(state);

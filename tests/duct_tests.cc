@@ -58,6 +58,7 @@ int main() {
   RUN_TEST(test_shm_dial_timeout_honored);
   RUN_TEST(test_shm_dial_positive_timeout_path);
   RUN_TEST(test_shm_accept_unblocks_on_listener_close);
+  RUN_TEST(test_shm_accept_connid_read_unblocks_on_listener_close);
   RUN_TEST(test_dial_rejects_negative_timeout);
   RUN_TEST(test_wire_clears_send_timeout_for_blocking_write);
   RUN_TEST(test_wire_write_no_sigpipe_on_macos);

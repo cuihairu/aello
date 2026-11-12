@@ -1,6 +1,17 @@
 #include "test_support.h"
 #include "shm_tests.h"
 
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <dirent.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <cstring>
+#endif
 
 void test_shm_echo_one() {
   auto lis_r = duct::listen("shm://duct_testbus");
@@ -970,4 +981,82 @@ void test_shm_accept_unblocks_on_listener_close() {
       EXPECT_EQ(r.status().code(), duct::StatusCode::kClosed);
     }
   }
+}
+
+
+#if !defined(_WIN32)
+// Snapshot of the shm bootstrap unix socket paths currently in /tmp. The
+// bootstrap path is derived from an internal hash of the bus name, so tests
+// that need it compare snapshots taken before and after listen().
+static std::vector<std::string> list_duct_shm_bootstrap_socks() {
+  std::vector<std::string> out;
+  DIR* d = ::opendir("/tmp");
+  if (!d) return out;
+  while (struct dirent* e = ::readdir(d)) {
+    const std::string name = e->d_name;
+    if (name.rfind("duct_shm_", 0) == 0 && name.size() > 5 &&
+        name.compare(name.size() - 5, 5, ".sock") == 0) {
+      out.push_back("/tmp/" + name);
+    }
+  }
+  ::closedir(d);
+  return out;
+}
+#endif
+
+// The connid handshake read after ::accept() must also be interruptible by
+// listener close(): a silent client (connected to the bootstrap socket but
+// never writing the connid) must not pin accept() forever. The bootstrap
+// accept itself is poll-sliced; this covers the read on the accepted fd.
+void test_shm_accept_connid_read_unblocks_on_listener_close() {
+#if defined(_WIN32)
+  return;
+#else
+  const auto before = list_duct_shm_bootstrap_socks();
+  auto lis_r = duct::listen("shm://duct_shm_connid_close");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+  const auto after = list_duct_shm_bootstrap_socks();
+  std::string boot;
+  for (const auto& p : after) {
+    if (std::find(before.begin(), before.end(), p) == before.end()) boot = p;
+  }
+  EXPECT_TRUE(!boot.empty());
+  if (boot.empty()) {
+    lis_r.value()->close();
+    return;
+  }
+
+  // Silent client: connect but never write the 16-byte connid.
+  int cfd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  EXPECT_TRUE(cfd >= 0);
+  if (cfd < 0) {
+    lis_r.value()->close();
+    return;
+  }
+  struct sockaddr_un addr {};
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, boot.c_str(), sizeof(addr.sun_path) - 1);
+  EXPECT_TRUE(::connect(cfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  // Deliberately heap-allocated: if accept() stays blocked (regression), the
+  // leaked future avoids the std::async destructor joining the stuck thread
+  // and hanging the suite; the process tears it down at exit.
+  auto* acc = new std::future<duct::Result<std::unique_ptr<duct::Pipe>>>(
+      std::async(std::launch::async, [&]() { return lis_r.value()->accept(); }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  lis_r.value()->close();
+  auto st = acc->wait_for(std::chrono::seconds(3));
+  EXPECT_TRUE(st == std::future_status::ready);
+  if (st == std::future_status::ready) {
+    auto r = acc->get();
+    delete acc;
+    EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+      EXPECT_EQ(r.status().code(), duct::StatusCode::kClosed);
+    }
+  }
+  ::close(cfd);
+#endif
 }
