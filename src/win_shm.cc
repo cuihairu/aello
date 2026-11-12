@@ -538,7 +538,9 @@ class ShmPipe final : public Pipe {
 struct ShmListenerState {
   std::mutex mu;
   HANDLE bootstrap_pipe = INVALID_HANDLE_VALUE;
-  HANDLE stop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  // Created by shm_listen before the listener exists: a NULL here would
+  // silently read as "listener closing" inside WaitForMultipleObjects.
+  HANDLE stop_event = NULL;
   bool closing = false;
   std::atomic<int> active_accepts{0};
   std::condition_variable cv;
@@ -550,11 +552,13 @@ struct ShmListenerState {
 
 class ShmListener final : public Listener {
  public:
-  ShmListener(ShmNames names, HANDLE bootstrap_pipe, ShmOptions expected)
+  ShmListener(ShmNames names, HANDLE bootstrap_pipe, HANDLE stop_event,
+              ShmOptions expected)
       : state_(std::make_shared<ShmListenerState>()),
         names_(std::move(names)),
         expected_(expected) {
     state_->bootstrap_pipe = bootstrap_pipe;
+    state_->stop_event = stop_event;
   }
   ~ShmListener() override {
     close();
@@ -747,7 +751,16 @@ Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const List
   ShmNames n = make_names(name, "0000000000000000");
   auto pipe = create_bootstrap_pipe(n.bootstrap_pipe);
   if (!pipe.ok()) return pipe.status();
-  return std::unique_ptr<Listener>(new ShmListener(std::move(n), pipe.value(), opt.shm));
+  // Create the accept stop event up front: accept() waits on it, and a NULL
+  // handle in the wait set would fail the wait and masquerade as
+  // "listener closing". Fail listen() with an explicit io_error instead.
+  HANDLE stop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  if (stop_event == NULL) {
+    CloseHandle(pipe.value());
+    return Status::io_error("CreateEvent failed");
+  }
+  return std::unique_ptr<Listener>(
+      new ShmListener(std::move(n), pipe.value(), stop_event, opt.shm));
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
