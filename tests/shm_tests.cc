@@ -61,7 +61,10 @@ void test_shm_echo_one() {
 
 
 void test_shm_crash_recovery_reclaims_orphan() {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
+  // macOS has no /dev/shm: POSIX shm is kernel-emulated there and the segment
+  // files are not visible in any mounted directory, so the leftover-file
+  // assertions below cannot be evaluated on that platform.
   // POSIX semaphore objects appear in /dev/shm with a "sem." prefix; the
   // shared-memory segment itself appears as "ddfb0e26d<conn>m".
   const std::string prefix = "ddfb0e26d";
@@ -139,7 +142,9 @@ void test_shm_crash_recovery_reclaims_orphan() {
 // new header read at offset 0-15 sees garbage and would previously skip them.
 // It must also tolerate an undersized hostile file without raising SIGBUS.
 void test_shm_reclaims_legacy_orphan() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
+  // Windows has no shm filesystem; macOS has no /dev/shm mount (POSIX shm is
+  // kernel-emulated), so the handcrafted segment below cannot be planted.
   return;
 #else
   // Reproduce src/shm_transport.cc's sanitize_name/fnv1a_32/hex8.
