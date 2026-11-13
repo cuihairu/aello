@@ -391,15 +391,25 @@ void test_wire_fragmentation_and_reassembly() {
   if (rc != 0) return;
 
   const std::string payload(duct::wire::kMaxFramePayload * 2 + 137, 'z');
+  // Write and read concurrently: the ~128 KiB payload exceeds the send
+  // buffer of a macOS AF_UNIX socketpair (~8 KiB, vs ~208 KiB defaults on
+  // Linux), so a fill-then-drain single thread would block forever mid-write
+  // (it hung the nightly duct_tests run for its whole 300s budget). Real
+  // wire peers stream in both directions anyway.
+  auto reader = std::async(std::launch::async, [&] {
+    return duct::wire::read_frame(fds[1]);
+  });
   auto st = duct::wire::write_frame(fds[0], duct::Message::from_string(payload));
   EXPECT_TRUE(st.ok());
   if (!st.ok()) {
+    // Unblock (and leak) the reader per harness convention for ops that may
+    // be stuck; shutdown wakes a blocked recv where close() does not.
+    ::shutdown(fds[1], SHUT_RD);
     ::close(fds[0]);
     ::close(fds[1]);
     return;
   }
-
-  auto r = duct::wire::read_frame(fds[1]);
+  auto r = reader.get();
   EXPECT_TRUE(r.ok());
   if (r.ok()) {
     EXPECT_EQ(r.value().size(), payload.size());
