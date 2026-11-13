@@ -226,9 +226,21 @@ void test_wire_write_timeout() {
   // Fill the socket send buffer first so the next frame cannot even write its
   // header. That keeps the timeout boundary at frame start, which must be
   // reported as kTimeout (mid-frame timeouts are kIoError, see below).
+  // Nonblocking is toggled with O_NONBLOCK instead of the MSG_DONTWAIT send
+  // flag: the flag is Linux-only and silently ignored by the XNU kernel, so
+  // on macOS the fill would block forever on a full socketpair (it hung the
+  // nightly duct_tests run for its whole 300s budget).
   char filler[4096] = {};
+  const int fl = ::fcntl(fds[0], F_GETFL, 0);
+  EXPECT_TRUE(fl >= 0);
+  if (fl < 0) {
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return;
+  }
+  EXPECT_TRUE(::fcntl(fds[0], F_SETFL, fl | O_NONBLOCK) == 0);
   for (;;) {
-    ssize_t w = ::send(fds[0], filler, sizeof(filler), MSG_DONTWAIT);
+    ssize_t w = ::send(fds[0], filler, sizeof(filler), 0);
     if (w < 0) {
       EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
       break;
@@ -236,6 +248,7 @@ void test_wire_write_timeout() {
     EXPECT_TRUE(w > 0);
     if (w <= 0) break;
   }
+  EXPECT_TRUE(::fcntl(fds[0], F_SETFL, fl) == 0);
 
   const std::string big(duct::wire::kMaxFramePayload, 'x');
   const auto start = std::chrono::steady_clock::now();
