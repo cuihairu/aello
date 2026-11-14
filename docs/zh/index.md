@@ -28,7 +28,7 @@ features:
 
 ## 当前状态
 
-Aello 处于实验阶段、尚未正式发布。当前提供消息模型、`Result`/`Status` 错误处理、覆盖 `tcp://`、`shm://`、`pipe://` 的 `Pipe`/`Listener` API、有界固定槽共享内存环、16 字节帧头以及跨平台 CI。
+Aello 处于实验阶段、尚未正式发布。当前提供消息模型、`Result`/`Status` 错误处理、覆盖 `tcp://`、`shm://`、`uds://`（POSIX）与 `pipe://`（Windows 命名管道）的 `Pipe`/`Listener` API、有界固定槽共享内存环、16 字节帧头以及跨平台 CI。
 
 本站记录驱动下一轮实现的设计裁决与逐文件审计：
 

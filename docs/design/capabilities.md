@@ -4,7 +4,7 @@ This is the single maintained surface for "what exists, what does not, and what
 is reserved". Both READMEs link here; update this file instead of the READMEs so
 the two languages cannot drift apart.
 
-Last reviewed: 2026-11-09.
+Last reviewed: 2026-11-14.
 
 ## Implemented capabilities
 
@@ -18,7 +18,7 @@ Last reviewed: 2026-11-09.
 | Reconnect | Automatic redial with exponential backoff + jitter, bounded attempts, state callbacks | `ReconnectPolicy`, `src/reconnect_pipe.cc`; `dial()` returns connected or fails within the deadline |
 | Adapters | Header-only builder/request-reply/batch/loop layer and RAII scoped wrappers; installed with the library, compiled by the test suite | `include/duct/convenience.h`, `include/duct/raii.h` |
 | RPC / pub-sub | Correlated request/response and topic broker, header-only | `include/duct/rpc.h`, `include/duct/pubsub.h` |
-| Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:105-146` |
+| Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:107-163` |
 | CI | GCC / Clang / MSVC run the full suite; POSIX suite also runs under wine locally | `.github/workflows/cmake-multi-platform.yml` |
 
 ## Explicitly not implemented
@@ -39,7 +39,7 @@ Setting them has no effect today; activating them later is source-compatible.
 |---|---|---|
 | `ReconnectPolicy::heartbeat_interval` | `include/duct/duct.h:45` | none — keepalives are whatever the OS defaults to; an earlier comment claimed a TCP keepalive mapping that was never implemented (corrected 2026-11-09) |
 | `QosOptions::reliability` | `include/duct/duct.h:77` | none — at-most-once is the only delivery semantics; `Reliability::kAtMostOnce` is the only enum value with an implementation |
-| `ListenOptions::qos` | `include/duct/duct.h:180` | none — listener-side QoS is reserved |
+| `ListenOptions::qos` | `include/duct/duct.h:181` | none — listener-side QoS is reserved |
 
 Note: the standalone `StateCallbackPipe` decorator (`src/state_callback_pipe.*`)
 was removed on 2026-11-09; the reconnect dial is the single state-callback path.

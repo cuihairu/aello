@@ -117,6 +117,7 @@ CMake options:
 |---|---|---|
 | `DUCT_BUILD_EXAMPLES` | `ON` | echo server/client and manual transport tools |
 | `DUCT_BUILD_TESTS` | `ON` | test suite (run via `ctest`) |
+| `DUCT_BUILD_BENCH` | `ON` | benchmark harness and its `ctest` smoke run (not built on Windows) |
 
 There is no versioned release yet — consume via `add_subdirectory(aello)` and
 link the `duct` target, or install it: `cmake --install` exports a CMake
@@ -126,11 +127,24 @@ covered by the `duct_install` smoke test in `ctest`. Library naming
 (`duct` → `aello`) will change in a later release series; the GitHub redirect
 from `duct` remains valid.
 
+## Nightly builds
+
+`.github/workflows/nightly.yml` runs daily at 00:00 UTC and on manual
+dispatch on four legs — `linux-x64` (GCC), `linux-x64-clang`, `windows-x64`
+(MSVC), and `macos-arm64` (Clang). Each leg builds the library and examples,
+runs the full acceptance suite under `ctest`, then packages
+`duct-linux-x64.tar.gz`, `duct-linux-x64-clang.tar.gz`,
+`duct-windows-x64.zip`, and `duct-macos-arm64.tar.gz` (headers, static
+library, echo pair, `README.md`, `LICENSE`) and publishes them under a single
+rolling `nightly` pre-release tag, so only the latest build is kept. macOS is
+exercised only on that schedule; `cmake-multi-platform.yml` covers Ubuntu and
+Windows.
+
 ## Repository layout
 
 ```
 include/duct/     public headers (core API, message, status, wire, transports)
-src/              transport implementations (tcp, shm, named pipe + helpers)
+src/              transport implementations (tcp, uds, shm, named pipe + helpers)
 tests/            cross-platform test suite (one source per layer under test)
 examples/         echo pair + manual transport tools
 bench/            benchmarks

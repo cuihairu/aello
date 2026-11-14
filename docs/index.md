@@ -28,7 +28,7 @@ features:
 
 ## Current status
 
-Aello is an experimental, pre-release messaging runtime. It currently provides a message model, `Result`/`Status` error handling, a `Pipe`/`Listener` API over `tcp://`, `shm://`, and `pipe://`, bounded fixed-slot shared-memory rings, a 16-byte wire header, and cross-platform CI.
+Aello is an experimental, pre-release messaging runtime. It currently provides a message model, `Result`/`Status` error handling, a `Pipe`/`Listener` API over `tcp://`, `shm://`, `uds://` (POSIX), and `pipe://` (Windows named pipes), bounded fixed-slot shared-memory rings, a 16-byte wire header, and cross-platform CI.
 
 The site records the design decisions and the file-by-file audit that drive the next implementation round:
 
