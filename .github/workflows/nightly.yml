@@ -112,7 +112,7 @@ jobs:
 
       - name: Generate release tag
         id: tag
-        run: echo "tag=nightly-$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+        run: echo "tag=nightly" >> $GITHUB_OUTPUT
 
       - name: Delete existing nightly release
         run: |
