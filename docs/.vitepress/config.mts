@@ -3,7 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   base: '/aello/',
   title: 'Aello',
-  description: 'High-performance messaging runtime for game servers',
+  description: 'Messaging runtime for game servers',
   cleanUrls: true,
   ignoreDeadLinks: false,
   themeConfig: {
@@ -15,7 +15,7 @@ export default defineConfig({
       label: 'English',
       lang: 'en-US',
       title: 'Aello',
-      description: 'High-performance messaging runtime for game servers',
+      description: 'Messaging runtime for game servers',
       themeConfig: {
         siteTitle: 'Aello',
         nav: [
@@ -43,7 +43,7 @@ export default defineConfig({
       lang: 'zh-CN',
       link: '/zh/',
       title: 'Aello',
-      description: '面向游戏服务器的高性能消息运行时',
+      description: '面向游戏服务器的消息运行时',
       themeConfig: {
         siteTitle: 'Aello',
         nav: [

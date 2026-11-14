@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Aello
-  text: 面向游戏服务器的高性能消息运行时
+  text: 面向游戏服务器的消息运行时
   tagline: 有界内存、低延迟、可观测的进程消息通信，契约明确，传输后端可插拔。
   actions:
     - theme: brand

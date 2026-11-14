@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Aello
-  text: High-Performance Messaging Runtime for Game Servers
+  text: Messaging Runtime for Game Servers
   tagline: Bounded, low-latency, observable process messaging with explicit contracts and pluggable transports.
   actions:
     - theme: brand
