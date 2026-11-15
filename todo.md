@@ -31,7 +31,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Protocol
 
 - [x] Fragmentation and reassembly for payloads larger than 64 KiB. Evidence: 8c0b3ee; wire + shm multi-chunk round-trip tests green (36 duct cases, ctest 2/2).
-- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.（2026-11-09 复核：仍阻塞——传输协议未改、无丢包注入测试矩阵，属需设计决策的大特性，无实现可代办）
+- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.（2026-11-09 复核：仍阻塞——传输协议未改、无丢包注入测试矩阵，属需设计决策的大特性，无实现可代办）（2026-11-15 复核：仍阻塞——wire.h/duct.h 中 session_id/seq·ack/retransmit/dedup 零命中，tests/ 无 loss/retransmit 注入矩阵，r2 巡检重证）
 - [x] Priority scheduling and channel_id multiplexing. Evidence: 4dc7aa6; priority drains high-first and channel_id demux round-trip tests green (38 duct cases, ctest 2/2).
 - [x] Rate limiting (token bucket) per pipe or per socket. Evidence: f3d2870; paced delivery test green (39 duct cases, ctest 2/2).
 - [x] Capability / version negotiation in the handshake. Evidence: bfe0629; tcp handshake version negotiation + post-handshake echo test green (40 duct cases, ctest 2/2).
@@ -57,7 +57,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 - [x] Pub/sub with multiple subscribers. Evidence: 81b4490; include/duct/pubsub.h adds a topic-filter Broker with per-subscriber prefix filters and unsubscribe-on-destroy; multi-subscriber delivery + unsubscribe test green (51 duct cases, ctest 3/3, 12x stress).
 - [x] Async/event-loop API (async.h is on the design audit delete list; not part of the library). Evidence: d00e310; deleted async.h, tests/async_tests.cc, examples/async_example.cc and the async_tests build target per design audit (aello-audit §7: conflicts with v1 no-general-event-loop direction); remaining ctest 2/2.
 - [x] Peer credential checks for uds (SO_PEERCRED uid/gid/pid, wired via Pipe::peer_credential(), both ends verify own-process identity; test green, 12x stress). Evidence: 8fd33cb.
-- [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).（2026-11-09 复核：仍阻塞——CMake 无 OpenSSL、无证书配置 API，需凭据方案与用户签核）
+- [ ] TLS / mTLS for tcp. BLOCKED: requires certificate provisioning (key/cert paths, trust store, mTLS mutual-auth design) — a credentials/design decision needing user sign-off; no existing TLS scaffolding in repo (no OpenSSL in CMake, no cert config API).（2026-11-09 复核：仍阻塞——CMake 无 OpenSSL、无证书配置 API，需凭据方案与用户签核）（2026-11-15 复核：仍阻塞——CMakeLists.txt OpenSSL 零引用、include/duct/ 无 tls/ssl 头，r2 巡检重证）
 - [x] Crash recovery for orphaned shm segments. Evidence: f90c944; shm header records owner PID+magic; shm_listen scans /dev/shm for dead-owner segments and unlinks them + their semaphores; fork/SIGKILL/orphan/reclaim test green (ctest 2/2, 12x stress, no leftover segments).
 - [x] Install / packaging target. Evidence: CMake install/export + generated version header + pkg-config + CPack TGZ; `ctest 3/3`; consumer `find_package(duct)` link/run green; external-prefix `pkg-config --cflags --libs duct` green.
 
