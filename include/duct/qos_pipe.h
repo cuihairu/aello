@@ -20,6 +20,12 @@ struct QueuedMessage {
   std::chrono::steady_clock::time_point timestamp;
   int priority = 0;
   std::uint32_t channel_id = 0;
+  // Reliability trailer (v2 framing). The drain worker forwards it verbatim,
+  // mirroring channel_id: the reliability layer re-stamps session/seq per send
+  // anyway, but a wrapper above it must not silently zero them.
+  std::uint64_t session_id = 0;
+  std::uint64_t seq = 0;
+  std::uint32_t wire_flags = 0;
 
   QueuedMessage(const Message& msg, int prio = 0, std::uint32_t ch = 0)
     : message(msg), timestamp(std::chrono::steady_clock::now()),

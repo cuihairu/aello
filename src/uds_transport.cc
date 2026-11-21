@@ -4,6 +4,8 @@
 #include "duct/socket_utils.h"
 #include "duct/wire.h"
 
+#include "reliable_pipe.h"
+
 #include <cstring>
 #include <cerrno>
 #include <atomic>
@@ -45,7 +47,27 @@ struct PipeIoState {
 
 class UdsPipe final : public Pipe {
  public:
-  explicit UdsPipe(int fd) : io_(std::make_shared<PipeIoState>()) { io_->fd = fd; }
+  // Mirrors TcpPipe: plain clients negotiate lazily and fire-and-forget (so a
+  // blocking dial() cannot deadlock before the peer calls accept()); the
+  // reliable client path negotiates in uds_dial() and passes the settled caps.
+  UdsPipe(int fd, bool handshake_ready = false, std::uint32_t negotiated_caps = 0)
+      : io_(std::make_shared<PipeIoState>()),
+        handshake_ready_(handshake_ready),
+        negotiated_caps_(negotiated_caps) {
+    io_->fd = fd;
+    if (!handshake_ready_) {
+      auto hs = wire::handshake_client(io_->fd, /*capabilities=*/0);
+      if (!hs.ok()) {
+        std::lock_guard<std::mutex> lock(io_->mu);
+        if (!io_->closing) {
+          io_->closing = true;
+          ::shutdown(io_->fd, SHUT_RDWR);
+        }
+      } else {
+        handshake_ready_ = true;
+      }
+    }
+  }
   ~UdsPipe() override {
     close();
     // Wait for already-registered io to unwind before the shared state dies.
@@ -61,13 +83,22 @@ class UdsPipe final : public Pipe {
     if (!io_begin(&fd)) return Status::closed("pipe closed");
     IoGuard guard{io_};
 
+    auto hs = ensure_handshake(fd);
+    if (!hs.ok()) return hs;
+
     // Wait for writable if timeout is specified.
     if (opt.timeout.count() > 0) {
       auto st = socket_utils::wait_writable(fd, opt.timeout);
       if (!st.ok()) return st;
     }
 
-    return wire::write_frame(fd, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
+    std::uint32_t flags = channel_id_to_flags(opt.channel_id) | opt.wire_flags;
+    wire::FrameMeta meta;
+    if (opt.session_id != 0) {
+      meta.session_id = opt.session_id;
+      meta.seq = opt.seq;
+    }
+    return wire::write_frame(fd, msg, flags, opt.timeout, meta);
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
@@ -80,11 +111,27 @@ class UdsPipe final : public Pipe {
     // Serialize socket reads: concurrent recv() calls for different channels
     // must not interleave their raw frame reads on the same fd.
     std::lock_guard<std::mutex> lock(read_mu_);
-    if (opt.timeout.count() > 0) {
-      auto st = socket_utils::wait_readable(fd, opt.timeout);
-      if (!st.ok()) return st.status();
+    // Transparently consume the handshake reply the server wrote (a fire-and-
+    // forget client never reads it); it is protocol metadata, not an app frame.
+    const bool has_deadline = opt.timeout.count() > 0;
+    const auto deadline = std::chrono::steady_clock::now() + opt.timeout;
+    for (;;) {
+      RecvOptions frame_opt = opt;
+      if (has_deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return Status::timeout("recv timed out");
+        frame_opt.timeout =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        if (frame_opt.timeout <= std::chrono::milliseconds::zero()) {
+          frame_opt.timeout = std::chrono::milliseconds(1);
+        }
+        auto st = socket_utils::wait_readable(fd, frame_opt.timeout);
+        if (!st.ok()) return st.status();
+      }
+      auto r = wire::read_frame_with_flags(fd, frame_opt.timeout);
+      if (!r.ok()) return r.status();
+      if ((r.value().flags & to_u32(FrameFlags::kCtrl)) == 0) return r;
     }
-    return wire::read_frame_with_flags(fd, opt.timeout);
   }
 
   Result<Message> recv(const RecvOptions& opt) override {
@@ -191,6 +238,8 @@ class UdsPipe final : public Pipe {
     if (fd_to_close >= 0) ::close(fd_to_close);
   }
 
+  std::uint32_t negotiated_capabilities() const override { return negotiated_caps_; }
+
   Result<PeerCredential> peer_credential() const override {
     int fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
@@ -249,7 +298,25 @@ class UdsPipe final : public Pipe {
     ~IoGuard() { io_end(io); }
   };
 
+  Result<void> ensure_handshake(int fd) {
+    if (!handshake_ready_) {
+      auto hs = wire::handshake_client(fd, /*capabilities=*/0);
+      if (!hs.ok()) {
+        std::lock_guard<std::mutex> lock(io_->mu);
+        if (!io_->closing) {
+          io_->closing = true;
+          ::shutdown(io_->fd, SHUT_RDWR);
+        }
+        return hs;
+      }
+      handshake_ready_ = true;
+    }
+    return {};
+  }
+
   std::shared_ptr<PipeIoState> io_;
+  bool handshake_ready_ = false;
+  std::uint32_t negotiated_caps_ = 0;
   std::mutex ch_mu_;
   std::mutex read_mu_;
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
@@ -272,14 +339,26 @@ struct UdsListenerState {
   std::mutex mu;
   std::condition_variable cv;
   int fd = -1;
-  bool closing = false;
+  // Atomic: the handshake read in accept() slices its wait and re-checks this
+  // without holding mu, so a listener close must be observable during the
+  // handshake (a blocked recv is not woken by close on POSIX).
+  std::atomic<bool> closing{false};
   std::atomic<int> active_accepts{0};
 };
 
 class UdsListener final : public Listener {
  public:
-  UdsListener(int fd, std::string path)
-      : state_(std::make_shared<UdsListenerState>()), path_(std::move(path)) {
+  // server_caps: capabilities advertised in the handshake reply (see
+  // TcpListener for the negotiation semantics); a plain client negotiates down
+  // to 0 and this accepted pipe degrades to v1 framing.
+  UdsListener(int fd, std::string path,
+              std::chrono::milliseconds handshake_timeout, std::uint32_t server_caps = 0,
+              ReliabilityListenerConfig reliability = {})
+      : state_(std::make_shared<UdsListenerState>()),
+        path_(std::move(path)),
+        handshake_timeout_(handshake_timeout),
+        server_caps_(server_caps),
+        reliability_(std::move(reliability)) {
     state_->fd = fd;
   }
 
@@ -299,7 +378,7 @@ class UdsListener final : public Listener {
     {
       std::lock_guard<std::mutex> lock(s->mu);
       const int prev = s->active_accepts.fetch_sub(1, std::memory_order_acq_rel);
-      if (prev == 1 && s->closing && s->fd >= 0) {
+      if (prev == 1 && s->closing.load(std::memory_order_acquire) && s->fd >= 0) {
         fd_to_close = s->fd;
         s->fd = -1;
       }
@@ -312,7 +391,7 @@ class UdsListener final : public Listener {
     auto state = state_;
     {
       std::lock_guard<std::mutex> lock(state->mu);
-      if (state->closing) return Status::closed("listener closed");
+      if (state->closing.load(std::memory_order_acquire)) return Status::closed("listener closed");
       state->active_accepts.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -323,7 +402,7 @@ class UdsListener final : public Listener {
       int lfd;
       {
         std::lock_guard<std::mutex> lock(state->mu);
-        if (state->closing) {
+        if (state->closing.load(std::memory_order_acquire)) {
           stopped = true;
           break;
         }
@@ -365,8 +444,39 @@ class UdsListener final : public Listener {
     int one = 1;
     (void)::setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
+    // Stop-aware handshake: a silent client (connected but never writing the
+    // handshake) must not pin accept() past a listener close. This is new on
+    // uds:// (TCP has always had it); every in-library peer sends a handshake,
+    // so no existing raw-socket client is left behind.
+    auto hs = wire::handshake_server_stoppable(cfd, server_caps_,
+                                               handshake_timeout_, state->closing);
+    if (!hs.ok()) {
+      ::close(cfd);
+      finish_accept(state);
+      return hs.status();
+    }
+    const std::uint32_t negotiated = server_caps_ & hs.value().capabilities;
+    std::unique_ptr<Pipe> pipe(new UdsPipe(cfd, /*handshake_ready=*/true, negotiated));
+    if ((negotiated & kCapabilityReliable) != 0 && reliability_.table &&
+        hs.value().session_id != 0) {
+      // Same session-resume contract as TcpListener::accept(): the shared table
+      // keeps a redial's counters going so a replay is deduplicated.
+      auto st = reliability_.table->resume_or_start(hs.value().session_id);
+      if (!st.ok()) {
+        pipe->close();
+        finish_accept(state);
+        return st.status();
+      }
+      ReliablePipeConfig cfg;
+      cfg.session_id = hs.value().session_id;
+      cfg.state = st.value();
+      cfg.window_bytes = reliability_.window_bytes;
+      cfg.backpressure = reliability_.backpressure;
+      cfg.replay_pending_window_on_bind = true;
+      pipe = make_reliable_pipe(std::move(pipe), cfg);
+    }
     finish_accept(state);
-    return std::unique_ptr<Pipe>(new UdsPipe(cfd));
+    return pipe;
   }
 
   Result<std::string> local_address() const override {
@@ -379,9 +489,9 @@ class UdsListener final : public Listener {
     int fd_to_close = -1;
     {
       std::lock_guard<std::mutex> lock(state_->mu);
-      if (state_->closing) return;
-      state_->closing = true;
-      if (state_->fd >= 0 && state_->active_accepts.load() == 0) {
+      if (state_->closing.load(std::memory_order_acquire)) return;
+      state_->closing.store(true, std::memory_order_release);
+      if (state_->fd >= 0 && state_->active_accepts.load(std::memory_order_acquire) == 0) {
         // No accept in flight: this thread owns the fd release. Otherwise the
         // last registered accept releases it in finish_accept.
         fd_to_close = state_->fd;
@@ -397,6 +507,10 @@ class UdsListener final : public Listener {
  private:
   std::shared_ptr<UdsListenerState> state_;
   std::string path_;
+  std::chrono::milliseconds handshake_timeout_{5000};
+  std::uint32_t server_caps_ = 0;
+  // Empty (no table) unless the listener was created with reliability on.
+  ReliabilityListenerConfig reliability_;
 };
 
 static Result<int> connect_uds(const std::string& path, std::chrono::milliseconds timeout) {
@@ -544,11 +658,23 @@ Result<std::unique_ptr<Listener>> uds_listen(const std::string& path, const List
 #else
   auto fd = listen_uds(path, opt.backlog);
   if (!fd.ok()) return fd.status();
-  return std::unique_ptr<Listener>(new UdsListener(fd.value(), path));
+  const std::uint32_t server_caps =
+      opt.qos.reliability == Reliability::kAtLeastOnce ? kCapabilityReliable : 0;
+  ReliabilityListenerConfig reliability;
+  if (opt.qos.reliability == Reliability::kAtLeastOnce) {
+    constexpr std::size_t kMaxReliableSessions = 4096;
+    reliability.table = std::make_shared<ReliabilitySessionTable>(kMaxReliableSessions);
+    reliability.window_bytes = opt.qos.snd_hwm_bytes;
+    reliability.backpressure = opt.qos.backpressure;
+  }
+  return std::unique_ptr<Listener>(
+      new UdsListener(fd.value(), path, opt.handshake_timeout, server_caps,
+                      std::move(reliability)));
 #endif
 }
 
-Result<std::unique_ptr<Pipe>> uds_dial(const std::string& path, const DialOptions& opt) {
+Result<std::unique_ptr<Pipe>> uds_dial(const std::string& path, const DialOptions& opt,
+                                       std::uint64_t reliability_session_id) {
 #if defined(_WIN32)
   (void)path;
   (void)opt;
@@ -556,6 +682,20 @@ Result<std::unique_ptr<Pipe>> uds_dial(const std::string& path, const DialOption
 #else
   auto fd = connect_uds(path, opt.timeout);
   if (!fd.ok()) return fd.status();
+  // Reliable dials advertise kCapabilityReliable and settle the negotiated caps
+  // before dial() returns (see tcp_dial for the rationale).
+  if (opt.qos.reliability == Reliability::kAtLeastOnce) {
+    // reliability_session_id: see tcp_dial; the session id announced here is
+    // what the listener resumes on a redial.
+    auto server_caps = wire::handshake_client_sync(fd.value(), kCapabilityReliable,
+                                                  opt.timeout, reliability_session_id);
+    if (!server_caps.ok()) {
+      ::close(fd.value());
+      return server_caps.status();
+    }
+    return std::unique_ptr<Pipe>(
+        new UdsPipe(fd.value(), /*handshake_ready=*/true, kCapabilityReliable & server_caps.value()));
+  }
   return std::unique_ptr<Pipe>(new UdsPipe(fd.value()));
 #endif
 }

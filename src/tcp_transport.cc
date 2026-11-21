@@ -4,6 +4,8 @@
 #include "duct/socket_utils.h"
 #include "duct/wire.h"
 
+#include "reliable_pipe.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -83,11 +85,18 @@ struct PipeIoState {
 
 class TcpPipe final : public Pipe {
  public:
-  // handshake_ready: true when the server side already completed negotiation in
-  // accept(). The client side performs it lazily on the first send/recv so a
-  // blocking dial() does not deadlock before the peer calls accept().
-  TcpPipe(wire::SocketHandle fd, bool handshake_ready = true)
-      : io_(std::make_shared<PipeIoState>()), handshake_ready_(handshake_ready) {
+  // handshake_ready: true when negotiation already completed (server side in
+  // accept(), reliable client side in tcp_dial()). The plain client side
+  // performs it lazily on the first send/recv so a blocking dial() does not
+  // deadlock before the peer calls accept().
+  // negotiated_caps: the capability bitmask both peers advertised (the AND of
+  // the two), known once the handshake completed. Plain clients never negotiate
+  // (they advertise 0), so this stays 0 and the pipe emits v1 frames.
+  TcpPipe(wire::SocketHandle fd, bool handshake_ready = true,
+          std::uint32_t negotiated_caps = 0)
+      : io_(std::make_shared<PipeIoState>()),
+        handshake_ready_(handshake_ready),
+        negotiated_caps_(negotiated_caps) {
     io_->fd = fd;
     // Send the client's handshake eagerly (write-only, fire-and-forget). The
     // peer's accept() reads it whenever it runs, so this never deadlocks even
@@ -123,7 +132,17 @@ class TcpPipe final : public Pipe {
     IoGuard guard{io_};
     auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs;
-    return wire::write_frame(fd, msg, channel_id_to_flags(opt.channel_id), opt.timeout);
+    // The reliability layer sets session_id only after the connection negotiated
+    // kCapabilityReliable, so a v2 frame is never sent to a v1 peer (that is
+    // what makes degradation clean instead of a protocol error). wire_flags
+    // carries protocol control bits (e.g. kAck) the application never sets.
+    std::uint32_t flags = channel_id_to_flags(opt.channel_id) | opt.wire_flags;
+    wire::FrameMeta meta;
+    if (opt.session_id != 0) {
+      meta.session_id = opt.session_id;
+      meta.seq = opt.seq;
+    }
+    return wire::write_frame(fd, msg, flags, opt.timeout, meta);
   }
 
   Result<wire::FrameMessage> recv_frame(const RecvOptions& opt) override {
@@ -242,6 +261,8 @@ class TcpPipe final : public Pipe {
     }
   }
 
+  std::uint32_t negotiated_capabilities() const override { return negotiated_caps_; }
+
   void close() override {
 #if defined(_WIN32)
     // On Windows, closesocket() wakes a blocked recv/send and the kernel pins
@@ -335,6 +356,7 @@ class TcpPipe final : public Pipe {
 
   std::shared_ptr<PipeIoState> io_;
   bool handshake_ready_ = true;
+  std::uint32_t negotiated_caps_ = 0;
   std::mutex ch_mu_;
   std::mutex read_mu_;
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
@@ -364,12 +386,20 @@ struct TcpListenerState {
 
 class TcpListener final : public Listener {
  public:
+  // server_caps: capabilities this listener advertises in the handshake reply
+  // (kCapabilityReliable when the listener was created with reliability on).
+  // The accepted pipe's negotiated caps are the AND of what both sides sent, so
+  // a plain client silently degrades instead of erroring.
   TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port,
-              std::chrono::milliseconds handshake_timeout)
+              std::chrono::milliseconds handshake_timeout,
+              std::uint32_t server_caps = 0,
+              ReliabilityListenerConfig reliability = {})
       : state_(std::make_shared<TcpListenerState>()),
         host_(std::move(host)),
         port_(port),
-        handshake_timeout_(handshake_timeout) {
+        handshake_timeout_(handshake_timeout),
+        server_caps_(server_caps),
+        reliability_(std::move(reliability)) {
     state_->fd = fd;
   }
   ~TcpListener() override {
@@ -475,15 +505,45 @@ class TcpListener final : public Listener {
 #endif
     // Stop-aware handshake: a silent client (connected but never writing the
     // handshake) must not pin accept() past a listener close.
-    auto hs = wire::handshake_server_stoppable(cfd, /*server_capabilities=*/0,
+    auto hs = wire::handshake_server_stoppable(cfd, server_caps_,
                                                handshake_timeout_, state->closing);
     if (!hs.ok()) {
       close_socket(cfd);
       finish_accept(state);
       return hs.status();
     }
+    // Negotiated caps are the AND of what both sides advertised: a reliable
+    // listener facing a plain client degrades to v1 on this accepted pipe.
+    const std::uint32_t negotiated = server_caps_ & hs.value().capabilities;
+    std::unique_ptr<Pipe> pipe(new TcpPipe(cfd, /*handshake_ready=*/true, negotiated));
+    if ((negotiated & kCapabilityReliable) != 0 && reliability_.table &&
+        hs.value().session_id != 0) {
+      // Resume (or start) this session's counters in the table shared by every
+      // accepted connection of this listener: a redial continues the same
+      // next_expected_in / next_seq_out instead of restarting them, which is
+      // what lets a replay be recognized as a replay rather than delivered
+      // twice. The session id rides the handshake so this happens before any
+      // frame flows.
+      auto st = reliability_.table->resume_or_start(hs.value().session_id);
+      if (!st.ok()) {
+        pipe->close();
+        finish_accept(state);
+        return st.status();
+      }
+      ReliablePipeConfig cfg;
+      cfg.session_id = hs.value().session_id;
+      cfg.state = st.value();
+      cfg.window_bytes = reliability_.window_bytes;
+      cfg.backpressure = reliability_.backpressure;
+      // This session may already have unacked outbound messages from a
+      // connection that died before their ACK came back. The fresh connection
+      // is live now, so push them out; the first connection starts empty, so
+      // this is a no-op there.
+      cfg.replay_pending_window_on_bind = true;
+      pipe = make_reliable_pipe(std::move(pipe), cfg);
+    }
     finish_accept(state);
-    return std::unique_ptr<Pipe>(new TcpPipe(cfd, /*handshake_ready=*/true));
+    return pipe;
   }
 
   Result<std::string> local_address() const override {
@@ -513,6 +573,9 @@ class TcpListener final : public Listener {
   std::string host_;
   std::uint16_t port_ = 0;
   std::chrono::milliseconds handshake_timeout_{5000};
+  std::uint32_t server_caps_ = 0;
+  // Empty (no table) unless the listener was created with reliability on.
+  ReliabilityListenerConfig reliability_;
 };
 
 // Non-blocking connect bounded by `timeout`. Returns kTimeout on expiry.
@@ -722,16 +785,55 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
     }
   }
 
+  // The listener advertises the reliability capability in its handshake reply
+  // when the caller opted in; each accepted pipe negotiates it down to what
+  // both sides support.
+  const std::uint32_t server_caps =
+      opt.qos.reliability == Reliability::kAtLeastOnce ? kCapabilityReliable : 0;
+
+  // One session table per listener: it is what lets an accepted connection
+  // resume a session a redial continues (see ReliabilitySessionTable). Capped
+  // so a peer spraying session ids cannot grow it without bound.
+  ReliabilityListenerConfig reliability;
+  if (opt.qos.reliability == Reliability::kAtLeastOnce) {
+    constexpr std::size_t kMaxReliableSessions = 4096;
+    reliability.table = std::make_shared<ReliabilitySessionTable>(kMaxReliableSessions);
+    reliability.window_bytes = opt.qos.snd_hwm_bytes;
+    reliability.backpressure = opt.qos.backpressure;
+  }
+
   return std::unique_ptr<Listener>(
-      new TcpListener(fd.value(), addr.host, effective_port, opt.handshake_timeout));
+      new TcpListener(fd.value(), addr.host, effective_port, opt.handshake_timeout,
+                      server_caps, std::move(reliability)));
 }
 
-Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt) {
+Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt,
+                                       std::uint64_t reliability_session_id) {
   if (opt.timeout.count() < 0) {
     return Status::invalid_argument("dial timeout must not be negative");
   }
   auto fd = connect_tcp(addr.host, addr.port, opt.timeout);
   if (!fd.ok()) return fd.status();
+
+  // Reliable dials advertise kCapabilityReliable and read the server's reply
+  // synchronously so the negotiated caps (and with them v2 vs v1 framing) are
+  // settled before dial() returns — the reconnect worker publishes kConnected
+  // from this same call, and the reliability layer replays based on the caps it
+  // sees then. Every in-tree listener replies, so the bounded wait cannot hang;
+  // a truly silent peer surfaces as a handshake timeout dial error.
+  if (opt.qos.reliability == Reliability::kAtLeastOnce) {
+    // reliability_session_id is this logical dial's stable identity (0 only for
+    // non-reliable dials, which never enter this branch): the listener uses it
+    // to resume the session's counters on a redial instead of restarting them.
+    auto server_caps = wire::handshake_client_sync(fd.value(), kCapabilityReliable,
+                                                  opt.timeout, reliability_session_id);
+    if (!server_caps.ok()) {
+      close_socket(fd.value());
+      return server_caps.status();
+    }
+    return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/true,
+                                             kCapabilityReliable & server_caps.value()));
+  }
   return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/false));
 }
 

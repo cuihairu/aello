@@ -107,6 +107,14 @@ struct SendOptions {
   int priority = 0;
   // Multiplexing channel id; carried on the wire so the receiver can demux.
   std::uint32_t channel_id = 0;
+  // Reliability trailer. session_id == 0 selects the v1 frame encoding; a
+  // nonzero session_id selects the v2 encoding carrying session + seq. The
+  // ReliablePipe fills these; application callers never set them.
+  std::uint64_t session_id = 0;
+  std::uint64_t seq = 0;
+  // Extra wire flags OR'd into the frame (e.g. kAck for a cumulative ACK).
+  // Plain sends leave this 0.
+  std::uint32_t wire_flags = 0;
 };
 
 struct RecvOptions {
@@ -149,6 +157,10 @@ class Pipe {
   virtual Result<PeerCredential> peer_credential() const {
     return Status::not_supported("peer credential not supported");
   }
+  // Capability bitmask negotiated with the peer during the handshake (see
+  // kCapabilityReliable). Default 0: transports without a handshake (shm/pipe)
+  // or before negotiation completes report no capabilities.
+  virtual std::uint32_t negotiated_capabilities() const { return 0; }
 };
 
 class Listener {

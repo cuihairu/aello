@@ -1,14 +1,17 @@
-# At-Least-Once Delivery Proposal (2026-11-21)
+# At-Least-Once Delivery (2026-11-21)
 
-Status: **proposal, not implemented**. `QosOptions::reliability` stays a
-reserved field until the user signs off on the decision points (D1–D5) at the
-end of this document. The fault model below is pinned by
-`tests/loss_injection_tests.cc`, which lands together with this proposal and
-stays green on current (at-most-once) semantics.
+Status: **implemented** (D1–D5 signed off 2026-11-21, per the recommendations).
+`Reliability::kAtLeastOnce` is live on `tcp://` and `uds://` dials; cells R1–R4
+landed in `tests/reliability_tests.cc`; the pinned fault model
+`tests/loss_injection_tests.cc` (L1–L5) stays green on `kAtMostOnce` defaults.
+Implementation lives in `src/reliable_pipe.{h,cc}` with wire support in
+`src/wire.cc` and transport wiring in `src/{tcp,uds}_transport.cc`.
 
-See also [capabilities and reserved contracts](capabilities.md) — the
-"explicitly not implemented" section remains accurate until this proposal is
-implemented.
+Two refinements were made during implementation, both recorded under
+"Implementation notes" below: `uds://` gained the handshake, and reliability
+metadata crosses the decorator→transport boundary via `SendOptions` fields.
+
+See also [capabilities and reserved contracts](capabilities.md).
 
 ## Goal
 
@@ -97,6 +100,47 @@ No durability across process death; no persistence; not exactly-once; no idle
 keepalive probing in v1 (`ReconnectPolicy::heartbeat_interval` stays
 reserved).
 
+## Implementation notes (deltas from the proposal)
+
+Two refinements and two clarifications were applied while implementing; the
+semantics above are otherwise exactly as signed off.
+
+- **`uds://` gained the handshake.** The proposal said capability negotiation
+  rides "the existing handshake capability bitmask", but only `tcp://` had a
+  handshake. A v2 frame can only be emitted after learning the peer's caps, so
+  the TCP-style handshake was added to `uds://` (fire-and-forget client write,
+  stoppable server read in `accept()` with `ListenOptions::handshake_timeout`).
+  No raw `AF_UNIX` client in the suite is affected (the only ones are
+  `lstat`-only or the separate `shm://` bootstrap socket).
+- **`SendOptions` carries the reliability metadata.** `session_id` (u64),
+  `seq` (u64) and `wire_flags` (u32) were added to `SendOptions` (default 0),
+  mirroring the existing `channel_id` idiom by which protocol metadata crosses
+  the decorator→transport boundary. `Pipe::negotiated_capabilities()` is a new
+  additive virtual (default 0); `ReconnectPipe` memoizes it across the
+  disconnect window exactly like `max_message_bytes()`.
+- **ACKs are `kAck = 1<<7`, not `kCtrl`.** Transports swallow `kCtrl` frames
+  forever (the handshake reply loop), which would eat every ACK. ACK frames are
+  a distinct flag with a 16-byte payload `{session_id u64 BE, cumulative u64
+  BE}`.
+- **The server resumes by handshake-announced session id.** A per-listener
+  `ReliabilitySessionTable` (capped at 4096 sessions) is shared by every
+  accepted connection, keyed by the dialer's id, so a redial resumes
+  `next_expected_in`/`next_seq_out` without a separate HELLO frame — the server
+  must know the id before any frame flows, so it rides the handshake, not the
+  first data frame.
+- **Backpressure mapping.** `kFailFast`/`kDropNew` on a full window report
+  `kQueueFull` (the message is dropped, caller may retry); `kDropOld` evicts the
+  oldest unacked message (degraded to at-most-once); `kBlock` waits on the
+  window's condition variable for the bounded send timeout, then `kTimeout`.
+- **`ReconnectPipe::mark_disconnected` demotes state under the same lock that
+  unlinks `inner_`.** The replay hook runs inside the reconnect worker's
+  `kConnected` publish, so a redial that lands while a dying connection's send
+  error is still being processed used to have its fresh `kConnected` overwritten
+  by the stale `kDisconnected` — a live inner pipe beside a disconnected state,
+  which `wait_connected` never satisfies: every send (replay included) timed out
+  and at-least-once delivery stalled. Flipping the state in the same critical
+  section as `publish_connected` closes that window; acceptance R1/R2 found it.
+
 ## Decision points (user sign-off required)
 
 - **D1 — wire encoding**: extended 32-byte header (recommended) vs flags-only
@@ -110,8 +154,9 @@ reserved).
   (redelivery after reconnect), R2 (dedup of replayed messages), R3 (window
   bound under backpressure), R4 (graceful v1-peer degradation).
 
-## Acceptance criteria (future work, gated on D1–D5)
+## Acceptance criteria (met)
 
-Implement `ReliablePipe`, add cells R1–R4 to the suite, keep L1–L5 green for
-`kAtMostOnce`, and update `capabilities.md` (move the reserved row to the
-implemented table) in the same change.
+`ReliablePipe` landed in `src/reliable_pipe.{h,cc}`; cells R1–R4 are in
+`tests/reliability_tests.cc`; L1–L5 stay green on `kAtMostOnce` defaults
+(reliability is a no-op unless opted in); `capabilities.md` moves the reserved
+row to the implemented table (same change).

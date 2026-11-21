@@ -21,6 +21,7 @@ add_library(duct
   src/message.cc
   src/qos_pipe.cc
   src/reconnect_pipe.cc
+  src/reliable_pipe.cc
   src/socket_utils.cc
   src/shm_transport.cc
   src/tcp_transport.cc
@@ -90,6 +91,7 @@ if (DUCT_BUILD_TESTS)
     tests/wire_tests.cc
     tests/session_tests.cc
     tests/loss_injection_tests.cc
+    tests/reliability_tests.cc
     tests/adapter_tests.cc
   )
   target_link_libraries(duct_tests PRIVATE duct)

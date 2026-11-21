@@ -171,6 +171,19 @@ class ReconnectPipe final : public Pipe {
     return last_bound_.load(std::memory_order_acquire);
   }
 
+  // Forward the negotiated capability bitmask from the live inner pipe, memoized
+  // like max_message_bytes(): during a disconnect window inner_ is empty and a
+  // caller (the reliability layer's reconnect callback) must still see the caps
+  // of the connection it is about to recover, not the base default 0.
+  std::uint32_t negotiated_capabilities() const override {
+    std::shared_ptr<Pipe> inner_snapshot = snapshot_inner();
+    if (inner_snapshot) {
+      last_caps_.store(inner_snapshot->negotiated_capabilities(),
+                       std::memory_order_release);
+    }
+    return last_caps_.load(std::memory_order_acquire);
+  }
+
   void close() override {
     std::shared_ptr<Pipe> inner_to_close;
     {
@@ -226,26 +239,37 @@ class ReconnectPipe final : public Pipe {
 
   void mark_disconnected(const std::shared_ptr<Pipe>& which, const std::string& reason) {
     std::shared_ptr<Pipe> inner_to_close;
-    bool is_current = false;
+    ConnectionCallback cb;
+    bool fire = false;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (closed_) return;
-      is_current = inner_ && inner_ == which;
-      if (is_current) {
-        inner_to_close = std::move(inner_);
-        last_error_ = reason;
-        cv_.notify_all();
+      if (!(inner_ && inner_ == which)) {
+        // Stale error from a prior connection: it was closed when it was marked,
+        // but close it again (idempotent) so a snapshot still held by another
+        // caller cannot keep the transport alive past the disconnect.
+        which->close();
+        return;
       }
+      inner_to_close = std::move(inner_);
+      last_error_ = reason;
+      // Unlinking inner_ and demoting state_ are one critical section, exactly as
+      // publish_connected sets both under the same lock: wait_connected requires
+      // both. Demoting after the unlock let publish_connected land in the gap and
+      // have its kConnected overwritten by this late kDisconnected, leaving a
+      // live inner_ beside a stale disconnected state that wait_connected's
+      // predicate never satisfied -- every send then timed out, the reliability
+      // layer's replay included, and the worker, never seeing an error on the
+      // connection it published, stayed put instead of redialing.
+      if (state_ != ConnectionState::kDisconnected) {
+        state_ = ConnectionState::kDisconnected;
+        cb = on_state_change_;
+        fire = true;
+      }
+      cv_.notify_all();
     }
-    if (!is_current) {
-      // Stale error from a prior connection: it was closed when it was marked,
-      // but close it again (idempotent) so a snapshot still held by another
-      // caller cannot keep the transport alive past the disconnect.
-      which->close();
-      return;
-    }
-    set_state(ConnectionState::kDisconnected, reason);
     if (inner_to_close) inner_to_close->close();
+    if (fire && cb) cb(ConnectionState::kDisconnected, reason);
   }
 
   void worker_loop() {
@@ -343,6 +367,8 @@ class ReconnectPipe final : public Pipe {
   // Last inner bound seen by max_message_bytes(); unbounded until the first
   // successful dial lands an inner pipe.
   mutable std::atomic<std::size_t> last_bound_{std::numeric_limits<std::size_t>::max()};
+  // Last negotiated caps seen; 0 until the first successful dial.
+  mutable std::atomic<std::uint32_t> last_caps_{0};
 };
 
 }  // namespace

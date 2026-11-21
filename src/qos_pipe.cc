@@ -137,6 +137,9 @@ void QosPipe::send_worker() {
     SendOptions opt;
     opt.timeout = std::chrono::milliseconds(100);
     opt.channel_id = msg_to_send.channel_id;
+    opt.session_id = msg_to_send.session_id;
+    opt.seq = msg_to_send.seq;
+    opt.wire_flags = msg_to_send.wire_flags;
     auto result = underlying_->send(msg_to_send.message, opt);
 
     if (!result.ok()) {
@@ -266,6 +269,10 @@ Result<void> QosPipe::send(const Message& msg, const SendOptions& opt) {
 
   // Add message to send queue
   send_queue_.emplace_back(msg, opt.priority, opt.channel_id);
+  QueuedMessage& queued = send_queue_.back();
+  queued.session_id = opt.session_id;
+  queued.seq = opt.seq;
+  queued.wire_flags = opt.wire_flags;
   send_bytes_ += msg.size();
   send_count_ += 1;
 

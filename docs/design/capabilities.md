@@ -16,6 +16,7 @@ Last reviewed: 2026-11-21.
 | Framing | 16-byte wire header; socket transports cap single frames at 64 KiB and fragment/reassemble larger messages up to 64 MiB; Windows `pipe://` and `shm://` reject oversize synchronously | `include/duct/wire.h`, `src/wire.cc` |
 | QoS layer | Send/recv byte watermarks, item-count cap, backpressure policies, per-message TTL, linger drain, priority, rate limit, channel multiplexing | `include/duct/qos_pipe.h`, `src/qos_pipe.cc` |
 | Reconnect | Automatic redial with exponential backoff + jitter, bounded attempts, state callbacks | `ReconnectPolicy`, `src/reconnect_pipe.cc`; `dial()` returns connected or fails within the deadline |
+| Reliability | At-least-once delivery on `tcp://`/`uds://` via opt-in `Reliability::kAtLeastOnce`: session id + seq + cumulative ACK + retransmit window (bounded by `snd_hwm_bytes`) + receiver dedup; `kAtLeastOnce` auto-enables reconnect | `QosOptions::reliability`, `src/reliable_pipe.{h,cc}`; `shm://`/`pipe://` reject it with `kNotSupported` at dial |
 | Adapters | Header-only builder/request-reply/batch/loop layer and RAII scoped wrappers; installed with the library, compiled by the test suite | `include/duct/convenience.h`, `include/duct/raii.h` |
 | RPC / pub-sub | Correlated request/response and topic broker, header-only | `include/duct/rpc.h`, `include/duct/pubsub.h` |
 | Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:108-164` |
@@ -25,7 +26,11 @@ Last reviewed: 2026-11-21.
 
 - No async/event-loop API on the pipe itself. (When QoS is enabled the send
   side does run an internal queue-drain worker.)
-- Delivery is at-most-once. No durability, no retransmit across process death.
+- Delivery is at-most-once by default and on every transport without an opt-in:
+  no durability, no retransmit across process death. (`tcp://`/`uds://` dials
+  that opt into `Reliability::kAtLeastOnce` redeliver the unacked window across
+  redials — see the reliability row above and
+  [reliability-at-least-once](reliability-at-least-once.md).)
 - No TLS or other credential layers. A design proposal (tcp-only scope,
   OpenSSL-vs-platform, opt-in via `TlsOptions`, optional mTLS) with
   decision points T1–T5 awaits sign-off: [tls-mtls](tls-mtls.md); current
@@ -41,7 +46,6 @@ Setting them has no effect today; activating them later is source-compatible.
 | Field | Declared at | Current effect |
 |---|---|---|
 | `ReconnectPolicy::heartbeat_interval` | `include/duct/duct.h:45` | none — keepalives are whatever the OS defaults to; an earlier comment claimed a TCP keepalive mapping that was never implemented (corrected 2026-11-09) |
-| `QosOptions::reliability` | `include/duct/duct.h:77` | none — at-most-once is the only delivery semantics; `Reliability::kAtMostOnce` is the only enum value with an implementation. A protocol proposal (session/seq/ack/retransmit/dedup) with decision points awaits sign-off: [reliability-at-least-once](reliability-at-least-once.md); its fault model is pinned by `tests/loss_injection_tests.cc` |
 | `ListenOptions::qos` | `include/duct/duct.h:181` | none — listener-side QoS is reserved |
 
 Note: the standalone `StateCallbackPipe` decorator (`src/state_callback_pipe.*`)

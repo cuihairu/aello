@@ -12,6 +12,7 @@
 #include "wire_tests.h"
 #include "session_tests.h"
 #include "loss_injection_tests.h"
+#include "reliability_tests.h"
 #include "adapter_tests.h"
 
 int main() {
@@ -136,6 +137,11 @@ int main() {
   RUN_TEST(test_pubsub_multiple_subscribers);
   RUN_TEST(test_pubsub_subscription_outlives_broker);
   RUN_TEST(test_pubsub_concurrent_broker_subscription_destruction);
+
+  RUN_TEST(test_reliable_redelivers_after_reconnect);
+  RUN_TEST(test_reliable_replay_is_deduplicated);
+  RUN_TEST(test_reliable_window_bounded_by_snd_hwm);
+  RUN_TEST(test_reliable_degrades_to_at_most_once_against_v1_peer);
 
   RUN_TEST(test_adapter_dial_builder_propagates_options);
   RUN_TEST(test_adapter_listen_builder_binds_and_accepts);

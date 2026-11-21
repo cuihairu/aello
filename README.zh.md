@@ -22,8 +22,9 @@
 
 能力矩阵——已有什么、明确没有什么、哪些选项字段是预留但未被消费的——只在
 一处维护：[`docs/design/capabilities.md`](docs/design/capabilities.md)；本节及
-英文版仅作摘要。显著的缺失：管道本身没有异步/事件循环 API，送达语义为至多
-一次，没有 TLS 层。
+英文版仅作摘要。显著的缺失：管道本身没有异步/事件循环 API，送达语义默认
+为至多一次（在 `tcp://`/`uds://` 上显式启用 `Reliability::kAtLeastOnce` 可跨
+重连重投未确认窗口），没有 TLS 层。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
 
@@ -100,7 +101,9 @@ auto reply = pipe.value()->recv({});
 - **`shm://` 队列满行为：** send 阻塞至有空间或超时（`SendOptions::timeout`），
   超时返回 `kTimeout`。这是传输层（关闭 QoS 时）的行为；启用 QoS 时先由
   内存发送队列的 `snd_hwm_bytes` 高水位约束。
-- **可靠性为 at-most-once。** 对端死亡时在途消息丢失；可靠投递是应用层课题。
+- **送达默认为 at-most-once。** 对端死亡时在途消息丢失。在 `tcp://`/`uds://`
+  拨号上显式启用 `Reliability::kAtLeastOnce`（会自动开启重连）可跨重连重投
+  未确认窗口，并在接收端去重。跨进程死亡的持久投递仍是应用层课题。
 
 ## 构建
 

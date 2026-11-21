@@ -26,7 +26,9 @@ The capability matrix — what exists, what does **not** exist yet, and which
 option fields are reserved but not consumed — is maintained in one place,
 [`docs/design/capabilities.md`](docs/design/capabilities.md); this section and
 its Chinese twin only summarize it. Notable absences: no async/event-loop API
-on the pipe itself, delivery is at-most-once, and there is no TLS layer.
+on the pipe itself, delivery is at-most-once by default (opt-in
+`Reliability::kAtLeastOnce` on `tcp://`/`uds://` redelivers the unacked window
+across redials), and there is no TLS layer.
 
 Design audit and roadmap live in [`docs/design/`](docs/design/):
 
@@ -106,8 +108,11 @@ Every call returns a `Result<T>`; check `.ok()` and read `.status()` — no exce
   (`SendOptions::timeout`), then returns `kTimeout`. This is the transport-level
   behavior (with QoS disabled); with QoS enabled the in-memory send queue's
   `snd_hwm_bytes` water mark applies first.
-- **Reliability is at-most-once.** Messages in flight are lost if a peer dies;
-  durable delivery is an application-level concern.
+- **Delivery is at-most-once by default.** Messages in flight are lost if a
+  peer dies. Opting into `Reliability::kAtLeastOnce` on a `tcp://`/`uds://` dial
+  (which auto-enables reconnect) redelivers the unacked window across redials
+  with receiver-side dedup. Durable delivery across process death remains an
+  application-level concern.
 
 ## Building
 

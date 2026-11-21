@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
+#include <utility>
 #if defined(__APPLE__)
 #include <mutex>
 #endif
@@ -25,7 +27,24 @@
 
 namespace duct::wire {
 
-void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]) {
+namespace {
+
+// 64-bit network order helpers. ntohll/htonll are not standard (POSIX only
+// defines the 32-bit pair; glibc/macOS/WinSock disagree on the 64-bit names),
+// so the v2 trailer uses explicit byte shuffling like the 16-bit fields do.
+inline std::uint64_t load_be64(const std::uint8_t* p) {
+  std::uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<std::uint64_t>(p[i]);
+  return v;
+}
+
+inline void store_be64(std::uint8_t* p, std::uint64_t v) {
+  for (int i = 0; i < 8; ++i) {
+    p[i] = static_cast<std::uint8_t>(v >> (56 - 8 * i));
+  }
+}
+
+void encode_base_fields(const FrameHeader& h, std::uint8_t* out) {
   std::uint32_t magic = htonl(h.magic);
   std::uint16_t version = htons(h.version);
   std::uint16_t header_len = htons(h.header_len);
@@ -39,7 +58,9 @@ void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]) {
   std::memcpy(out + 12, &flags, 4);
 }
 
-Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
+// Decodes the 16-byte base. `ext` (optional) points at the 16-byte v2 trailer
+// that follows the base when header_len == kHeaderLenV2.
+Result<FrameHeader> decode_impl(const std::uint8_t* base, const std::uint8_t* ext) {
   FrameHeader h;
   std::uint32_t magic = 0;
   std::uint16_t version = 0;
@@ -47,11 +68,11 @@ Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
   std::uint32_t payload_len = 0;
   std::uint32_t flags = 0;
 
-  std::memcpy(&magic, in + 0, 4);
-  std::memcpy(&version, in + 4, 2);
-  std::memcpy(&header_len, in + 6, 2);
-  std::memcpy(&payload_len, in + 8, 4);
-  std::memcpy(&flags, in + 12, 4);
+  std::memcpy(&magic, base + 0, 4);
+  std::memcpy(&version, base + 4, 2);
+  std::memcpy(&header_len, base + 6, 2);
+  std::memcpy(&payload_len, base + 8, 4);
+  std::memcpy(&flags, base + 12, 4);
 
   h.magic = ntohl(magic);
   h.version = ntohs(version);
@@ -62,16 +83,46 @@ Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
   if (h.magic != kProtocolMagic) {
     return Status::protocol_error("bad magic");
   }
-  if (h.version != kProtocolVersion) {
+  if (h.version == kProtocolVersion && h.header_len == kHeaderLen) {
+    // v1 frame: no trailer.
+  } else if (h.version == kProtocolVersionV2 && h.header_len == kHeaderLenV2) {
+    // v2 frame: the reliability trailer follows the base. Without the bytes
+    // in hand the stream cannot be trusted, so report a protocol error.
+    if (ext == nullptr) {
+      return Status::protocol_error("truncated v2 header");
+    }
+    h.session_id = load_be64(ext + 0);
+    h.seq = load_be64(ext + 8);
+    if (h.session_id == 0) {
+      return Status::protocol_error("v2 frame without session id");
+    }
+  } else {
     return Status::protocol_error("unsupported version");
-  }
-  if (h.header_len != kHeaderLen) {
-    return Status::protocol_error("bad header_len");
   }
   if (h.payload_len > kMaxFramePayload) {
     return Status::protocol_error("payload too large (frame)");
   }
   return h;
+}
+
+}  // namespace
+
+void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]) {
+  encode_base_fields(h, out);
+}
+
+Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
+  return decode_impl(in, nullptr);
+}
+
+void encode_header_v2(const FrameHeader& h, std::uint8_t out[kHeaderLenV2]) {
+  encode_base_fields(h, out);
+  store_be64(out + kHeaderLen, h.session_id);
+  store_be64(out + kHeaderLen + 8, h.seq);
+}
+
+Result<FrameHeader> decode_header_v2(const std::uint8_t in[kHeaderLenV2]) {
+  return decode_impl(in, in + kHeaderLen);
 }
 
 namespace {
@@ -266,7 +317,7 @@ Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n,
 }  // namespace
 
 Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags,
-                         std::chrono::milliseconds timeout) {
+                         std::chrono::milliseconds timeout, const FrameMeta& meta) {
   auto deadline = timeout.count() > 0
       ? std::chrono::steady_clock::now() + timeout
       : std::chrono::steady_clock::time_point{};
@@ -294,19 +345,32 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
 
     FrameHeader h;
     h.magic = kProtocolMagic;
-    h.version = kProtocolVersion;
-    h.header_len = static_cast<std::uint16_t>(kHeaderLen);
     h.payload_len = static_cast<std::uint32_t>(chunk);
     h.flags = flags;
     if (fragmented) {
       h.flags |= to_u32(FrameFlags::kFrag);
       if (last) h.flags |= to_u32(FrameFlags::kFragFinal);
     }
+    // A nonzero session id selects the v2 encoding: the same session/seq repeats
+    // on every fragment chunk so the reassembled FrameMessage keeps them.
+    if (meta.session_id != 0) {
+      h.version = kProtocolVersionV2;
+      h.header_len = static_cast<std::uint16_t>(kHeaderLenV2);
+      h.session_id = meta.session_id;
+      h.seq = meta.seq;
+    } else {
+      h.version = kProtocolVersion;
+      h.header_len = static_cast<std::uint16_t>(kHeaderLen);
+    }
 
-    std::uint8_t hdr[kHeaderLen];
-    encode_header(h, hdr);
+    std::uint8_t hdr[kHeaderLenV2];
+    if (meta.session_id != 0) {
+      encode_header_v2(h, hdr);
+    } else {
+      encode_header(h, hdr);
+    }
     bool frame_started = false;
-    auto st = write_all(fd, hdr, sizeof(hdr), &frame_started, deadline);
+    auto st = write_all(fd, hdr, h.header_len, &frame_started, deadline);
     if (!st.ok()) return st;
     if (chunk != 0) {
       st = write_all(fd, data + offset, chunk, &frame_started, deadline);
@@ -338,24 +402,39 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
 
   std::vector<std::uint8_t> assembled;
   std::uint32_t frame_flags = 0;
+  std::uint64_t frame_session = 0;
+  std::uint64_t frame_seq = 0;
   bool first = true;
   std::size_t chunks = 0;
   for (;;) {
-    std::uint8_t hdr[kHeaderLen];
+    // Read the 16-byte base first, then the 16-byte v2 trailer when the base
+    // header announces header_len == kHeaderLenV2. The base read is the single
+    // place a partial header can strand the stream, so it alone owns the
+    // mid-frame timeout classification.
+    std::uint8_t hdr[kHeaderLenV2];
     bool frame_started = false;
-    auto st = read_exact(fd, hdr, sizeof(hdr), &frame_started);
+    auto st = read_exact(fd, hdr, kHeaderLen, &frame_started);
     if (!st.ok()) return st.status();
-    auto decoded = decode_header(hdr);
+    std::uint16_t header_len = 0;
+    std::memcpy(&header_len, hdr + 6, 2);
+    header_len = ntohs(header_len);
+    if (header_len == kHeaderLenV2) {
+      st = read_exact(fd, hdr + kHeaderLen, kHeaderLenV2 - kHeaderLen, &frame_started);
+      if (!st.ok()) return st.status();
+    }
+    auto decoded = header_len == kHeaderLenV2 ? decode_header_v2(hdr) : decode_header(hdr);
     if (!decoded.ok()) return decoded.status();
-
+    const FrameHeader h = decoded.value();
     if (++chunks > kMaxFragChunks) {
       return Status::protocol_error("fragment stream has too many chunks");
     }
 
-    const std::uint32_t payload_len = decoded.value().payload_len;
-    const bool is_frag = (decoded.value().flags & to_u32(FrameFlags::kFrag)) != 0;
-    const bool is_final = (decoded.value().flags & to_u32(FrameFlags::kFragFinal)) != 0;
-    frame_flags = decoded.value().flags;
+    const std::uint32_t payload_len = h.payload_len;
+    const bool is_frag = (h.flags & to_u32(FrameFlags::kFrag)) != 0;
+    const bool is_final = (h.flags & to_u32(FrameFlags::kFragFinal)) != 0;
+    frame_flags = h.flags;
+    frame_session = h.session_id;
+    frame_seq = h.seq;
 
     if (first) {
       if (!is_frag) {
@@ -369,7 +448,8 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
           st = read_exact(fd, buf.data(), buf.size(), &payload_started);
           if (!st.ok()) return st.status();
         }
-        return FrameMessage{Message::from_bytes(buf.data(), buf.size()), frame_flags};
+        return FrameMessage{Message::from_bytes(buf.data(), buf.size()), frame_flags,
+                            frame_session, frame_seq};
       }
       if (payload_len > kMaxReassembledBytes) {
         return Status::protocol_error("fragment stream too large");
@@ -381,7 +461,10 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
         if (!st.ok()) return st.status();
       }
       first = false;
-      if (is_final) return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()), frame_flags};
+      if (is_final) {
+        return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()),
+                            frame_flags, frame_session, frame_seq};
+      }
       continue;
     }
 
@@ -396,22 +479,47 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
       st = read_exact(fd, assembled.data() + old_size, payload_len, &payload_started);
       if (!st.ok()) return st.status();
     }
-    if (is_final) return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()), frame_flags};
+    if (is_final) {
+      return FrameMessage{Message::from_bytes(assembled.data(), assembled.size()),
+                          frame_flags, frame_session, frame_seq};
+    }
   }
 }
 
 namespace {
 
 constexpr std::uint8_t kHandshakeKind = 0x01;
-constexpr std::size_t kHandshakeLen = 5;
+constexpr std::size_t kHandshakeLen = 13;
+
+// Parse the fixed handshake payload: [0]=version, [1..5)=caps (host order,
+// memcpy — matches the historical layout), [5..13)=session id (BE).
+Result<std::pair<std::uint32_t, std::uint64_t>> parse_handshake_payload(
+    const std::string_view& sv) {
+  if (sv.size() != kHandshakeLen) {
+    return Status::protocol_error("handshake length mismatch");
+  }
+  if (static_cast<std::uint8_t>(sv[0]) != kProtocolVersion) {
+    return Status::protocol_error("unsupported protocol version");
+  }
+  std::uint32_t caps = 0;
+  std::memcpy(&caps, sv.data() + 1, sizeof(caps));
+  return std::make_pair(caps, load_be64(reinterpret_cast<const std::uint8_t*>(sv.data()) + 5));
+}
+
+void build_handshake_payload(std::uint8_t payload[kHandshakeLen], std::uint32_t caps,
+                             std::uint64_t session_id) {
+  payload[0] = kProtocolVersion;
+  std::memcpy(payload + 1, &caps, sizeof(caps));
+  store_be64(payload + 5, session_id);
+}
 
 }  // namespace
 
 Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+                              std::uint64_t session_id,
                               std::chrono::milliseconds timeout) {
   std::uint8_t payload[kHandshakeLen] = {};
-  payload[0] = kProtocolVersion;
-  std::memcpy(payload + 1, &capabilities, sizeof(capabilities));
+  build_handshake_payload(payload, capabilities, session_id);
   // Fire-and-forget: write the request so a dial() that returns before the peer
   // calls accept() cannot deadlock. The server validates the version and
   // closes the connection on mismatch, so no synchronous reply is needed.
@@ -419,29 +527,36 @@ Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
                      to_u32(FrameFlags::kCtrl), timeout);
 }
 
-Result<std::uint32_t> handshake_server(SocketHandle fd, std::uint32_t server_capabilities,
-                                       std::chrono::milliseconds timeout) {
+Result<std::uint32_t> handshake_client_sync(SocketHandle fd, std::uint32_t capabilities,
+                                            std::chrono::milliseconds timeout,
+                                            std::uint64_t session_id) {
+  auto ws = handshake_client(fd, capabilities, session_id, timeout);
+  if (!ws.ok()) return ws.status();
+  // Read the server's reply. The dial needs the negotiated capabilities before
+  // its first frame (reliability chooses v2 vs v1), so this is a synchronous
+  // round-trip bounded by `timeout`.
   auto r = read_frame_with_flags(fd, timeout);
   if (!r.ok()) return r.status();
-  const auto& sv = r.value().message.as_string_view();
-  if (sv.size() != kHandshakeLen) {
-    return Status::protocol_error("handshake length mismatch");
-  }
-  if (static_cast<std::uint8_t>(sv[0]) != kProtocolVersion) {
-    return Status::protocol_error("unsupported protocol version");
-  }
-  std::uint32_t client_caps = 0;
-  std::memcpy(&client_caps, sv.data() + 1, sizeof(client_caps));
+  auto parsed = parse_handshake_payload(r.value().message.as_string_view());
+  if (!parsed.ok()) return parsed.status();
+  return parsed.value().first;
+}
+
+Result<HandshakeResult> handshake_server(SocketHandle fd, std::uint32_t server_capabilities,
+                                         std::chrono::milliseconds timeout) {
+  auto r = read_frame_with_flags(fd, timeout);
+  if (!r.ok()) return r.status();
+  auto parsed = parse_handshake_payload(r.value().message.as_string_view());
+  if (!parsed.ok()) return parsed.status();
   std::uint8_t reply[kHandshakeLen] = {};
-  reply[0] = kProtocolVersion;
-  std::memcpy(reply + 1, &server_capabilities, sizeof(server_capabilities));
+  build_handshake_payload(reply, server_capabilities, /*session_id=*/0);
   auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
                         to_u32(FrameFlags::kCtrl), timeout);
   if (!ws.ok()) return ws.status();
-  return client_caps;
+  return HandshakeResult{parsed.value().first, parsed.value().second};
 }
 
-Result<std::uint32_t> handshake_server_stoppable(
+Result<HandshakeResult> handshake_server_stoppable(
     SocketHandle fd, std::uint32_t server_capabilities,
     std::chrono::milliseconds timeout, const std::atomic<bool>& stop) {
   // Slice the handshake read into 100ms windows: the stop flag must be
@@ -467,25 +582,17 @@ Result<std::uint32_t> handshake_server_stoppable(
     }
     auto r = read_frame_with_flags(fd, slice);
     if (r.ok()) {
-      const auto& sv = r.value().message.as_string_view();
-      if (sv.size() != kHandshakeLen) {
-        return Status::protocol_error("handshake length mismatch");
-      }
-      if (static_cast<std::uint8_t>(sv[0]) != kProtocolVersion) {
-        return Status::protocol_error("unsupported protocol version");
-      }
-      std::uint32_t client_caps = 0;
-      std::memcpy(&client_caps, sv.data() + 1, sizeof(client_caps));
+      auto parsed = parse_handshake_payload(r.value().message.as_string_view());
+      if (!parsed.ok()) return parsed.status();
       if (stop.load(std::memory_order_acquire)) {
         return Status::closed("listener closed");
       }
       std::uint8_t reply[kHandshakeLen] = {};
-      reply[0] = kProtocolVersion;
-      std::memcpy(reply + 1, &server_capabilities, sizeof(server_capabilities));
+      build_handshake_payload(reply, server_capabilities, /*session_id=*/0);
       auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
                             to_u32(FrameFlags::kCtrl), timeout);
       if (!ws.ok()) return ws.status();
-      return client_caps;
+      return HandshakeResult{parsed.value().first, parsed.value().second};
     }
     if (r.status().code() == StatusCode::kTimeout) continue;  // slice elapsed
     return r.status();
