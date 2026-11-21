@@ -11,6 +11,7 @@
 #include "qos_tests.h"
 #include "wire_tests.h"
 #include "session_tests.h"
+#include "loss_injection_tests.h"
 #include "adapter_tests.h"
 
 int main() {
@@ -118,6 +119,11 @@ int main() {
   RUN_TEST(test_qos_send_failure_does_not_kill_recv);
   RUN_TEST(test_reconnect_ioerror_send_not_resent);
   RUN_TEST(test_reconnect_invalid_policy_rejected_at_dial);
+  RUN_TEST(test_loss_injection_drop_is_silent);
+  RUN_TEST(test_loss_injection_duplicate_arrives_twice);
+  RUN_TEST(test_loss_injection_reorder_observed);
+  RUN_TEST(test_midstream_close_delivers_exact_prefix);
+  RUN_TEST(test_reconnect_gap_losses_are_invisible_to_caller);
   RUN_TEST(test_qos_drop_old_evicts_oldest_queued);
   RUN_TEST(test_concurrent_send_recv_channels);
   RUN_TEST(test_wait_writable_getsockopt_failure_reports_errno);
