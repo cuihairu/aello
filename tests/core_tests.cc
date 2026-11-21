@@ -52,3 +52,23 @@ void test_dial_rejects_negative_timeout() {
     EXPECT_EQ(s.status().code(), duct::StatusCode::kInvalidArgument);
   }
 }
+
+
+// Pinned current behavior: no TLS layer exists (see the proposal in
+// docs/design/tls-mtls.md). tls:// is unknown at the address layer, so
+// dial()/listen() reject it during Address::parse — before any scheme
+// dispatch — with kInvalidArgument. When TLS lands this test is replaced by
+// a real handshake test.
+void test_tls_scheme_rejected_as_unsupported() {
+  {
+    auto r = duct::dial("tls://127.0.0.1:1");
+    EXPECT_TRUE(!r.ok());
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kInvalidArgument);
+    EXPECT_TRUE(r.status().message().find("unknown scheme") != std::string::npos);
+  }
+  {
+    auto r = duct::listen("tls://127.0.0.1:0");
+    EXPECT_TRUE(!r.ok());
+    EXPECT_EQ(r.status().code(), duct::StatusCode::kInvalidArgument);
+  }
+}

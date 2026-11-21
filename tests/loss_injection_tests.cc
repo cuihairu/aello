@@ -1,7 +1,9 @@
 #include "loss_injection_tests.h"
 
+#include <chrono>
 #include <future>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_support.h"
@@ -324,17 +326,27 @@ void test_reconnect_gap_losses_are_invisible_to_caller() {
   EXPECT_TRUE(all.size() <= static_cast<std::size_t>(kTotal));
   EXPECT_TRUE(all.size() >= static_cast<std::size_t>(kPrefix));
 
-  // (d) The wrapper observed the disconnect and recovered.
+  // (d) The wrapper observed the disconnect and recovered. Recovery is
+  // asynchronous with respect to the client's recv path, so poll the callback
+  // log for a bounded window instead of coupling the assertion to when the
+  // redial happened to land: the invariant under test is that recovery
+  // happens at all, not when it lands.
   bool saw_disconnected = false;
   bool connected_after_disconnect = false;
-  {
-    std::lock_guard<std::mutex> lk(st_mu);
-    for (std::size_t i = 0; i < states.size(); ++i) {
-      if (states[i] == duct::ConnectionState::kDisconnected) saw_disconnected = true;
-      if (saw_disconnected && states[i] == duct::ConnectionState::kConnected) {
-        connected_after_disconnect = true;
+  for (int wait = 0; wait < 200; ++wait) {
+    {
+      std::lock_guard<std::mutex> lk(st_mu);
+      saw_disconnected = false;
+      connected_after_disconnect = false;
+      for (std::size_t i = 0; i < states.size(); ++i) {
+        if (states[i] == duct::ConnectionState::kDisconnected) saw_disconnected = true;
+        if (saw_disconnected && states[i] == duct::ConnectionState::kConnected) {
+          connected_after_disconnect = true;
+        }
       }
     }
+    if (saw_disconnected && connected_after_disconnect) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   EXPECT_TRUE(saw_disconnected);
   EXPECT_TRUE(connected_after_disconnect);
