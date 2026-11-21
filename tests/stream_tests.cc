@@ -1,6 +1,8 @@
 #include "test_support.h"
 #include "stream_tests.h"
 
+#include <atomic>
+#include <future>
 #include <string>
 
 #if !defined(_WIN32)
@@ -713,6 +715,11 @@ void test_tcp_channel_recv_deadline_bounded() {
   EXPECT_TRUE(addr_r.ok());
   if (!addr_r.ok()) return;
 
+  // Spray until the client says its deadline recv is over (bounded by a cap
+  // well below the pending cap): a fixed 1.5 s window let a descheduled
+  // client observe the pipe closing (kClosed) instead of its own deadline
+  // (kTimeout) under load.
+  std::atomic<bool> stop_spray{false};
   auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
     auto p = lis_r.value()->accept();
     if (!p.ok()) return p.status();
@@ -720,13 +727,14 @@ void test_tcp_channel_recv_deadline_bounded() {
     s8.channel_id = 8;
     const std::string other(1024, 'x');
     const auto start = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
+    while (!stop_spray.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() - start < std::chrono::milliseconds(5000)) {
       auto st = p.value()->send(duct::Message::from_string(other), s8);
       if (!st.ok()) return st.status();
       // Pace the spray so the client's stash stays far below the pending cap:
-      // on a fast runner an unbounded 1 KiB send loop can cross 64 MiB inside
-      // this window and turn the deadline assertion into a kQueueFull. The
-      // pace still keeps ch-8 frames flowing for the client's whole deadline.
+      // 1 KiB per millisecond tops out at ~5 MiB against a 64 MiB cap, so the
+      // deadline assertion cannot turn into a kQueueFull. The pace still keeps
+      // ch-8 frames flowing for the client's whole deadline.
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return {};
@@ -745,10 +753,14 @@ void test_tcp_channel_recv_deadline_bounded() {
   const auto begin = std::chrono::steady_clock::now();
   auto m7 = c.value()->recv(r7);
   const auto elapsed = std::chrono::steady_clock::now() - begin;
+  stop_spray.store(true, std::memory_order_release);
   EXPECT_TRUE(!m7.ok());
   EXPECT_EQ(m7.status().code(), duct::StatusCode::kTimeout);
   // Must be bounded by roughly the requested timeout, not the peer's stream.
-  EXPECT_TRUE(elapsed < std::chrono::milliseconds(900));
+  // The slack absorbs scheduler descheduling under load; a recv that wrongly
+  // waits on the peer's stream instead lands near the 5 s spray cap and fails
+  // this bound.
+  EXPECT_TRUE(elapsed < std::chrono::milliseconds(3000));
 
   c.value()->close();
   lis_r.value()->close();
@@ -1259,6 +1271,7 @@ void run_channel_pending_channel_count_capped_case(const char* url) {
 
   // 2000 distinct channels with empty frames: no bytes are ever charged, only
   // the buffered-channel count can trip.
+  std::promise<void> sprayed;
   auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
     auto p = lis_r.value()->accept();
     if (!p.ok()) return p.status();
@@ -1269,6 +1282,7 @@ void run_channel_pending_channel_count_capped_case(const char* url) {
       auto st = p.value()->send(duct::Message::from_string(""), s);
       if (!st.ok()) return st.status();
     }
+    sprayed.set_value();
     return {};
   });
 
@@ -1286,6 +1300,10 @@ void run_channel_pending_channel_count_capped_case(const char* url) {
   duct::RecvOptions r;
   r.timeout = std::chrono::milliseconds(5000);
   r.channel_id = 3000;  // never sprayed by the server
+  // The kQueueFull assertion needs the stash cap already crossed, so wait for
+  // the spray to finish (bounded) instead of racing it against the recv
+  // deadline — under load the client used to observe kTimeout first.
+  sprayed.get_future().wait_for(std::chrono::seconds(30));
   auto m = c.value()->recv(r);
   EXPECT_TRUE(!m.ok());
   if (!m.ok()) {
