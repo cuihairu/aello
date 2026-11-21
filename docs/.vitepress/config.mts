@@ -1,11 +1,52 @@
 import { defineConfig } from 'vitepress'
 
+const base = '/aello/'
+
+// First-visit language auto-redirect: on the first page load of a browser
+// session, if the user's browser language is Chinese and they landed on an
+// English page, send them to the matching /zh/ page. The decision is recorded
+// in sessionStorage so the manual language switcher always wins afterwards
+// (a switch to English is never bounced back, since the flag is already set).
+function langRedirectHead() {
+  return [
+    [
+      'script',
+      {},
+    `
+(function () {
+  try {
+    if (sessionStorage.getItem('aello:docs:lang')) return;
+    var path = window.location.pathname;
+    if (path.indexOf(${JSON.stringify(base)}) !== 0) return; // not on this site
+    var zhRoot = ${JSON.stringify(base)} + 'zh';
+    if (path === zhRoot || path.indexOf(zhRoot + '/') === 0) {
+      sessionStorage.setItem('aello:docs:lang', 'done');
+      return;
+    }
+    var lang = (navigator.languages && navigator.languages[0]) || navigator.language || '';
+    if (!/^zh/i.test(lang)) {
+      sessionStorage.setItem('aello:docs:lang', 'done');
+      return;
+    }
+    sessionStorage.setItem('aello:docs:lang', 'zh');
+    // base ends in '/'; slice from base.length - 1 to keep the leading '/'
+    var rest = path.slice(${JSON.stringify(base)}.length - 1);
+    if (rest === '') rest = '/';
+    window.location.replace(zhRoot + rest + window.location.search + window.location.hash);
+  } catch (e) {}
+})();
+`.trim(),
+    ],
+  ]
+}
+
 export default defineConfig({
-  base: '/aello/',
+  base,
   title: 'Aello',
   description: 'Messaging runtime for game servers',
   cleanUrls: true,
   ignoreDeadLinks: false,
+  head: langRedirectHead(),
   themeConfig: {
     outline: { level: [2, 3] },
     socialLinks: [{ icon: 'github', link: 'https://github.com/cuihairu/aello' }],
