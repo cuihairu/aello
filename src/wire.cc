@@ -192,36 +192,119 @@ Result<void> apply_socket_timeout(SocketHandle fd, bool writing,
   return {};
 }
 
-Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
-                       bool* frame_started,
-                       std::chrono::steady_clock::time_point deadline) {
+#if defined(__APPLE__)
+// Avoid SIGPIPE when writing to a closed socket. macOS offers SO_NOSIGPIPE per
+// socket, but newer XNU (macos-latest runners) rejects it with EINVAL, and
+// merely blocking SIGPIPE does not help: XNU queues the blocked signal and
+// delivers it once the mask is restored (both confirmed by the sigpipe-probe
+// workflow). Where SO_NOSIGPIPE is unavailable, temporarily set SIGPIPE to
+// SIG_IGN for the duration of the send call; a mutex serializes concurrent
+// writers so the previous handler is restored once.
+class SigpipeGuard {
+ public:
+  explicit SigpipeGuard(SocketHandle fd) {
+    int one = 1;
+    ok_ = ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0;
+    if (!ok_) {
+      lock_ = std::unique_lock<std::mutex>(mu());
+      sigemptyset(&ign_.sa_mask);
+      ign_.sa_handler = SIG_IGN;
+      (void)::sigaction(SIGPIPE, &ign_, &prev_);
+    }
+  }
+  ~SigpipeGuard() {
+    if (!ok_) (void)::sigaction(SIGPIPE, &prev_, nullptr);
+  }
+
+ private:
+  static std::mutex& mu() {
+    static std::mutex m;
+    return m;
+  }
+  bool ok_ = false;
+  std::unique_lock<std::mutex> lock_;
+  struct sigaction ign_ {};
+  struct sigaction prev_ {};
+};
+#endif
+
+}  // namespace
+
+// SocketStream: the framing behavior moved behind the Stream interface.
+Result<std::size_t> SocketStream::write_some(const void* data, std::size_t len,
+                                             std::chrono::milliseconds timeout) {
 #if defined(_WIN32)
   auto wsa = ensure_winsock();
-  if (!wsa.ok()) return wsa;
+  if (!wsa.ok()) return wsa.status();
 #endif
+  auto st = apply_socket_timeout(fd_, /*writing=*/true, timeout);
+  if (!st.ok()) return st.status();
 #if defined(__APPLE__)
-  // Avoid SIGPIPE when writing to a closed socket. macOS offers SO_NOSIGPIPE
-  // per socket, but newer XNU (macos-latest runners) rejects it with EINVAL,
-  // and merely blocking SIGPIPE does not help: XNU queues the blocked signal
-  // and delivers it once the mask is restored (both confirmed by the
-  // sigpipe-probe workflow). Where SO_NOSIGPIPE is unavailable, temporarily
-  // set SIGPIPE to SIG_IGN for the duration of the send loop; a mutex
-  // serializes concurrent writers so the previous handler is restored once.
-  static std::mutex sigpipe_ignore_mu;
-  int one = 1;
-  const bool nosigpipe_ok =
-      ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) == 0;
-  std::unique_lock<std::mutex> ignore_lock;
-  struct sigaction ign {};
-  struct sigaction prev_handler {};
-  if (!nosigpipe_ok) {
-    ignore_lock = std::unique_lock<std::mutex>(sigpipe_ignore_mu);
-    sigemptyset(&ign.sa_mask);
-    ign.sa_handler = SIG_IGN;
-    (void)::sigaction(SIGPIPE, &ign, &prev_handler);
-  }
+  SigpipeGuard guard(fd_);
 #endif
+  for (;;) {
+#if defined(_WIN32)
+    int w = ::send(static_cast<SOCKET>(fd_), reinterpret_cast<const char*>(data),
+                   static_cast<int>(len), 0);
+#else
+    ssize_t w = ::send(fd_, data, len, 0);
+#endif
+    if (w < 0) {
+      int error = get_last_error();
+      if (interrupted(error)) continue;
+      if (timed_out(error)) return Status::timeout("send() timed out");
+      return Status::io_error("send() failed");
+    }
+    if (w == 0) return Status::closed("peer closed");
+    return static_cast<std::size_t>(w);
+  }
+}
+
+Result<std::size_t> SocketStream::read_some(void* buf, std::size_t cap,
+                                            std::chrono::milliseconds timeout) {
+#if defined(_WIN32)
+  auto wsa = ensure_winsock();
+  if (!wsa.ok()) return wsa.status();
+#endif
+  auto st = apply_socket_timeout(fd_, /*writing=*/false, timeout);
+  if (!st.ok()) return st.status();
+  for (;;) {
+#if defined(_WIN32)
+    int r = ::recv(static_cast<SOCKET>(fd_), reinterpret_cast<char*>(buf),
+                   static_cast<int>(cap), 0);
+#else
+    ssize_t r = ::recv(fd_, buf, cap, 0);
+#endif
+    if (r < 0) {
+      int error = get_last_error();
+      if (interrupted(error)) continue;
+      if (timed_out(error)) return Status::timeout("recv() timed out");
+      return Status::io_error("recv() failed");
+    }
+    // 0 is a clean EOF; the caller (read_exact) classifies it as kClosed.
+    return static_cast<std::size_t>(r);
+  }
+}
+
+void SocketStream::shutdown() {
+#if defined(_WIN32)
+  ::shutdown(static_cast<SOCKET>(fd_), SD_BOTH);
+#else
+  ::shutdown(fd_, SHUT_RDWR);
+#endif
+}
+
+namespace {
+
+// Framing over a Stream. `frame_started` tracks whether any byte of the current
+// frame already moved: a timeout after that point desynchronizes the byte
+// stream, so it is a hard error (the connection must be closed) rather than a
+// retryable timeout.
+Result<void> write_all(Stream& stream, const std::uint8_t* p, std::size_t n,
+                       bool* frame_started,
+                       std::chrono::steady_clock::time_point deadline) {
   while (n != 0) {
+    std::chrono::milliseconds ms(0);
     if (deadline.time_since_epoch().count() != 0) {
       auto remaining = deadline - std::chrono::steady_clock::now();
       if (remaining <= std::chrono::milliseconds::zero()) {
@@ -230,28 +313,17 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
         }
         return Status::timeout("send() timed out");
       }
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+      ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+      // duration_cast truncates a sub-millisecond remaining wait to 0, which
+      // would clear the socket timeout and turn the send into an unbounded
+      // blocking call. Clamp to 1ms so the deadline still bounds the write.
       if (ms <= std::chrono::milliseconds::zero()) {
         ms = std::chrono::milliseconds(1);
       }
-      auto timeout_st = apply_socket_timeout(fd, /*writing=*/true, ms);
-      if (!timeout_st.ok()) return timeout_st;
     }
-#if defined(_WIN32)
-    SOCKET sock = static_cast<SOCKET>(fd);
-    int w = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0);
-#else
-    ssize_t w = ::send(fd, p, n, 0);
-#endif
-    if (w < 0) {
-      int error = get_last_error();
-      if (interrupted(error)) continue;
-#if defined(__APPLE__)
-      if (!nosigpipe_ok) {
-        (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
-      }
-#endif
-      if (timed_out(error)) {
+    auto r = stream.write_some(p, n, ms);
+    if (!r.ok()) {
+      if (r.status().code() == StatusCode::kTimeout) {
         // Only a timeout before the first byte of a frame is safe to retry.
         // Mid-frame the stream is already desynchronized; report a hard error
         // so callers (e.g. QosPipe) close instead of resending the message.
@@ -260,76 +332,44 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n,
         }
         return Status::timeout("send() timed out");
       }
-      return Status::io_error("send() failed");
+      return r.status();
     }
-    if (w == 0) {
-#if defined(__APPLE__)
-      if (!nosigpipe_ok) {
-        (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
-      }
-#endif
-      return Status::closed("peer closed");
-    }
+    if (r.value() == 0) return Status::closed("peer closed");
     *frame_started = true;
-    p += static_cast<std::size_t>(w);
-    n -= static_cast<std::size_t>(w);
+    p += r.value();
+    n -= r.value();
   }
-#if defined(__APPLE__)
-  if (!nosigpipe_ok) {
-    (void)::sigaction(SIGPIPE, &prev_handler, nullptr);
-  }
-#endif
   return {};
 }
 
-Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n,
-                        bool* frame_started) {
-#if defined(_WIN32)
-  auto wsa = ensure_winsock();
-  if (!wsa.ok()) return wsa;
-#endif
+Result<void> read_exact(Stream& stream, std::uint8_t* p, std::size_t n,
+                        bool* frame_started, std::chrono::milliseconds timeout) {
   while (n != 0) {
-#if defined(_WIN32)
-    SOCKET sock = static_cast<SOCKET>(fd);
-    int r = ::recv(sock, reinterpret_cast<char*>(p), static_cast<int>(n), 0);
-#else
-    ssize_t r = ::recv(fd, p, n, 0);
-#endif
-    if (r < 0) {
-      int error = get_last_error();
-      if (interrupted(error)) continue;
-      if (timed_out(error)) {
+    auto r = stream.read_some(p, n, timeout);
+    if (!r.ok()) {
+      if (r.status().code() == StatusCode::kTimeout) {
         if (*frame_started) {
           return Status::io_error("recv() timed out mid-frame");
         }
         return Status::timeout("recv() timed out");
       }
-      return Status::io_error("recv() failed");
+      return r.status();
     }
-    if (r == 0) return Status::closed("peer closed");
+    if (r.value() == 0) return Status::closed("peer closed");
     *frame_started = true;
-    p += static_cast<std::size_t>(r);
-    n -= static_cast<std::size_t>(r);
+    p += r.value();
+    n -= r.value();
   }
   return {};
 }
 
 }  // namespace
 
-Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags,
+Result<void> write_frame(Stream& stream, const Message& msg, std::uint32_t flags,
                          std::chrono::milliseconds timeout, const FrameMeta& meta) {
   auto deadline = timeout.count() > 0
       ? std::chrono::steady_clock::now() + timeout
       : std::chrono::steady_clock::time_point{};
-
-  // Explicitly clear the socket timeout before a "no timeout" send. A prior
-  // bounded write may have left SO_SNDTIMEO in place; leaving it set would
-  // silently turn this blocking send into a timed-out send.
-  if (timeout.count() == 0) {
-    auto timeout_st = apply_socket_timeout(fd, /*writing=*/true,
-                                           std::chrono::milliseconds(0));
-    if (!timeout_st.ok()) return timeout_st;
-  }
 
   // Fragment payloads larger than one frame into kMaxFramePayload chunks. The
   // reader concatenates them until the kFragFinal chunk. Each chunk carries the
@@ -370,10 +410,10 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
       encode_header(h, hdr);
     }
     bool frame_started = false;
-    auto st = write_all(fd, hdr, h.header_len, &frame_started, deadline);
+    auto st = write_all(stream, hdr, h.header_len, &frame_started, deadline);
     if (!st.ok()) return st;
     if (chunk != 0) {
-      st = write_all(fd, data + offset, chunk, &frame_started, deadline);
+      st = write_all(stream, data + offset, chunk, &frame_started, deadline);
       if (!st.ok()) return st;
     }
     offset += chunk;
@@ -382,13 +422,13 @@ Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flag
   return {};
 }
 
-Result<Message> read_frame(SocketHandle fd, std::chrono::milliseconds timeout) {
-  auto r = read_frame_with_flags(fd, timeout);
+Result<Message> read_frame(Stream& stream, std::chrono::milliseconds timeout) {
+  auto r = read_frame_with_flags(stream, timeout);
   if (!r.ok()) return r.status();
   return std::move(r.value().message);
 }
 
-Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
+Result<FrameMessage> read_frame_with_flags(Stream& stream,
                                            std::chrono::milliseconds timeout) {
   constexpr std::size_t kMaxReassembledBytes = 64 * 1024 * 1024;  // 64 MiB
   // Zero-length kFrag continuations never grow the reassembly buffer, so the
@@ -397,8 +437,6 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
   // 64 KiB chunks (1024 chunks for a full 64 MiB message), so this only ever
   // rejects malformed streams.
   constexpr std::size_t kMaxFragChunks = 4096;
-  auto timeout_st = apply_socket_timeout(fd, /*writing=*/false, timeout);
-  if (!timeout_st.ok()) return timeout_st.status();
 
   std::vector<std::uint8_t> assembled;
   std::uint32_t frame_flags = 0;
@@ -413,13 +451,14 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
     // mid-frame timeout classification.
     std::uint8_t hdr[kHeaderLenV2];
     bool frame_started = false;
-    auto st = read_exact(fd, hdr, kHeaderLen, &frame_started);
+    auto st = read_exact(stream, hdr, kHeaderLen, &frame_started, timeout);
     if (!st.ok()) return st.status();
     std::uint16_t header_len = 0;
     std::memcpy(&header_len, hdr + 6, 2);
     header_len = ntohs(header_len);
     if (header_len == kHeaderLenV2) {
-      st = read_exact(fd, hdr + kHeaderLen, kHeaderLenV2 - kHeaderLen, &frame_started);
+      st = read_exact(stream, hdr + kHeaderLen, kHeaderLenV2 - kHeaderLen,
+                      &frame_started, timeout);
       if (!st.ok()) return st.status();
     }
     auto decoded = header_len == kHeaderLenV2 ? decode_header_v2(hdr) : decode_header(hdr);
@@ -445,7 +484,7 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
         std::vector<std::uint8_t> buf(payload_len);
         if (payload_len != 0) {
           bool payload_started = true;
-          st = read_exact(fd, buf.data(), buf.size(), &payload_started);
+          st = read_exact(stream, buf.data(), buf.size(), &payload_started, timeout);
           if (!st.ok()) return st.status();
         }
         return FrameMessage{Message::from_bytes(buf.data(), buf.size()), frame_flags,
@@ -457,7 +496,7 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
       assembled.resize(payload_len);
       if (payload_len != 0) {
         bool payload_started = true;
-        st = read_exact(fd, assembled.data(), payload_len, &payload_started);
+        st = read_exact(stream, assembled.data(), payload_len, &payload_started, timeout);
         if (!st.ok()) return st.status();
       }
       first = false;
@@ -476,7 +515,7 @@ Result<FrameMessage> read_frame_with_flags(SocketHandle fd,
     assembled.resize(old_size + payload_len);
     if (payload_len != 0) {
       bool payload_started = true;
-      st = read_exact(fd, assembled.data() + old_size, payload_len, &payload_started);
+      st = read_exact(stream, assembled.data() + old_size, payload_len, &payload_started, timeout);
       if (!st.ok()) return st.status();
     }
     if (is_final) {
@@ -515,7 +554,7 @@ void build_handshake_payload(std::uint8_t payload[kHandshakeLen], std::uint32_t 
 
 }  // namespace
 
-Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+Result<void> handshake_client(Stream& stream, std::uint32_t capabilities,
                               std::uint64_t session_id,
                               std::chrono::milliseconds timeout) {
   std::uint8_t payload[kHandshakeLen] = {};
@@ -523,41 +562,41 @@ Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
   // Fire-and-forget: write the request so a dial() that returns before the peer
   // calls accept() cannot deadlock. The server validates the version and
   // closes the connection on mismatch, so no synchronous reply is needed.
-  return write_frame(fd, Message::from_bytes(payload, sizeof(payload)),
+  return write_frame(stream, Message::from_bytes(payload, sizeof(payload)),
                      to_u32(FrameFlags::kCtrl), timeout);
 }
 
-Result<std::uint32_t> handshake_client_sync(SocketHandle fd, std::uint32_t capabilities,
+Result<std::uint32_t> handshake_client_sync(Stream& stream, std::uint32_t capabilities,
                                             std::chrono::milliseconds timeout,
                                             std::uint64_t session_id) {
-  auto ws = handshake_client(fd, capabilities, session_id, timeout);
+  auto ws = handshake_client(stream, capabilities, session_id, timeout);
   if (!ws.ok()) return ws.status();
   // Read the server's reply. The dial needs the negotiated capabilities before
   // its first frame (reliability chooses v2 vs v1), so this is a synchronous
   // round-trip bounded by `timeout`.
-  auto r = read_frame_with_flags(fd, timeout);
+  auto r = read_frame_with_flags(stream, timeout);
   if (!r.ok()) return r.status();
   auto parsed = parse_handshake_payload(r.value().message.as_string_view());
   if (!parsed.ok()) return parsed.status();
   return parsed.value().first;
 }
 
-Result<HandshakeResult> handshake_server(SocketHandle fd, std::uint32_t server_capabilities,
+Result<HandshakeResult> handshake_server(Stream& stream, std::uint32_t server_capabilities,
                                          std::chrono::milliseconds timeout) {
-  auto r = read_frame_with_flags(fd, timeout);
+  auto r = read_frame_with_flags(stream, timeout);
   if (!r.ok()) return r.status();
   auto parsed = parse_handshake_payload(r.value().message.as_string_view());
   if (!parsed.ok()) return parsed.status();
   std::uint8_t reply[kHandshakeLen] = {};
   build_handshake_payload(reply, server_capabilities, /*session_id=*/0);
-  auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
+  auto ws = write_frame(stream, Message::from_bytes(reply, sizeof(reply)),
                         to_u32(FrameFlags::kCtrl), timeout);
   if (!ws.ok()) return ws.status();
   return HandshakeResult{parsed.value().first, parsed.value().second};
 }
 
 Result<HandshakeResult> handshake_server_stoppable(
-    SocketHandle fd, std::uint32_t server_capabilities,
+    Stream& stream, std::uint32_t server_capabilities,
     std::chrono::milliseconds timeout, const std::atomic<bool>& stop) {
   // Slice the handshake read into 100ms windows: the stop flag must be
   // observed even while no bytes arrive (a blocked recv is not woken by
@@ -580,7 +619,7 @@ Result<HandshakeResult> handshake_server_stoppable(
       }
       if (slice > std::chrono::milliseconds(100)) slice = std::chrono::milliseconds(100);
     }
-    auto r = read_frame_with_flags(fd, slice);
+    auto r = read_frame_with_flags(stream, slice);
     if (r.ok()) {
       auto parsed = parse_handshake_payload(r.value().message.as_string_view());
       if (!parsed.ok()) return parsed.status();
@@ -589,7 +628,7 @@ Result<HandshakeResult> handshake_server_stoppable(
       }
       std::uint8_t reply[kHandshakeLen] = {};
       build_handshake_payload(reply, server_capabilities, /*session_id=*/0);
-      auto ws = write_frame(fd, Message::from_bytes(reply, sizeof(reply)),
+      auto ws = write_frame(stream, Message::from_bytes(reply, sizeof(reply)),
                             to_u32(FrameFlags::kCtrl), timeout);
       if (!ws.ok()) return ws.status();
       return HandshakeResult{parsed.value().first, parsed.value().second};

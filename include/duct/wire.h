@@ -54,17 +54,72 @@ Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]);
 void encode_header_v2(const FrameHeader& h, std::uint8_t out[kHeaderLenV2]);
 Result<FrameHeader> decode_header_v2(const std::uint8_t in[kHeaderLenV2]);
 
+// A byte stream the framing layer reads/writes through. Raw sockets and
+// encrypted transports (TLS) implement this so the framing code is the same
+// either way; the design (docs/design/tls-mtls.md) layers TLS *before*
+// framing: connect → TLS handshake → capability handshake → frames.
+class Stream {
+ public:
+  virtual ~Stream() = default;
+  // Single timed write. Returns the number of bytes written (partial writes
+  // are reported, never an error). kTimeout when nothing moved within
+  // `timeout` (0 = block forever); kClosed when the peer closed; kIoError
+  // otherwise. Mid-frame timeout classification is the caller's job
+  // (write_frame), so a stream never reports a partial write as an error.
+  virtual Result<std::size_t> write_some(const void* data, std::size_t len,
+                                         std::chrono::milliseconds timeout) = 0;
+  // Single timed read. Returns bytes read; 0 means a clean EOF. kTimeout when
+  // nothing arrived within `timeout` (0 = block forever). A partial header is
+  // the caller's responsibility to classify (read_frame_with_flags).
+  virtual Result<std::size_t> read_some(void* buf, std::size_t cap,
+                                        std::chrono::milliseconds timeout) = 0;
+  // Wake any in-flight read/write so close() cannot hang on a blocked call.
+  virtual void shutdown() = 0;
+};
+
+// Stream over a raw socket fd: applies SO_SNDTIMEO/SO_RCVTIMEO per call and
+// performs one send()/recv(). This is the current framing behavior moved
+// behind the Stream interface (no behavior change).
+class SocketStream final : public Stream {
+ public:
+  explicit SocketStream(SocketHandle fd) : fd_(fd) {}
+  Result<std::size_t> write_some(const void* data, std::size_t len,
+                                 std::chrono::milliseconds timeout) override;
+  Result<std::size_t> read_some(void* buf, std::size_t cap,
+                                std::chrono::milliseconds timeout) override;
+  void shutdown() override;
+
+ private:
+  SocketHandle fd_;
+};
+
 // Socket I/O functions (cross-platform).
 // timeout == 0 keeps the blocking behavior; a positive value bounds each
 // underlying send()/recv() call and yields StatusCode::kTimeout on expiry.
 // A timeout after a frame has partially transferred returns kIoError instead:
 // the byte stream is out of sync, so callers must close the connection rather
 // than resending the message on the same handle.
-Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags = 0,
+//
+// The framing primitives read/write through a Stream. The fd-based overloads
+// wrap the fd in a SocketStream for callers without an explicit stream (the
+// raw transports, tests); transports that add encryption (TLS) pass their own
+// Stream instead.
+Result<void> write_frame(Stream& stream, const Message& msg, std::uint32_t flags = 0,
                          std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
                          const FrameMeta& meta = FrameMeta{});
-Result<Message> read_frame(SocketHandle fd,
+Result<Message> read_frame(Stream& stream,
                            std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+inline Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags = 0,
+                                std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
+                                const FrameMeta& meta = FrameMeta{}) {
+  SocketStream s(fd);
+  return write_frame(s, msg, flags, timeout, meta);
+}
+inline Result<Message> read_frame(SocketHandle fd,
+                                  std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) {
+  SocketStream s(fd);
+  return read_frame(s, timeout);
+}
 
 // A frame together with its flags and reliability trailer. Used by
 // multiplexing/reliability layers to inspect channel id, control bits, session
@@ -77,8 +132,14 @@ struct FrameMessage {
 };
 
 Result<FrameMessage> read_frame_with_flags(
-    SocketHandle fd,
+    Stream& stream,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+inline Result<FrameMessage> read_frame_with_flags(
+    SocketHandle fd,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) {
+  SocketStream s(fd);
+  return read_frame_with_flags(s, timeout);
+}
 
 // Capability/version negotiation. The client sends its capabilities and, for a
 // reliability dial, its session id; the server validates the protocol version
@@ -90,7 +151,7 @@ Result<FrameMessage> read_frame_with_flags(
 // first data frame) so the listener can resume a known session's counters
 // before any frame flows — a server that pushes first needs the dialer's
 // session id to keep its own send-side sequence across redials.
-Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+Result<void> handshake_client(Stream& stream, std::uint32_t capabilities,
                               std::uint64_t session_id = 0,
                               std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 // Request+reply variant: writes the request, then reads the server's kCtrl
@@ -98,7 +159,7 @@ Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
 // capabilities before their first frame (reliability) use this; the
 // fire-and-forget variant above is enough for everyone else.
 Result<std::uint32_t> handshake_client_sync(
-    SocketHandle fd, std::uint32_t capabilities,
+    Stream& stream, std::uint32_t capabilities,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
     std::uint64_t session_id = 0);
 
@@ -109,7 +170,7 @@ struct HandshakeResult {
 };
 
 Result<HandshakeResult> handshake_server(
-    SocketHandle fd, std::uint32_t server_capabilities,
+    Stream& stream, std::uint32_t server_capabilities,
     std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
 // Stop-aware variant of handshake_server(): the client handshake read is
@@ -118,8 +179,36 @@ Result<HandshakeResult> handshake_server(
 // woken by close() on POSIX. Returns kClosed as soon as `stop` is observed
 // set. The overall handshake deadline still bounds the wait.
 Result<HandshakeResult> handshake_server_stoppable(
-    SocketHandle fd, std::uint32_t server_capabilities,
+    Stream& stream, std::uint32_t server_capabilities,
     std::chrono::milliseconds timeout, const std::atomic<bool>& stop);
+
+// fd convenience overloads (wrapping a SocketStream) for the handshake entry
+// points; transports that layer encryption pass their own Stream instead.
+inline Result<void> handshake_client(SocketHandle fd, std::uint32_t capabilities,
+                                     std::uint64_t session_id = 0,
+                                     std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) {
+  SocketStream s(fd);
+  return handshake_client(s, capabilities, session_id, timeout);
+}
+inline Result<std::uint32_t> handshake_client_sync(
+    SocketHandle fd, std::uint32_t capabilities,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
+    std::uint64_t session_id = 0) {
+  SocketStream s(fd);
+  return handshake_client_sync(s, capabilities, timeout, session_id);
+}
+inline Result<HandshakeResult> handshake_server(
+    SocketHandle fd, std::uint32_t server_capabilities,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) {
+  SocketStream s(fd);
+  return handshake_server(s, server_capabilities, timeout);
+}
+inline Result<HandshakeResult> handshake_server_stoppable(
+    SocketHandle fd, std::uint32_t server_capabilities,
+    std::chrono::milliseconds timeout, const std::atomic<bool>& stop) {
+  SocketStream s(fd);
+  return handshake_server_stoppable(s, server_capabilities, timeout, stop);
+}
 
 }  // namespace duct::wire
 
