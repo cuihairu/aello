@@ -59,7 +59,17 @@ class ReconnectPipe final : public Pipe {
   // before dial() returns (see make_connected_reconnect_pipe).
   Result<void> wait_connected(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lk(mu_);
-    auto pred = [&] { return closed_ || inner_ != nullptr || permanently_failed_; };
+    // Require the published kConnected state, not just inner_: the worker
+    // publishes inner_ first so a callback that sends inside on_state_change
+    // sees a live pipe, then flips the state (set_state takes mu_). Waiting
+    // only on inner_ let dial() return before kConnected was observable, which
+    // made the state callback visible out of order (or missing) to callers
+    // that read it right after dial(). Both checks run under mu_, so this is
+    // ordered against set_state.
+    auto pred = [&] {
+      return closed_ || permanently_failed_ ||
+             (inner_ != nullptr && state_ == ConnectionState::kConnected);
+    };
     if (timeout.count() > 0) {
       if (!cv_.wait_for(lk, timeout, pred)) {
         return Status::timeout("connect timed out");
@@ -197,6 +207,23 @@ class ReconnectPipe final : public Pipe {
     return inner_;
   }
 
+  // Publish a new inner pipe and its kConnected state in one critical section
+  // and hand back the callback to fire outside it. Publishing the two under one
+  // lock is what lets wait_connected() require kConnected (so dial() never
+  // returns before the callback is observable) without leaving a waiter
+  // asleep: notify_all happens after both are set, and holding mu_ across
+  // user code would deadlock a callback that sends or recvs.
+  void publish_connected(std::unique_ptr<Pipe> pipe, ConnectionCallback& out_cb) {
+    out_cb = {};
+    std::lock_guard<std::mutex> lk(mu_);
+    inner_ = std::shared_ptr<Pipe>(std::move(pipe));
+    ever_connected_ = true;
+    last_error_.clear();
+    state_ = ConnectionState::kConnected;
+    out_cb = on_state_change_;
+    cv_.notify_all();
+  }
+
   void mark_disconnected(const std::shared_ptr<Pipe>& which, const std::string& reason) {
     std::shared_ptr<Pipe> inner_to_close;
     bool is_current = false;
@@ -255,17 +282,12 @@ class ReconnectPipe final : public Pipe {
 
         auto r = dial_once_();
         if (r.ok()) {
-          {
-            std::lock_guard<std::mutex> lk(mu_);
-            inner_ = std::shared_ptr<Pipe>(std::move(r.value()));
-            ever_connected_ = true;
-            last_error_.clear();
-            cv_.notify_all();
-          }
-          // Publish kConnected only after inner_ is visible. A callback that
-          // sends/recvs inside on_state_change sees a connected pipe instead of
-          // deadlocking on wait_connected's inner_ != nullptr predicate.
-          set_state(ConnectionState::kConnected, "connected");
+          ConnectionCallback connected_cb;
+          publish_connected(std::move(r.value()), connected_cb);
+          // Fire the callback outside mu_: a callback that sends/recvs inside
+          // on_state_change sees a connected pipe instead of deadlocking on
+          // wait_connected's predicate.
+          if (connected_cb) connected_cb(ConnectionState::kConnected, "connected");
           if (is_closed()) return;
           break;
         }
