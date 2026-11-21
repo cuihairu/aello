@@ -4,6 +4,8 @@
 
 #include "test_support.h"
 
+#include "duct/config.h"
+
 #include "core_tests.h"
 #include "pipe_tests.h"
 #include "shm_tests.h"
@@ -14,6 +16,7 @@
 #include "loss_injection_tests.h"
 #include "reliability_tests.h"
 #include "adapter_tests.h"
+#include "tls_tests.h"
 
 int main() {
 #if defined(SIGPIPE)
@@ -63,6 +66,23 @@ int main() {
   RUN_TEST(test_shm_accept_connid_read_unblocks_on_listener_close);
   RUN_TEST(test_dial_rejects_negative_timeout);
   RUN_TEST(test_tls_scheme_rejected_as_unsupported);
+#if DUCT_HAVE_TLS
+  // TLS transport (tcp:// with TlsOptions). See docs/design/tls-mtls.md.
+  RUN_TEST(test_tls_only_on_tcp);
+#if defined(DUCT_TLS_FIXTURE_DIR)
+  // Fixture-dependent cases: need the build-time generated test CA/leaf pairs.
+  RUN_TEST(test_tls_echo_roundtrip);
+  RUN_TEST(test_tls_reliable_echo_roundtrip);
+  RUN_TEST(test_tls_expired_cert_rejected);
+  RUN_TEST(test_tls_wrong_host_rejected);
+  RUN_TEST(test_tls_wrong_host_verify_name_skipped);
+  RUN_TEST(test_tls_untrusted_ca_rejected);
+  RUN_TEST(test_tls_listener_rejects_wrong_key);
+  RUN_TEST(test_tls_listener_requires_cert_and_key);
+  RUN_TEST(test_tls_mtls_requires_client_cert);
+  RUN_TEST(test_tls_mtls_client_without_cert_rejected);
+#endif
+#endif
   RUN_TEST(test_wire_clears_send_timeout_for_blocking_write);
   RUN_TEST(test_wire_write_no_sigpipe_on_macos);
   RUN_TEST(test_qos_block_zero_timeout_blocks);

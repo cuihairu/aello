@@ -1,16 +1,16 @@
 # TLS / mTLS Proposal (2026-11-21)
 
-Status: **design signed off 2026-11-22, not implemented**. The user approved
-the recommended option at every decision point T1–T5. There is no TLS
-dependency in the build (no OpenSSL in CMake) and no certificate configuration
-API; `tls://` addresses are rejected at the address layer: `Address::parse`
-reports `kInvalidArgument` ("unknown scheme") before any scheme dispatch
-(pinned by `test_tls_scheme_rejected_as_unsupported`). Implementation is gated
-on the user provisioning real credentials — test fixtures are not production
-certificates.
+Status: **implemented 2026-11-22** (the recommended option was signed off at
+every decision point T1–T5). TLS 1.3 over OpenSSL 3 is available on `tcp://`
+via opt-in `TlsOptions` on `dial()`/`listen()`; a build without OpenSSL
+(`DUCT_BUILD_TLS` off) reports `tls_available() == false` and rejects
+`TlsOptions.enabled` with `kNotSupported`. `tls://` addresses remain unknown
+at the address layer (`Address::parse` reports `kInvalidArgument`, pinned by
+`test_tls_scheme_rejected_as_unsupported`) — TLS is a `tcp://` option, not a
+scheme. Test fixtures are build-time generated (never committed as production
+material); the one manual smoke with real credentials stays a user task.
 
-See also [capabilities and reserved contracts](capabilities.md) — "no TLS or
-other credential layers" stays accurate until this proposal is implemented.
+See also [capabilities and reserved contracts](capabilities.md).
 
 ## Goal
 
@@ -94,10 +94,22 @@ existing capability handshake and framing code stay untouched.
 No TLS on `uds://`/`shm://`/`pipe://` in v1; no certificate rotation or
 management; no OCSP/CRL checking in v1; no session resumption in v1.
 
-## Acceptance criteria (future work; T1–T5 signed off, gated on real credentials)
+## Acceptance criteria
 
-Implement the TLS transport wrapper, replace
-`test_tls_scheme_rejected_as_unsupported` with positive and negative
-handshake tests, keep the full existing suite green, and move the
-"no TLS" line in [capabilities](capabilities.md) to the implemented table in
-the same change.
+Met 2026-11-22 (T1–T5 signed off earlier that day):
+
+- TLS 1.3 on `tcp://` via `TlsOptions` (client-side verification, optional
+  mTLS), layered before the wire handshake, build-gated by `DUCT_BUILD_TLS`.
+- `test_tls_scheme_rejected_as_unsupported` stays: the `tls://` scheme is still
+  unknown because TLS is a `tcp://` option, not a scheme. The positive and
+  negative handshake cases live in `tests/tls_tests.cc` against build-time
+  generated fixtures (`cmake/gen_tls_fixtures.cmake`): echo round-trip,
+  reliable echo, expired cert, wrong host (rejected, plus accepted when the
+  name check is skipped), untrusted CA, mismatched server key, missing server
+  cert/key, mTLS, and mTLS with a client that presents no certificate.
+- Full suite green (134 tests) on GCC/Linux, and green under wine on the
+  mingw gate with TLS compiled out (the intended degradation, not a gap).
+- The "no TLS" line moved to the implemented table in
+  [capabilities](capabilities.md) in the same change.
+
+Remaining: the single manual smoke with real credentials (user-provided).

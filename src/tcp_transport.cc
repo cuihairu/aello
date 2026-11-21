@@ -1,10 +1,17 @@
 #include "duct/duct.h"
 
+#include "duct/config.h"
 #include "duct/protocol.h"
 #include "duct/socket_utils.h"
 #include "duct/wire.h"
 
 #include "reliable_pipe.h"
+
+#if DUCT_HAVE_TLS
+#include "tls_stream.h"
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -93,16 +100,27 @@ class TcpPipe final : public Pipe {
   // the two), known once the handshake completed. Plain clients never negotiate
   // (they advertise 0), so this stays 0 and the pipe emits v1 frames.
   TcpPipe(wire::SocketHandle fd, bool handshake_ready = true,
-          std::uint32_t negotiated_caps = 0)
+          std::uint32_t negotiated_caps = 0
+#if DUCT_HAVE_TLS
+          // `ssl` is an established SSL bound to `fd` (SSL_set_fd, so it does not
+          // own the fd — the transport still releases it); empty for plain TCP.
+          // `ssl_mu` serializes SSL ops across every TlsStream of this connection.
+          , std::shared_ptr<SSL> ssl = nullptr, std::shared_ptr<std::mutex> ssl_mu = nullptr
+#endif
+      )
       : io_(std::make_shared<PipeIoState>()),
         handshake_ready_(handshake_ready),
-        negotiated_caps_(negotiated_caps) {
+        negotiated_caps_(negotiated_caps)
+#if DUCT_HAVE_TLS
+        , ssl_(std::move(ssl)), ssl_mu_(std::move(ssl_mu))
+#endif
+ {
     io_->fd = fd;
     // Send the client's handshake eagerly (write-only, fire-and-forget). The
     // peer's accept() reads it whenever it runs, so this never deadlocks even
     // when accept() is called after dial() returns.
     if (!handshake_ready_) {
-      auto hs = wire::handshake_client(io_->fd, /*capabilities=*/0);
+      auto hs = write_handshake(io_->fd);
       if (!hs.ok()) {
         // Same discipline as close(): shutdown first, and let the last
         // registered io (or close()) release the fd.
@@ -129,7 +147,11 @@ class TcpPipe final : public Pipe {
     }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{io_};
+    IoGuard guard{io_
+#if DUCT_HAVE_TLS
+                  , ssl_, ssl_mu_
+#endif
+    };
     auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs;
     // The reliability layer sets session_id only after the connection negotiated
@@ -142,6 +164,12 @@ class TcpPipe final : public Pipe {
       meta.session_id = opt.session_id;
       meta.seq = opt.seq;
     }
+#if DUCT_HAVE_TLS
+    if (ssl_) {
+      StreamHolder holder{fd, ssl_, ssl_mu_};
+      return wire::write_frame(holder.tls, msg, flags, opt.timeout, meta);
+    }
+#endif
     return wire::write_frame(fd, msg, flags, opt.timeout, meta);
   }
 
@@ -151,7 +179,11 @@ class TcpPipe final : public Pipe {
     }
     wire::SocketHandle fd;
     if (!io_begin(&fd)) return Status::closed("pipe closed");
-    IoGuard guard{io_};
+    IoGuard guard{io_
+#if DUCT_HAVE_TLS
+                  , ssl_, ssl_mu_
+#endif
+    };
     auto hs = ensure_handshake(fd);
     if (!hs.ok()) return hs.status();
     // Serialize socket reads: channel demux is designed for concurrent recv()
@@ -160,7 +192,7 @@ class TcpPipe final : public Pipe {
     // Transparently consume the server's kCtrl handshake reply; it is protocol
     // metadata, not an application frame.
     for (;;) {
-      auto r = wire::read_frame_with_flags(fd, opt.timeout);
+      auto r = read_one_frame(fd, opt.timeout);
       if (!r.ok()) return r.status();
       if ((r.value().flags & to_u32(FrameFlags::kCtrl)) == 0) return r;
     }
@@ -330,15 +362,20 @@ class TcpPipe final : public Pipe {
 
   // Holds the shared state, not the pipe: if the pipe is destroyed after its
   // destructor's bounded wait expires while this io is still in flight, the
-  // state stays alive and io_end remains memory-safe.
+  // state stays alive and io_end remains memory-safe. It also pins the SSL and
+  // its op mutex, so a TLS op in flight survives the pipe being destroyed.
   struct IoGuard {
     std::shared_ptr<PipeIoState> io;
+#if DUCT_HAVE_TLS
+    std::shared_ptr<SSL> ssl;
+    std::shared_ptr<std::mutex> ssl_mu;
+#endif
     ~IoGuard() { io_end(io); }
   };
 
   Result<void> ensure_handshake(wire::SocketHandle fd) {
     if (!handshake_ready_) {
-      auto hs = wire::handshake_client(fd, /*capabilities=*/0);
+      auto hs = write_handshake(fd);
       if (!hs.ok()) {
         // Shutdown the socket so any io blocked elsewhere wakes; the fd is
         // released by the last registered io (or close()).
@@ -354,11 +391,53 @@ class TcpPipe final : public Pipe {
     return {};
   }
 
+  // Send the client's capability handshake through the TLS stream when
+  // encrypted, else straight over the socket. (Fire-and-forget; the peer's
+  // accept() reads it whenever it runs.)
+  Result<void> write_handshake(wire::SocketHandle fd) {
+#if DUCT_HAVE_TLS
+    if (ssl_) {
+      tls::TlsStream ts(ssl_.get(), fd, ssl_mu_);
+      return wire::handshake_client(ts, /*capabilities=*/0);
+    }
+#endif
+    return wire::handshake_client(fd, /*capabilities=*/0);
+  }
+
+  // Read one frame through the TLS stream when encrypted, else the raw socket.
+  Result<wire::FrameMessage> read_one_frame(wire::SocketHandle fd,
+                                            std::chrono::milliseconds timeout) {
+#if DUCT_HAVE_TLS
+    if (ssl_) {
+      StreamHolder holder{fd, ssl_, ssl_mu_};
+      return wire::read_frame_with_flags(holder.tls, timeout);
+    }
+#endif
+    return wire::read_frame_with_flags(fd, timeout);
+  }
+
+  // The TLS framing stream for one io. The holder pins the SSL and the op mutex
+  // for the duration of the read/write so an in-flight op never sees freed
+  // memory if the pipe is destroyed while it runs.
+#if DUCT_HAVE_TLS
+  struct StreamHolder {
+    std::shared_ptr<SSL> ssl;
+    std::shared_ptr<std::mutex> ssl_mu;
+    tls::TlsStream tls;
+    StreamHolder(wire::SocketHandle fd, std::shared_ptr<SSL> s, std::shared_ptr<std::mutex> m)
+        : ssl(std::move(s)), ssl_mu(std::move(m)), tls(ssl.get(), fd, ssl_mu) {}
+  };
+#endif
+
   std::shared_ptr<PipeIoState> io_;
   bool handshake_ready_ = true;
   std::uint32_t negotiated_caps_ = 0;
   std::mutex ch_mu_;
   std::mutex read_mu_;
+#if DUCT_HAVE_TLS
+  std::shared_ptr<SSL> ssl_;
+  std::shared_ptr<std::mutex> ssl_mu_;
+#endif
   std::map<std::uint32_t, std::vector<wire::FrameMessage>> pending_;
   // Total bytes stashed in pending_ across all channels, guarded by ch_mu_.
   static constexpr std::size_t kMaxPendingBytes = 64 * 1024 * 1024;
@@ -393,13 +472,21 @@ class TcpListener final : public Listener {
   TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port,
               std::chrono::milliseconds handshake_timeout,
               std::uint32_t server_caps = 0,
-              ReliabilityListenerConfig reliability = {})
+              ReliabilityListenerConfig reliability = {}
+#if DUCT_HAVE_TLS
+              , std::shared_ptr<tls::SslContext> tls_ctx = nullptr
+#endif
+      )
       : state_(std::make_shared<TcpListenerState>()),
         host_(std::move(host)),
         port_(port),
         handshake_timeout_(handshake_timeout),
         server_caps_(server_caps),
-        reliability_(std::move(reliability)) {
+        reliability_(std::move(reliability))
+#if DUCT_HAVE_TLS
+        , tls_ctx_(std::move(tls_ctx))
+#endif
+ {
     state_->fd = fd;
   }
   ~TcpListener() override {
@@ -503,35 +590,89 @@ class TcpListener final : public Listener {
 #else
     (void)::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #endif
+    // TLS: establish the encrypted channel before the wire handshake, so the
+    // capability handshake (and every frame after it) rides the TLS stream. The
+    // cert/key were validated at listen() time; the SSL_CTX is shared across
+    // accepted sockets, each gets its own SSL + op mutex.
+#if DUCT_HAVE_TLS
+    std::shared_ptr<SSL> ssl;
+    std::shared_ptr<std::mutex> ssl_mu;
+    if (tls_ctx_) {
+      SSL* raw = SSL_new(tls_ctx_->get());
+      if (raw == nullptr) {
+        close_socket(cfd);
+        finish_accept(state);
+        return Status::io_error("SSL_new failed");
+      }
+      // SSL_set_fd takes an int; a Windows SOCKET (UINT_PTR) is passed through
+      // the OpenSSL convention of storing the handle in BIO's num field.
+      (void)SSL_set_fd(raw, static_cast<int>(cfd));
+      auto tls_hs = tls::handshake(raw, cfd, /*server=*/true, handshake_timeout_);
+      if (!tls_hs.ok()) {
+        SSL_free(raw);
+        close_socket(cfd);
+        finish_accept(state);
+        return tls_hs.status();
+      }
+      ssl.reset(raw, SSL_free);
+      ssl_mu = std::make_shared<std::mutex>();
+    }
+#endif
+
     // Stop-aware handshake: a silent client (connected but never writing the
     // handshake) must not pin accept() past a listener close.
-    auto hs = wire::handshake_server_stoppable(cfd, server_caps_,
-                                               handshake_timeout_, state->closing);
-    if (!hs.ok()) {
-      close_socket(cfd);
-      finish_accept(state);
-      return hs.status();
+    wire::HandshakeResult hs;
+#if DUCT_HAVE_TLS
+    if (ssl) {
+      tls::TlsStream ts(ssl.get(), cfd, ssl_mu);
+      auto r = wire::handshake_server_stoppable(ts, server_caps_, handshake_timeout_,
+                                                state->closing);
+      if (!r.ok()) {
+        close_socket(cfd);
+        finish_accept(state);
+        return r.status();
+      }
+      hs = r.value();
+    } else
+#endif
+    {
+      auto r = wire::handshake_server_stoppable(cfd, server_caps_, handshake_timeout_,
+                                                state->closing);
+      if (!r.ok()) {
+        close_socket(cfd);
+        finish_accept(state);
+        return r.status();
+      }
+      hs = r.value();
     }
     // Negotiated caps are the AND of what both sides advertised: a reliable
     // listener facing a plain client degrades to v1 on this accepted pipe.
-    const std::uint32_t negotiated = server_caps_ & hs.value().capabilities;
-    std::unique_ptr<Pipe> pipe(new TcpPipe(cfd, /*handshake_ready=*/true, negotiated));
+    const std::uint32_t negotiated = server_caps_ & hs.capabilities;
+    std::unique_ptr<Pipe> pipe;
+#if DUCT_HAVE_TLS
+    if (ssl) {
+      pipe.reset(new TcpPipe(cfd, /*handshake_ready=*/true, negotiated, ssl, ssl_mu));
+    } else
+#endif
+    {
+      pipe.reset(new TcpPipe(cfd, /*handshake_ready=*/true, negotiated));
+    }
     if ((negotiated & kCapabilityReliable) != 0 && reliability_.table &&
-        hs.value().session_id != 0) {
+        hs.session_id != 0) {
       // Resume (or start) this session's counters in the table shared by every
       // accepted connection of this listener: a redial continues the same
       // next_expected_in / next_seq_out instead of restarting them, which is
       // what lets a replay be recognized as a replay rather than delivered
       // twice. The session id rides the handshake so this happens before any
       // frame flows.
-      auto st = reliability_.table->resume_or_start(hs.value().session_id);
+      auto st = reliability_.table->resume_or_start(hs.session_id);
       if (!st.ok()) {
         pipe->close();
         finish_accept(state);
         return st.status();
       }
       ReliablePipeConfig cfg;
-      cfg.session_id = hs.value().session_id;
+      cfg.session_id = hs.session_id;
       cfg.state = st.value();
       cfg.window_bytes = reliability_.window_bytes;
       cfg.backpressure = reliability_.backpressure;
@@ -576,6 +717,10 @@ class TcpListener final : public Listener {
   std::uint32_t server_caps_ = 0;
   // Empty (no table) unless the listener was created with reliability on.
   ReliabilityListenerConfig reliability_;
+#if DUCT_HAVE_TLS
+  // Empty (no TLS) unless the listener was created with TlsOptions.enabled.
+  std::shared_ptr<tls::SslContext> tls_ctx_;
+#endif
 };
 
 // Non-blocking connect bounded by `timeout`. Returns kTimeout on expiry.
@@ -762,6 +907,21 @@ static Result<wire::SocketHandle> listen_tcp(const std::string& host, std::uint1
 }  // namespace
 
 Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const ListenOptions& opt) {
+  // Validate the server credentials before binding: a bad cert/key must fail
+  // the listen() call, not each accept() later.
+#if DUCT_HAVE_TLS
+  std::shared_ptr<tls::SslContext> tls_ctx;
+  if (opt.tls.enabled) {
+    auto ctx = tls::SslContext::make_server(opt.tls);
+    if (!ctx.ok()) return ctx.status();
+    tls_ctx = ctx.value();
+  }
+#else
+  if (opt.tls.enabled) {
+    return Status::not_supported("TLS support not built into this library");
+  }
+#endif
+
   auto fd = listen_tcp(addr.host, addr.port, opt.backlog);
   if (!fd.ok()) return fd.status();
 
@@ -804,7 +964,11 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
 
   return std::unique_ptr<Listener>(
       new TcpListener(fd.value(), addr.host, effective_port, opt.handshake_timeout,
-                      server_caps, std::move(reliability)));
+                      server_caps, std::move(reliability)
+#if DUCT_HAVE_TLS
+                      , std::move(tls_ctx)
+#endif
+                      ));
 }
 
 Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt,
@@ -812,8 +976,71 @@ Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions
   if (opt.timeout.count() < 0) {
     return Status::invalid_argument("dial timeout must not be negative");
   }
+
+#if DUCT_HAVE_TLS
+  std::shared_ptr<tls::SslContext> tls_ctx;
+  if (opt.tls.enabled) {
+    auto ctx = tls::SslContext::make_client(opt.tls);
+    if (!ctx.ok()) return ctx.status();
+    tls_ctx = ctx.value();
+  }
+#else
+  if (opt.tls.enabled) {
+    return Status::not_supported("TLS support not built into this library");
+  }
+#endif
+
   auto fd = connect_tcp(addr.host, addr.port, opt.timeout);
   if (!fd.ok()) return fd.status();
+
+#if DUCT_HAVE_TLS
+  std::shared_ptr<SSL> ssl;
+  std::shared_ptr<std::mutex> ssl_mu;
+  if (tls_ctx) {
+    SSL* raw = SSL_new(tls_ctx->get());
+    if (raw == nullptr) {
+      close_socket(fd.value());
+      return Status::io_error("SSL_new failed");
+    }
+    // Hostname/SAN verification. An IP literal is matched against the cert's
+    // iPAddress SAN (not a dNSName); a hostname against its dNSName SAN.
+    // verify_peer_name == false skips only this name check — the chain is
+    // still verified against the CA bundle.
+    if (opt.tls.verify_peer_name) {
+      X509_VERIFY_PARAM* param = SSL_get0_param(raw);
+      unsigned char v4[sizeof(in_addr)];
+      unsigned char v6[sizeof(in6_addr)];
+      if (inet_pton(AF_INET, addr.host.c_str(), v4) == 1 ||
+          inet_pton(AF_INET6, addr.host.c_str(), v6) == 1) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(param, addr.host.c_str()) != 1) {
+          SSL_free(raw);
+          close_socket(fd.value());
+          return Status::invalid_argument(
+              "failed to set the IP literal for hostname verification");
+        }
+      } else if (X509_VERIFY_PARAM_set1_host(param, addr.host.c_str(), 0) != 1) {
+        SSL_free(raw);
+        close_socket(fd.value());
+        return Status::invalid_argument("failed to set the expected hostname");
+      }
+    }
+    // SSL_set_fd takes an int; a Windows SOCKET (UINT_PTR) is passed through
+    // the OpenSSL convention of storing the handle in BIO's num field.
+    (void)SSL_set_fd(raw, static_cast<int>(fd.value()));
+    // The TLS handshake is bounded by the dial timeout (0 = design default 10s)
+    // so a silent/mismatched peer cannot pin dial() forever.
+    const auto tls_timeout = opt.timeout.count() > 0
+        ? opt.timeout : std::chrono::milliseconds(10000);
+    auto tls_hs = tls::handshake(raw, fd.value(), /*server=*/false, tls_timeout);
+    if (!tls_hs.ok()) {
+      SSL_free(raw);
+      close_socket(fd.value());
+      return tls_hs.status();
+    }
+    ssl.reset(raw, SSL_free);
+    ssl_mu = std::make_shared<std::mutex>();
+  }
+#endif
 
   // Reliable dials advertise kCapabilityReliable and read the server's reply
   // synchronously so the negotiated caps (and with them v2 vs v1 framing) are
@@ -825,15 +1052,44 @@ Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions
     // reliability_session_id is this logical dial's stable identity (0 only for
     // non-reliable dials, which never enter this branch): the listener uses it
     // to resume the session's counters on a redial instead of restarting them.
-    auto server_caps = wire::handshake_client_sync(fd.value(), kCapabilityReliable,
-                                                  opt.timeout, reliability_session_id);
-    if (!server_caps.ok()) {
-      close_socket(fd.value());
-      return server_caps.status();
+    std::uint32_t server_caps = 0;
+#if DUCT_HAVE_TLS
+    if (ssl) {
+      tls::TlsStream ts(ssl.get(), fd.value(), ssl_mu);
+      auto caps = wire::handshake_client_sync(ts, kCapabilityReliable, opt.timeout,
+                                              reliability_session_id);
+      if (!caps.ok()) {
+        close_socket(fd.value());
+        return caps.status();
+      }
+      server_caps = caps.value();
+    } else
+#endif
+    {
+      auto caps = wire::handshake_client_sync(fd.value(), kCapabilityReliable,
+                                              opt.timeout, reliability_session_id);
+      if (!caps.ok()) {
+        close_socket(fd.value());
+        return caps.status();
+      }
+      server_caps = caps.value();
     }
+#if DUCT_HAVE_TLS
+    if (ssl) {
+      return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/true,
+                                               kCapabilityReliable & server_caps,
+                                               ssl, ssl_mu));
+    }
+#endif
     return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/true,
-                                             kCapabilityReliable & server_caps.value()));
+                                             kCapabilityReliable & server_caps));
   }
+#if DUCT_HAVE_TLS
+  if (ssl) {
+    return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/false,
+                                             /*negotiated_caps=*/0, ssl, ssl_mu));
+  }
+#endif
   return std::unique_ptr<Pipe>(new TcpPipe(fd.value(), /*handshake_ready=*/false));
 }
 

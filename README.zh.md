@@ -24,7 +24,8 @@
 一处维护：[`docs/design/capabilities.md`](docs/design/capabilities.md)；本节及
 英文版仅作摘要。显著的缺失：管道本身没有异步/事件循环 API，送达语义默认
 为至多一次（在 `tcp://`/`uds://` 上显式启用 `Reliability::kAtLeastOnce` 可跨
-重连重投未确认窗口），没有 TLS 层。
+重连重投未确认窗口）。`tcp://` 支持 TLS 1.3（显式启用 `TlsOptions`，构建期
+依赖 OpenSSL 3；`tls_available()` 报告本构建是否带 TLS）。
 
 设计审计与路线图在 [`docs/design/`](docs/design/)：
 

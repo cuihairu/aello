@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <memory>
 
+#include "duct/config.h"
 #include "duct/qos_pipe.h"
 
 #include "reconnect_pipe.h"
 #include "reliable_pipe.h"
 
 namespace duct {
+
+bool tls_available() { return DUCT_HAVE_TLS != 0; }
 
 // Implemented in tcp_transport.cc.
 Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const ListenOptions& opt);
@@ -41,6 +44,14 @@ Result<std::unique_ptr<Listener>> listen(const std::string& address, const Liste
     return parsed.status();
   }
   const Address& a = parsed.value();
+  if (opt.tls.enabled) {
+    if (a.scheme != Scheme::kTcp) {
+      return Status::not_supported("tls is only supported on tcp://");
+    }
+    if (!tls_available()) {
+      return Status::not_supported("TLS support not built into this library");
+    }
+  }
   if (a.scheme == Scheme::kTcp) {
     return tcp_listen(a.tcp, opt);
   }
@@ -188,6 +199,12 @@ Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions
       parsed.value().scheme != Scheme::kUds) {
     return Status::not_supported("at-least-once reliability is not supported on " +
                                  parsed.value().scheme_text);
+  }
+  if (opt.tls.enabled && parsed.value().scheme != Scheme::kTcp) {
+    return Status::not_supported("tls is only supported on tcp://");
+  }
+  if (opt.tls.enabled && !tls_available()) {
+    return Status::not_supported("TLS support not built into this library");
   }
 
   DialOptions effective = opt;

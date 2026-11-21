@@ -1,13 +1,15 @@
 # TLS / mTLS 提案（2026-11-21）
 
-状态：**设计已签核（2026-11-22），未实现**。用户对决策点 T1–T5 全部按
-推荐选项签核。构建中尚无 TLS 依赖（CMake 无 OpenSSL）、无证书配置 API；
-`tls://` 地址在地址层以 `kInvalidArgument`（"unknown scheme"）拒绝（由
-`test_tls_scheme_rejected_as_unsupported` 钉死）。实现以用户提供真实凭据
-为门——测试夹具不是生产证书。
+状态：**已实现（2026-11-22）**（决策点 T1–T5 全部按推荐选项签核）。`tcp://`
+通过 `dial()`/`listen()` 上的 `TlsOptions` 显式启用 TLS 1.3（OpenSSL 3）；
+未带 OpenSSL 构建（`DUCT_BUILD_TLS` 关）时 `tls_available()` 为 false 并以
+`kNotSupported` 拒绝 `TlsOptions.enabled`。`tls://` 地址在地址层仍未知
+（`Address::parse` 返回 `kInvalidArgument`，由
+`test_tls_scheme_rejected_as_unsupported` 钉死）——TLS 是 `tcp://` 的选项，
+不是新 scheme。测试夹具为构建期生成（绝不作为生产材料提交）；用真实凭据
+做的一次手工冒烟仍属用户任务。
 
-另见[能力与保留契约](../../design/capabilities.md)（英文单源）——在提案
-实现之前，「无 TLS 或其他凭据层」一节仍然准确。
+另见[能力与保留契约](../../design/capabilities.md)（英文单源）。
 
 ## 目标
 
@@ -80,8 +82,20 @@ dial/listen 选择启用（推荐：明文与加密部署的地址完全一致�
 v1 不做 `uds://`/`shm://`/`pipe://` 的 TLS；不做证书轮换管理；v1 不做
 OCSP/CRL 检查；v1 不做会话恢复。
 
-## 验收标准（后续工作；T1–T5 已签核，以真实凭据为门）
+## 验收标准
 
-实现 TLS 传输包装器，把 `test_tls_scheme_rejected_as_unsupported` 替换为
-正反两面握手测试，既有全套测试保持全绿，并在同一变更中把
-[capabilities](../../design/capabilities.md) 的「无 TLS」行移入已实现表。
+已于 2026-11-22 达成（T1–T5 当日早先已签核）：
+
+- `tcp://` 通过 `TlsOptions` 启用 TLS 1.3（客户端校验、可选 mTLS），叠加在
+  线上握手之前，以 `DUCT_BUILD_TLS` 构建期开关。
+- `test_tls_scheme_rejected_as_unsupported` 保留：`tls://` scheme 仍未知，
+  因为 TLS 是 `tcp://` 的选项而非新 scheme。正反两面握手用例位于
+  `tests/tls_tests.cc`，用构建期生成的夹具（`cmake/gen_tls_fixtures.cmake`）：
+  回声往返、可靠回声、过期证书、域名不符（拒绝，并在跳过域名校验时接受）、
+  不受信 CA、服务端密钥错配、缺失服务端证书/密钥、mTLS、mTLS 但客户端无证书。
+- 全量测试全绿（134 项）于 GCC/Linux；mingw 门禁（wine）下亦全绿，TLS 按设计
+  被编译掉（预期降级，不是缺口）。
+- 「无 TLS」行在同一变更中移入
+  [capabilities](../../design/capabilities.md) 已实现表。
+
+剩余：一次用真实凭据（用户提供）的手动冒烟。

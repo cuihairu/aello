@@ -1,0 +1,5 @@
+#pragma once
+
+// Build-time feature flags. 0/1 booleans generated from CMake options so the
+// library (and its public headers) can gate optional transports.
+#define DUCT_HAVE_TLS @DUCT_HAVE_TLS@

@@ -2,7 +2,11 @@
 
 include(CMakeFindDependencyMacro)
 
-# 查找依赖（如果将来有的话）
+# 当构建带 TLS 时，导出的 ductTargets 引用 OpenSSL::SSL/OpenSSL::Crypto，
+# 消费方 find_package(duct) 必须先找到 OpenSSL 才能解析这些目标。
+if (@DUCT_HAVE_TLS@)
+  find_dependency(OpenSSL)
+endif()
 
 # 包含目标导出
 include("${CMAKE_CURRENT_LIST_DIR}/ductTargets.cmake")

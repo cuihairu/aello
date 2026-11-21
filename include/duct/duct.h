@@ -100,6 +100,26 @@ struct ShmOptions {
   std::uint32_t slot_count = 64;
 };
 
+// TLS configuration for tcp:// dials and listens. The library only consumes
+// PEM paths and never generates or stores credentials (a deployment decision,
+// docs/design/tls-mtls.md). Build-time gate: when the library was built
+// without OpenSSL, tls_available() is false and dial/listen reject
+// TlsOptions.enabled with kNotSupported.
+struct TlsOptions {
+  // Opt-in per dial/listen. When false (default) the transport is plain TCP.
+  bool enabled = false;
+  // Trust anchors (CA bundle). Empty uses the system trust store.
+  std::string ca_path;
+  // Leaf certificate. Optional on the client, required on the server.
+  std::string cert_path;
+  // Private key for cert_path. Required when cert_path is set.
+  std::string key_path;
+  // Client only: verify the server hostname/SAN against the dial host.
+  bool verify_peer_name = true;
+  // Server only: require and verify a client certificate (mTLS).
+  bool require_client_cert = false;
+};
+
 struct SendOptions {
   // If non-zero, send will time out (where supported).
   std::chrono::milliseconds timeout{0};
@@ -186,6 +206,8 @@ struct DialOptions {
   ReconnectPolicy reconnect{};
   // Called on each connection-state transition of a reconnect-enabled dial.
   ConnectionCallback on_state_change{};
+  // TLS encryption for this tcp:// dial. Ignored for other schemes.
+  TlsOptions tls{};
 };
 
 struct ListenOptions {
@@ -198,10 +220,18 @@ struct ListenOptions {
   // Bound for transport-level handshake completion on accepted sockets.
   // A silent peer is rejected after this interval instead of blocking accept().
   std::chrono::milliseconds handshake_timeout{5000};
+  // TLS for this tcp:// listener: cert_path/key_path are required, and the
+  // accepted pipes perform the TLS handshake during accept().
+  TlsOptions tls{};
 };
 
 // Minimal entry points (pattern layer comes later).
 Result<std::unique_ptr<Listener>> listen(const std::string& address, const ListenOptions& opt = {});
 Result<std::unique_ptr<Pipe>> dial(const std::string& address, const DialOptions& opt = {});
+
+// True when this build includes the TLS transport (OpenSSL was found at
+// configure time). When false, dial()/listen() reject TlsOptions.enabled with
+// kNotSupported instead of opening an unencrypted connection.
+bool tls_available();
 
 }  // namespace duct

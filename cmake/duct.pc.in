@@ -7,4 +7,5 @@ Name: @PROJECT_NAME@
 Description: @PROJECT_DESCRIPTION@
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -lduct
+Libs.private: @DUCT_PC_PRIVATE_LIBS@
 Cflags: -I${includedir}

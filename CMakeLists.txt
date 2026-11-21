@@ -14,6 +14,18 @@ endif()
 
 option(DUCT_BUILD_EXAMPLES "Build duct examples" ON)
 option(DUCT_BUILD_TESTS "Build duct tests" ON)
+option(DUCT_BUILD_TLS "Build the TLS transport (requires OpenSSL 3)" ON)
+
+# TLS (tcp:// with TlsOptions) needs OpenSSL 3. When the dependency is
+# missing (e.g. a bare mingw cross toolchain) the option silently degrades to
+# off: dial/listen report kNotSupported for TlsOptions.enabled and tls_available()
+# is false, instead of failing the whole build.
+find_package(OpenSSL QUIET)
+if (DUCT_BUILD_TLS AND OpenSSL_FOUND)
+  set(DUCT_HAVE_TLS 1)
+else()
+  set(DUCT_HAVE_TLS 0)
+endif()
 
 add_library(duct
   src/address.cc
@@ -29,6 +41,11 @@ add_library(duct
   src/wire.cc
 )
 
+if (DUCT_HAVE_TLS)
+  target_sources(duct PRIVATE src/tls_stream.cc)
+  target_link_libraries(duct PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
 # Add Windows-specific implementations
 if(WIN32)
   target_sources(duct PRIVATE
@@ -40,15 +57,17 @@ endif()
 target_compile_features(duct PUBLIC cxx_std_20)
 target_include_directories(duct PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-target_include_directories(duct PRIVATE
-  ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 # Generate the version header so consumers can query the library version.
 configure_file(cmake/duct_version.h.in generated/duct/version.h @ONLY)
 target_sources(duct PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/version.h)
+
+# Build-time feature flags (DUCT_HAVE_TLS and friends).
+configure_file(cmake/duct_config.h.in generated/duct/config.h @ONLY)
+target_sources(duct PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/config.h)
 
 if (MSVC)
   target_compile_options(duct PRIVATE /W4)
@@ -93,9 +112,31 @@ if (DUCT_BUILD_TESTS)
     tests/loss_injection_tests.cc
     tests/reliability_tests.cc
     tests/adapter_tests.cc
+    tests/tls_tests.cc
   )
   target_link_libraries(duct_tests PRIVATE duct)
   add_test(NAME duct_tests COMMAND duct_tests)
+
+  # TLS fixtures: a test-only CA and leaf pairs, generated at build time by the
+  # openssl CLI (never committed, never production material). The tests are
+  # compiled without them when the CLI is missing, so a build without openssl
+  # still builds and still runs the scheme-gating cases.
+  if (DUCT_HAVE_TLS)
+    find_program(DUCT_OPENSSL_CLI openssl)
+    if (DUCT_OPENSSL_CLI)
+      string(REPLACE "\\" "/" DUCT_TLS_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/tls-fixtures")
+      add_custom_target(duct_tls_fixtures
+        COMMAND ${CMAKE_COMMAND}
+                -DFIXTURE_DIR=${DUCT_TLS_FIXTURE_DIR}
+                -DOPENSSL_EXE=${DUCT_OPENSSL_CLI}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gen_tls_fixtures.cmake
+        COMMENT "Generating test-only TLS fixtures"
+        VERBATIM)
+      add_dependencies(duct_tests duct_tls_fixtures)
+      target_compile_definitions(duct_tests PRIVATE
+        DUCT_TLS_FIXTURE_DIR="${DUCT_TLS_FIXTURE_DIR}")
+    endif()
+  endif()
 
 endif()
 
@@ -119,6 +160,8 @@ install(TARGETS duct
 )
 install(DIRECTORY include/duct DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/version.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/duct)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/duct/config.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/duct)
 
 install(EXPORT ductTargets
@@ -144,6 +187,11 @@ install(FILES
 )
 
 # pkg-config for non-CMake consumers.
+if (DUCT_HAVE_TLS)
+  set(DUCT_PC_PRIVATE_LIBS "-lssl -lcrypto")
+else()
+  set(DUCT_PC_PRIVATE_LIBS "")
+endif()
 configure_file(cmake/duct.pc.in ${CMAKE_CURRENT_BINARY_DIR}/duct.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/duct.pc
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

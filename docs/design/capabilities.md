@@ -4,7 +4,7 @@ This is the single maintained surface for "what exists, what does not, and what
 is reserved". Both READMEs link here; update this file instead of the READMEs so
 the two languages cannot drift apart.
 
-Last reviewed: 2026-11-21.
+Last reviewed: 2026-11-22.
 
 ## Implemented capabilities
 
@@ -17,6 +17,7 @@ Last reviewed: 2026-11-21.
 | QoS layer | Send/recv byte watermarks, item-count cap, backpressure policies, per-message TTL, linger drain, priority, rate limit, channel multiplexing | `include/duct/qos_pipe.h`, `src/qos_pipe.cc` |
 | Reconnect | Automatic redial with exponential backoff + jitter, bounded attempts, state callbacks | `ReconnectPolicy`, `src/reconnect_pipe.cc`; `dial()` returns connected or fails within the deadline |
 | Reliability | At-least-once delivery on `tcp://`/`uds://` via opt-in `Reliability::kAtLeastOnce`: session id + seq + cumulative ACK + retransmit window (bounded by `snd_hwm_bytes`) + receiver dedup; `kAtLeastOnce` auto-enables reconnect | `QosOptions::reliability`, `src/reliable_pipe.{h,cc}`; `shm://`/`pipe://` reject it with `kNotSupported` at dial |
+| TLS (tcp) | TLS 1.3 (OpenSSL 3) on `tcp://` via opt-in `TlsOptions` on `dial()`/`listen()`: CA bundle or system trust store, server cert/key, optional client cert (mTLS), hostname/IP-SAN verification (skippable), per-connection `SSL`; layered before the wire handshake so framing is unchanged; build-gated by `DUCT_BUILD_TLS` | `TlsOptions`, `tls_available()`, `src/tls_stream.{h,cc}`, `src/tcp_transport.cc`; non-`tcp://` schemes reject `TlsOptions.enabled` with `kNotSupported` |
 | Adapters | Header-only builder/request-reply/batch/loop layer and RAII scoped wrappers; installed with the library, compiled by the test suite | `include/duct/convenience.h`, `include/duct/raii.h` |
 | RPC / pub-sub | Correlated request/response and topic broker, header-only | `include/duct/rpc.h`, `include/duct/pubsub.h` |
 | Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:108-164` |
@@ -31,10 +32,11 @@ Last reviewed: 2026-11-21.
   that opt into `Reliability::kAtLeastOnce` redeliver the unacked window across
   redials — see the reliability row above and
   [reliability-at-least-once](reliability-at-least-once.md).)
-- No TLS or other credential layers. A design proposal (tcp-only scope,
-  OpenSSL-vs-platform, opt-in via `TlsOptions`, optional mTLS) with
-  decision points T1–T5 awaits sign-off: [tls-mtls](tls-mtls.md); current
-  `tls://` rejection is pinned by `test_tls_scheme_rejected_as_unsupported`.
+- No TLS on `uds://`/`shm://`/`pipe://` (v1 scope decision, see
+  [tls-mtls](tls-mtls.md)); no certificate rotation/management, no
+  OCSP/CRL checking, no session resumption. A build without OpenSSL
+  (`DUCT_BUILD_TLS` off) reports `tls_available() == false` and rejects
+  `TlsOptions.enabled` with `kNotSupported`.
 - No versioned releases yet; the Releases page must stay empty until an
   acceptance-tested version is explicitly approved.
 

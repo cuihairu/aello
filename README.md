@@ -26,9 +26,10 @@ The capability matrix — what exists, what does **not** exist yet, and which
 option fields are reserved but not consumed — is maintained in one place,
 [`docs/design/capabilities.md`](docs/design/capabilities.md); this section and
 its Chinese twin only summarize it. Notable absences: no async/event-loop API
-on the pipe itself, delivery is at-most-once by default (opt-in
+on the pipe itself, and delivery is at-most-once by default (opt-in
 `Reliability::kAtLeastOnce` on `tcp://`/`uds://` redelivers the unacked window
-across redials), and there is no TLS layer.
+across redials). TLS 1.3 is available on `tcp://` (opt-in `TlsOptions`,
+OpenSSL 3 at build time; `tls_available()` reports whether the build has it).
 
 Design audit and roadmap live in [`docs/design/`](docs/design/):
 
