@@ -26,7 +26,10 @@ Last reviewed: 2026-11-21.
 - No async/event-loop API on the pipe itself. (When QoS is enabled the send
   side does run an internal queue-drain worker.)
 - Delivery is at-most-once. No durability, no retransmit across process death.
-- No TLS or other credential layers.
+- No TLS or other credential layers. A design proposal (tcp-only scope,
+  OpenSSL-vs-platform, opt-in via `TlsOptions`, optional mTLS) with
+  decision points T1–T5 awaits sign-off: [tls-mtls](tls-mtls.md); current
+  `tls://` rejection is pinned by `test_tls_scheme_rejected_as_unsupported`.
 - No versioned releases yet; the Releases page must stay empty until an
   acceptance-tested version is explicitly approved.
 
