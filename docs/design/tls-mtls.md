@@ -1,12 +1,13 @@
 # TLS / mTLS Proposal (2026-11-21)
 
-Status: **proposal, not implemented**. There is no TLS dependency in the build
-(no OpenSSL in CMake) and no certificate configuration API; `tls://` addresses
-are rejected at the address layer: `Address::parse` reports `kInvalidArgument`
-("unknown scheme") before any scheme dispatch (pinned by
-`test_tls_scheme_rejected_as_unsupported`). Implementation is gated on the
-user signing off the decision points T1–T5 and on the user provisioning real
-credentials — test fixtures are not production certificates.
+Status: **design signed off 2026-11-22, not implemented**. The user approved
+the recommended option at every decision point T1–T5. There is no TLS
+dependency in the build (no OpenSSL in CMake) and no certificate configuration
+API; `tls://` addresses are rejected at the address layer: `Address::parse`
+reports `kInvalidArgument` ("unknown scheme") before any scheme dispatch
+(pinned by `test_tls_scheme_rejected_as_unsupported`). Implementation is gated
+on the user provisioning real credentials — test fixtures are not production
+certificates.
 
 See also [capabilities and reserved contracts](capabilities.md) — "no TLS or
 other credential layers" stays accurate until this proposal is implemented.
@@ -73,15 +74,16 @@ certificate verification failure maps to `kInvalidArgument` with the verify
 error surfaced. A failed TLS handshake never reaches wire framing, so the
 existing capability handshake and framing code stay untouched.
 
-## Decision points (user sign-off required)
+## Decision points — signed off 2026-11-22 (all recommended options)
 
-- **T1 — dependency**: OpenSSL 3 (recommended) vs platform backends.
-- **T2 — addressing**: `tcp://` + `TlsOptions` opt-in (recommended) vs
-  `tls://` scheme.
-- **T3 — config shape**: `TlsOptions` as listed above.
-- **T4 — mTLS default**: `require_client_cert` default false (recommended;
-  explicit opt-in per listener) vs true fleet-wide.
-- **T5 — acceptance**: in-repo self-signed test fixtures (test-only CA +
+- **T1 — dependency**: **OpenSSL 3** (over platform backends).
+- **T2 — addressing**: **`tcp://` + `TlsOptions` opt-in** (over a `tls://`
+  scheme).
+- **T3 — config shape**: **`TlsOptions` as listed above** (accepted as
+  proposed).
+- **T4 — mTLS default**: **`require_client_cert` default false** (explicit
+  opt-in per listener, over true fleet-wide).
+- **T5 — acceptance**: **in-repo self-signed test fixtures** (test-only CA +
   leaf pair, clearly marked, generated at build time — never committed as
   production material), negative tests (expired / wrong-host / untrusted /
   wrong-key), plus one manual smoke with real credentials supplied by the
@@ -92,7 +94,7 @@ existing capability handshake and framing code stay untouched.
 No TLS on `uds://`/`shm://`/`pipe://` in v1; no certificate rotation or
 management; no OCSP/CRL checking in v1; no session resumption in v1.
 
-## Acceptance criteria (future work, gated on T1–T5)
+## Acceptance criteria (future work; T1–T5 signed off, gated on real credentials)
 
 Implement the TLS transport wrapper, replace
 `test_tls_scheme_rejected_as_unsupported` with positive and negative

@@ -1,9 +1,10 @@
 # TLS / mTLS 提案（2026-11-21）
 
-状态：**提案，未实现**。构建中无 TLS 依赖（CMake 无 OpenSSL）、无证书
-配置 API；`tls://` 地址以 `kNotSupported` 拒绝（由
-`test_tls_scheme_rejected_as_unsupported` 钉死）。实现以用户对决策点
-T1–T5 的签核、以及用户提供真实凭据为门——测试夹具不是生产证书。
+状态：**设计已签核（2026-11-22），未实现**。用户对决策点 T1–T5 全部按
+推荐选项签核。构建中尚无 TLS 依赖（CMake 无 OpenSSL）、无证书配置 API；
+`tls://` 地址在地址层以 `kInvalidArgument`（"unknown scheme"）拒绝（由
+`test_tls_scheme_rejected_as_unsupported` 钉死）。实现以用户提供真实凭据
+为门——测试夹具不是生产证书。
 
 另见[能力与保留契约](../../design/capabilities.md)（英文单源）——在提案
 实现之前，「无 TLS 或其他凭据层」一节仍然准确。
@@ -62,14 +63,14 @@ dial/listen 选择启用（推荐：明文与加密部署的地址完全一致�
 `kInvalidArgument` 并透出校验错误原因。TLS 握手失败永远不会触达线格式
 层，既有能力握手与封帧代码零改动。
 
-## 决策点（需用户签核）
+## 决策点（2026-11-22 用户已签核，全部按推荐）
 
-- **T1——依赖**：OpenSSL 3（推荐）vs 平台后端。
-- **T2——寻址**：`tcp://` + `TlsOptions` 选择启用（推荐）vs `tls://`
-  scheme。
-- **T3——配置形状**：如上所列的 `TlsOptions`。
-- **T4——mTLS 默认**：`require_client_cert` 默认 false（推荐；按监听器
-  显式开启）vs 全机群默认 true。
+- **T1——依赖**：OpenSSL 3（弃平台后端）。
+- **T2——寻址**：保持 `tcp://`，经 `TlsOptions` 选择启用（弃 `tls://`
+  scheme）。
+- **T3——配置形状**：如上所列的 `TlsOptions`（按提案接受）。
+- **T4——mTLS 默认**：`require_client_cert` 默认 false（按监听器显式开启；
+  弃全机群默认 true）。
 - **T5——验收**：仓内自签测试夹具（仅测试用 CA + 叶子证书对，显著标记，
   构建期生成——绝不作为生产材料提交）、阴性测试（过期 / 域名不符 /
   不受信 / 密钥错配），加上一次由用户提供真实凭据的手动冒烟。
@@ -79,7 +80,7 @@ dial/listen 选择启用（推荐：明文与加密部署的地址完全一致�
 v1 不做 `uds://`/`shm://`/`pipe://` 的 TLS；不做证书轮换管理；v1 不做
 OCSP/CRL 检查；v1 不做会话恢复。
 
-## 验收标准（后续工作，以 T1–T5 为门）
+## 验收标准（后续工作；T1–T5 已签核，以真实凭据为门）
 
 实现 TLS 传输包装器，把 `test_tls_scheme_rejected_as_unsupported` 替换为
 正反两面握手测试，既有全套测试保持全绿，并在同一变更中把
