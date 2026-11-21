@@ -4,7 +4,7 @@ This is the single maintained surface for "what exists, what does not, and what
 is reserved". Both READMEs link here; update this file instead of the READMEs so
 the two languages cannot drift apart.
 
-Last reviewed: 2026-11-14.
+Last reviewed: 2026-11-21.
 
 ## Implemented capabilities
 
@@ -18,7 +18,7 @@ Last reviewed: 2026-11-14.
 | Reconnect | Automatic redial with exponential backoff + jitter, bounded attempts, state callbacks | `ReconnectPolicy`, `src/reconnect_pipe.cc`; `dial()` returns connected or fails within the deadline |
 | Adapters | Header-only builder/request-reply/batch/loop layer and RAII scoped wrappers; installed with the library, compiled by the test suite | `include/duct/convenience.h`, `include/duct/raii.h` |
 | RPC / pub-sub | Correlated request/response and topic broker, header-only | `include/duct/rpc.h`, `include/duct/pubsub.h` |
-| Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:107-163` |
+| Install | CMake package config (`duct::`), pkg-config, CPack TGZ; covered by the `duct_install` smoke test | `CMakeLists.txt:108-164` |
 | CI | GCC / Clang / MSVC run the full suite; POSIX suite also runs under wine locally | `.github/workflows/cmake-multi-platform.yml` |
 
 ## Explicitly not implemented
@@ -38,7 +38,7 @@ Setting them has no effect today; activating them later is source-compatible.
 | Field | Declared at | Current effect |
 |---|---|---|
 | `ReconnectPolicy::heartbeat_interval` | `include/duct/duct.h:45` | none — keepalives are whatever the OS defaults to; an earlier comment claimed a TCP keepalive mapping that was never implemented (corrected 2026-11-09) |
-| `QosOptions::reliability` | `include/duct/duct.h:77` | none — at-most-once is the only delivery semantics; `Reliability::kAtMostOnce` is the only enum value with an implementation |
+| `QosOptions::reliability` | `include/duct/duct.h:77` | none — at-most-once is the only delivery semantics; `Reliability::kAtMostOnce` is the only enum value with an implementation. A protocol proposal (session/seq/ack/retransmit/dedup) with decision points awaits sign-off: [reliability-at-least-once](reliability-at-least-once.md); its fault model is pinned by `tests/loss_injection_tests.cc` |
 | `ListenOptions::qos` | `include/duct/duct.h:181` | none — listener-side QoS is reserved |
 
 Note: the standalone `StateCallbackPipe` decorator (`src/state_callback_pipe.*`)

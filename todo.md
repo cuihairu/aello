@@ -31,7 +31,7 @@ Requirements ledger for humans. One requirement per line; done items carry one e
 ## Protocol
 
 - [x] Fragmentation and reassembly for payloads larger than 64 KiB. Evidence: 8c0b3ee; wire + shm multi-chunk round-trip tests green (36 duct cases, ctest 2/2).
-- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.（2026-11-09 复核：仍阻塞——传输协议未改、无丢包注入测试矩阵，属需设计决策的大特性，无实现可代办）（2026-11-15 复核：仍阻塞——wire.h/duct.h 中 session_id/seq·ack/retransmit/dedup 零命中，tests/ 无 loss/retransmit 注入矩阵，r2 巡检重证）
+- [ ] Reliability (at-least-once): session_id, seq/ack, retransmit, dedup. BLOCKED: needs transport-level protocol redesign and loss-injection test matrix before implementation.（2026-11-09 复核：仍阻塞——传输协议未改、无丢包注入测试矩阵，属需设计决策的大特性，无实现可代办）（2026-11-15 复核：仍阻塞——wire.h/duct.h 中 session_id/seq·ack/retransmit/dedup 零命中，tests/ 无 loss/retransmit 注入矩阵，r2 巡检重证）（2026-11-21 推进：两前置件已落地——丢包注入矩阵 `tests/loss_injection_tests.cc`（L1–L5 五单元刻画现行 at-most-once 语义，Linux×3/ctest/mingw/wine 全绿 118 条）+ 协议设计提案 `docs/design/reliability-at-least-once.md`（EN/zh 双语：会话/序号/累计 ACK/重发窗口/去重、32 字节头扩展与 `QosPipe(ReliablePipe(ReconnectPipe))` 分层、决策点 D1–D5 待用户签核）；实现仍以 D1–D5 签核为门。Evidence: commit `1c9e85f`（矩阵）+ 设计文档提交）
 - [x] Priority scheduling and channel_id multiplexing. Evidence: 4dc7aa6; priority drains high-first and channel_id demux round-trip tests green (38 duct cases, ctest 2/2).
 - [x] Rate limiting (token bucket) per pipe or per socket. Evidence: f3d2870; paced delivery test green (39 duct cases, ctest 2/2).
 - [x] Capability / version negotiation in the handshake. Evidence: bfe0629; tcp handshake version negotiation + post-handshake echo test green (40 duct cases, ctest 2/2).
