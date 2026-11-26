@@ -32,7 +32,9 @@ jobs:
             artifact_name: duct-windows-x64
             c_compiler: cl
             cpp_compiler: cl
-          - os: macos-latest
+          # Pin macos-15: macos-latest rolled to macOS 26 arm64 on 2026-11-22
+          # and UDS echo tests fail there (stream_tests.cc echoed.ok()).
+          - os: macos-15
             target: macos-arm64
             artifact_name: duct-macos-arm64
             c_compiler: clang
